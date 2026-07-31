@@ -15,6 +15,11 @@ from cvise.utils.process import ProcessEventNotifier
 
 CLANG_STD_CHOICES = ('c++98', 'c++11', 'c++14', 'c++17', 'c++20', 'c++2b')
 
+# clang_delta parses a translation unit, so only the sources a compiler is
+# given directly are worth handing to it; a header is reduced through the units
+# that include it.
+SOURCE_SUFFIXES = ('.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cl', '.cu', '.hip')
+
 
 @dataclass(frozen=True, slots=True)
 class ClangState(HintState):
@@ -73,7 +78,11 @@ class ClangHintsPass(HintBasedPass):
         self, test_case: Path, tmp_dir: Path, job_timeout, process_event_notifier: ProcessEventNotifier, *args, **kwargs
     ):
         # If configured accordingly, choose the best standard unless the user provided one.
-        if self._user_clang_delta_std:
+        if self._compilation_database:
+            # The build already says which standard each file is compiled with,
+            # so there is nothing to guess and nothing to brute-force.
+            std_choices = [None]
+        elif self._user_clang_delta_std:
             std_choices = [self._user_clang_delta_std]
         elif self._iterate_stds:
             std_choices = CLANG_STD_CHOICES
@@ -154,7 +163,56 @@ class ClangHintsPass(HintBasedPass):
             case _:
                 raise ValueError(f'Unexpected strategy: {self._strategy}')
 
+    def supports_dir_test_cases(self) -> bool:
+        # A directory is reduced by running clang_delta over each translation
+        # unit in it and merging what comes back into one bundle.
+        return True
+
     def _generate_hints_for_standard(
+        self, test_case: Path, std: str | None, timeout: int, process_event_notifier: ProcessEventNotifier
+    ) -> HintBundle:
+        if not test_case.is_dir():
+            return self._generate_hints_for_file(test_case, std, timeout, process_event_notifier)
+
+        sources = sorted(p for p in test_case.rglob('*') if p.is_file() and p.suffix in SOURCE_SUFFIXES)
+        vocabulary: list[bytes] = []
+        hints: list[Hint] = []
+        failures = []
+        for source in sources:
+            try:
+                bundle = self._generate_hints_for_file(source, std, timeout, process_event_notifier)
+            except ClangDeltaError as e:
+                # One unhandled unit must not cost us the whole directory.
+                failures.append(f'{source}: {e}')
+                continue
+            offset = len(vocabulary)
+            vocabulary += bundle.vocabulary
+            path_id = len(vocabulary)
+            vocabulary.append(str(source.relative_to(test_case)).encode())
+            for hint in bundle.hints:
+                patches = tuple(
+                    msgspec.structs.replace(
+                        patch,
+                        path=path_id if patch.path is None else patch.path + offset,
+                        value=None if patch.value is None else patch.value + offset,
+                    )
+                    for patch in hint.patches
+                )
+                hints.append(
+                    msgspec.structs.replace(
+                        hint,
+                        patches=patches,
+                        type=None if hint.type is None else hint.type + offset,
+                        extra=None if hint.extra is None else hint.extra + offset,
+                    )
+                )
+        if failures and not hints:
+            raise ClangDeltaError('; '.join(failures))
+        for f in failures:
+            logging.debug('clang_delta skipped a file: %s', f)
+        return HintBundle(vocabulary=vocabulary, hints=hints)
+
+    def _generate_hints_for_file(
         self, test_case: Path, std: str | None, timeout: int, process_event_notifier: ProcessEventNotifier
     ) -> HintBundle:
         options = [f'--transformation={self.arg}', '--generate-hints']

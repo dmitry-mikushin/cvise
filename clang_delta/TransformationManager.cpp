@@ -199,7 +199,22 @@ bool TransformationManager::setupInvocationFromCompilationDatabase(
 
   clang::CreateInvocationOptions Opts;
   Opts.Diags = &ClangInstance->getDiagnostics();
+  std::vector<std::string> CC1Args;
+  Opts.CC1Args = &CC1Args;
   std::unique_ptr<CompilerInvocation> Inv = clang::createInvocation(CArgv, Opts);
+
+  // Set CLANG_DELTA_DUMP_INVOCATION to see what the file is really parsed
+  // with; guessing at it from the source is how the flags got lost in the
+  // first place.
+  if (getenv("CLANG_DELTA_DUMP_INVOCATION")) {
+    llvm::errs() << "clang_delta: compile command from database:\n ";
+    for (const std::string &A : Argv)
+      llvm::errs() << ' ' << A;
+    llvm::errs() << "\nclang_delta: resulting -cc1 invocation:\n ";
+    for (const std::string &A : CC1Args)
+      llvm::errs() << ' ' << A;
+    llvm::errs() << '\n';
+  }
   if (!Inv) {
     ErrorMsg = "cannot turn the compile command recorded for " +
                std::string(AbsSrc) + " into a parse invocation";
@@ -232,6 +247,15 @@ bool TransformationManager::initializeCompilerInstance(std::string &ErrorMsg)
   // When the build's own flags are available, they decide the target, the
   // language and the header search; nothing below has to be guessed.
   if (UseCompilationDatabase) {
+    // The build's own standard comes with the flags; honouring --std on top of
+    // it would either be ignored silently or contradict the build.
+    if (SetCXXStandard) {
+      ErrorMsg = "--std=" + CXXStandard + " cannot be combined with "
+                 "--compilation-database: the standard to parse with is part "
+                 "of the recorded compile command";
+      return false;
+    }
+
     if (!setupInvocationFromCompilationDatabase(ErrorMsg))
       return false;
 

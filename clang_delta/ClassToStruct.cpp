@@ -47,9 +47,17 @@ private:
 bool ClassToStructVisitor::VisitCXXRecordDecl(
        CXXRecordDecl *CXXRD)
 {
+  // Only what the file under reduction spells out itself may be rewritten. A
+  // class picked up from an included header belongs to a file this run does
+  // not own, and every other transformation guards against it the same way;
+  // without the guard the rewrite runs off the end of the main file's buffer.
+  if (ConsumerInstance->isInIncludedFile(CXXRD))
+    return true;
+
   CXXRecordDecl *definition = CXXRD->getDefinition();
   if (!definition
-      || !definition->isClass())
+      || !definition->isClass()
+      || ConsumerInstance->isInIncludedFile(definition))
     return true;
 
   ConsumerInstance->CXXRDDefSet.insert(definition);

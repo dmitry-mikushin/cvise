@@ -41,7 +41,7 @@ class ClangPass(AbstractPass):
             f'--transformation={self.arg}',
             f'--counter={state}',
         ]
-        if self._user_clang_delta_std:
+        if self._user_clang_delta_std and not self._compilation_database:
             args.append(f'--std={self._user_clang_delta_std}')
         if self._compilation_database:
             args.append(f'--compilation-database={self._compilation_database}')

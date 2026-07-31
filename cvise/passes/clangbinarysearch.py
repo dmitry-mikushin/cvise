@@ -84,8 +84,9 @@ class ClangBinarySearchPass(AbstractPass):
         args = [
             self.external_programs['clang_delta'],
             f'--query-instances={self.arg}',
-            f'--std={std}',
         ]
+        if not self._compilation_database:
+            args.append(f'--std={std}')
         args += self._compilation_database_args(test_case)
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
@@ -131,7 +132,8 @@ class ClangBinarySearchPass(AbstractPass):
             '--warn-on-counter-out-of-bounds',
             '--report-instances-count',
         ]
-        args.append(f'--std={state.clang_delta_std}')
+        if not self._compilation_database:
+            args.append(f'--std={state.clang_delta_std}')
         args += self._compilation_database_args(kwargs.get('original_test_case', test_case))
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
