@@ -28,6 +28,7 @@ import psutil  # noqa: E402
 from cvise.cvise import CVise  # noqa: E402
 from cvise.passes.abstract import AbstractPass  # noqa: E402
 from cvise.utils import statistics, testing  # noqa: E402
+from cvise.utils.checkpoint import Checkpoint, CheckpointError  # noqa: E402
 from cvise.utils.error import CViseError, MissingPassGroupsError  # noqa: E402
 from cvise.utils.externalprograms import find_external_programs  # noqa: E402
 from cvise.utils.fileutil import CloseableTemporaryFile  # noqa: E402
@@ -302,6 +303,12 @@ def main():
         help='Skip each pass after N successful transformations',
     )
     parser.add_argument(
+        '--checkpoint',
+        metavar='PATH',
+        help='Enable checkpoint/resume: if PATH exists, validate and resume from it; otherwise write it after every '
+        'completed pass and delete it on normal completion, so an interrupted reduction can be continued later',
+    )
+    parser.add_argument(
         'interestingness_test',
         metavar='INTERESTINGNESS_TEST',
         nargs='?',
@@ -480,6 +487,20 @@ def do_reduce(args):
             reducer = CVise(test_manager, args.skip_interestingness_test_check)
 
             reducer.tidy = args.tidy
+
+            if args.checkpoint:
+                checkpoint = Checkpoint(Path(args.checkpoint), CVise.Info.PACKAGE_VERSION)
+                reducer.checkpoint = checkpoint
+                try:
+                    if checkpoint.load(test_manager, pass_group):
+                        reducer._resume_position = checkpoint.resume_position
+                        # Restore the original size so the final report percentages cover the whole reduction.
+                        if checkpoint.resume_orig_total_file_size is not None:
+                            test_manager.orig_total_file_size = checkpoint.resume_orig_total_file_size
+                        checkpoint.restore_statistics(pass_statistic)
+                except CheckpointError as err:
+                    print(err, file=sys.stderr)
+                    sys.exit(1)
 
             # Track runtime
             time_start = time.monotonic()

@@ -130,6 +130,7 @@ set(SOURCE_FILES
   "tests/test_treesitter.py"
   "utils/__init__.py"
   "utils/cache.py"
+  "utils/checkpoint.py"
   "utils/error.py"
   "utils/externalprograms.py"
   "utils/fileutil.py"

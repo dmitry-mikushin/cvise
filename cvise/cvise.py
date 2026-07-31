@@ -32,6 +32,7 @@ from cvise.passes.ternary import TernaryPass
 from cvise.passes.treesitter import TreeSitterPass
 from cvise.passes.unifdef import UnIfDefPass
 from cvise.utils import sigmonitor
+from cvise.utils.checkpoint import Checkpoint, Position
 from cvise.utils.error import CViseError, PassOptionError
 
 
@@ -108,6 +109,15 @@ class CVise:
         self.test_manager = test_manager
         self.skip_interestingness_test_check = skip_interestingness_test_check
         self.tidy = False
+        self.checkpoint: Checkpoint | None = None
+        # When resuming, names the pass to run next; consumed as categories are entered.
+        self._resume_position: Position | None = None
+        # Tracks where we are in the schedule so a checkpoint can be written after every completed unit.
+        self._current_phase: str | None = None
+        self._current_round: int = 0
+        self._current_category_pos: int = 0
+        # Ordered [(name, passes, PassCategory)] of categories that will actually run; set at the start of reduce().
+        self._schedule: list = []
 
     @classmethod
     def load_pass_group_file(cls, path):
@@ -231,14 +241,34 @@ class CVise:
         if not self.tidy:
             self.test_manager.backup_test_cases()
 
-        for category_name, passes in pass_group.items():
-            category = next(c for c in self.PASS_CATEGORIES if c.name == category_name)
-            if skip_initial and category.initial:
-                continue
+        # If resuming, figure out which categories are already done and restore bookkeeping.
+        resume_phase = self._resume_position.phase if self._resume_position else None
+        resume_reached = resume_phase is None
+
+        # Ordered list of categories that will actually run (respects skip_initial), so a checkpoint written at the end
+        # of one category can name the first pass of the next one.
+        schedule = [
+            (name, passes, next(c for c in self.PASS_CATEGORIES if c.name == name))
+            for name, passes in pass_group.items()
+            if not (skip_initial and next(c for c in self.PASS_CATEGORIES if c.name == name).initial)
+        ]
+        self._schedule = schedule
+
+        for pos, (category_name, passes, category) in enumerate(schedule):
+            if not resume_reached:
+                if category_name != resume_phase:
+                    # This whole category completed before the checkpoint was taken.
+                    continue
+                resume_reached = True
             logging.info('%s', category.log_title)
+            self._current_phase = category_name
+            self._current_category_pos = pos
+            self._current_round = 0
             self._run_pass_category(passes, category)
 
         logging.info('===================== done ====================')
+        if self.checkpoint is not None:
+            self.checkpoint.remove()
         return True
 
     @staticmethod
@@ -250,35 +280,109 @@ class CVise:
 
     def _run_pass_category(self, passes: list[AbstractPass], category: PassCategory) -> None:
         if category.once:
+            self._current_round = 0
             self._run_passes(passes, category.interleaving, check_threshold=False)
         else:
+            # A looped category repeats until the total size stops shrinking. On resume, skip the rounds that already
+            # completed by starting the round counter at position.round.
+            round_ = self._resume_position.round if self._resume_position else 0
             while True:
+                self._current_round = round_
                 size_before = self.test_manager.total_file_size
                 met_stopping_threshold = self._run_passes(passes, category.interleaving, check_threshold=True)
                 logging.info(f'Termination check: size was {size_before}; now {self.test_manager.total_file_size}')
                 if (self.test_manager.total_file_size >= size_before) or met_stopping_threshold:
                     break
+                round_ += 1
 
     def _run_passes(self, passes: list[AbstractPass], interleaving: bool, check_threshold: bool) -> bool:
         """Runs the given passes once; returns whether the stopping threshold was met."""
-        available_passes = []
-        for p in passes:
-            if not p.check_prerequisites():
-                logging.error(f'Skipping pass {p}')
-            else:
-                available_passes.append(p)
-        if not available_passes:
-            return False
-
         if interleaving:
+            available_passes = [p for p in passes if self._pass_available(p)]
+            if not available_passes:
+                return False
+            # An interleaved category is a single unit that can run for a long time, so record where we are before
+            # entering it: a reduction killed inside it then resumes by replaying this category on the file as it
+            # stands, instead of finding no checkpoint at all and starting from the very beginning.
+            self._save_checkpoint_at(index=0, passes=passes)
             self.test_manager.run_passes(available_passes, interleaving)
-        else:
-            for p in available_passes:
-                # Exit early if we're already reduced enough
-                if check_threshold and self._met_stopping_threshold():
-                    return True
-                self.test_manager.run_passes([p], interleaving)
+            self._save_checkpoint_after_pass(last_index=len(passes) - 1, passes=passes)
+            return check_threshold and self._met_stopping_threshold()
+
+        # Non-interleaving: run pass by pass, indexing against the unfiltered schedule so the checkpoint index is
+        # comparable across runs even if prerequisite filtering differs.
+        resume_index = self._consume_resume_index()
+        for index, p in enumerate(passes):
+            if index < resume_index:
+                continue
+            if not self._pass_available(p):
+                continue
+            # Exit early if we're already reduced enough
+            if check_threshold and self._met_stopping_threshold():
+                return True
+            self._save_checkpoint_at(index=index, passes=passes)
+            self.test_manager.run_passes([p], interleaving)
+            self._save_checkpoint_after_pass(last_index=index, passes=passes)
         return check_threshold and self._met_stopping_threshold()
+
+    def _save_checkpoint_at(self, index: int, passes: list[AbstractPass]) -> None:
+        """Records the position of a pass that is about to run, so that an interruption inside it can be resumed."""
+        if self.checkpoint is None or self._current_phase is None:
+            return
+        if index >= len(passes):
+            return
+        self.checkpoint.save(
+            self.test_manager,
+            Position(
+                phase=self._current_phase,
+                round=self._current_round,
+                index=index,
+                pass_=str(passes[index]),
+            ),
+        )
+
+    @staticmethod
+    def _pass_available(p: AbstractPass) -> bool:
+        if not p.check_prerequisites():
+            logging.error(f'Skipping pass {p}')
+            return False
+        return True
+
+    def _consume_resume_index(self) -> int:
+        """Return the index to resume at for the current category, consuming the resume position exactly once."""
+        if self._resume_position is not None and self._resume_position.phase == self._current_phase:
+            index = self._resume_position.index
+            # The resume position applies only to the first category/round we re-enter.
+            self._resume_position = None
+            return index
+        return 0
+
+    def _save_checkpoint_after_pass(self, last_index: int, passes: list[AbstractPass]) -> None:
+        """Write a checkpoint naming the pass to run NEXT, after 'last_index' in the current category completed."""
+        if self.checkpoint is None:
+            return
+        assert self._current_phase is not None
+        next_position = self._next_position(last_index, passes)
+        if next_position is None:
+            # The whole reduction is complete; reduce() will delete the checkpoint file on normal exit.
+            return
+        self.checkpoint.save(self.test_manager, next_position)
+
+    def _next_position(self, last_index: int, passes: list[AbstractPass]) -> Position | None:
+        """Compute the (phase, round, index, pass) of the pass to run after 'last_index' in the current category."""
+        category = self._schedule[self._current_category_pos][2]
+        # More passes remain in the current category round.
+        if last_index + 1 < len(passes):
+            nxt = last_index + 1
+            return Position(self._current_phase, self._current_round, nxt, str(passes[nxt]))
+        # The current category round finished. A looped category may run another round.
+        if not category.once and passes:
+            return Position(self._current_phase, self._current_round + 1, 0, str(passes[0]))
+        # Otherwise advance to the first pass of the next runnable category.
+        for name, next_passes, _cat in self._schedule[self._current_category_pos + 1 :]:
+            if next_passes:
+                return Position(name, 0, 0, str(next_passes[0]))
+        return None
 
     def _met_stopping_threshold(self) -> bool:
         improvement = (
