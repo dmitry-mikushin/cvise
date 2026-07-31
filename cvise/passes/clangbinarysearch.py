@@ -15,10 +15,17 @@ class DirBinaryState:
 
     The search itself only makes sense within a single unit, so the position in
     the tree is carried alongside it and moves on when a unit is exhausted.
+
+    What is needed to step to the next unit travels in the state, not in the
+    pass object: new() and advance_on_success() run in a worker process while
+    advance() runs in the parent, so anything remembered on the pass itself is
+    invisible to half of them.
     """
 
     file_index: int
     inner: BinaryState
+    original_test_case: Path | None = None
+    job_timeout: int | None = None
 
     def __repr__(self):
         return f'DirBinaryState(file #{self.file_index}, {self.inner})'
@@ -44,9 +51,6 @@ class ClangBinarySearchPass(AbstractPass):
         )
         self._user_clang_delta_std = user_clang_delta_std
         self._clang_delta_preserve_routine = clang_delta_preserve_routine
-        # Remembered from new(), so that moving on to the next unit does not
-        # end up querying clang_delta without any time limit.
-        self._job_timeout = None
 
     def check_prerequisites(self):
         return self.check_external_program('clang_delta')
@@ -88,12 +92,16 @@ class ClangBinarySearchPass(AbstractPass):
                 key = Path(original_test_case) / target.relative_to(test_case)
             inner = BinaryState.create(self.count_instances(target, std, job_timeout, key))
             if inner is not None:
-                return DirBinaryState(file_index=file_index, inner=attach_clang_delta_std(inner, std))
+                return DirBinaryState(
+                    file_index=file_index,
+                    inner=attach_clang_delta_std(inner, std),
+                    original_test_case=original_test_case,
+                    job_timeout=job_timeout,
+                )
             file_index += 1
         return None
 
     def new(self, test_case: Path, job_timeout, *args, **kwargs):
-        self._job_timeout = job_timeout
         original_test_case = kwargs.get('original_test_case')
         if test_case.is_dir():
             sources = sources_of(test_case)
@@ -114,7 +122,7 @@ class ClangBinarySearchPass(AbstractPass):
             # This unit is done; the pass is not.
             return self._state_from_file(
                 sources_of(test_case), state.file_index + 1, state.inner.clang_delta_std,
-                self._job_timeout, None, test_case
+                state.job_timeout, state.original_test_case, test_case
             )
         new_state = state.advance()
         return attach_clang_delta_std(new_state, state.clang_delta_std)
@@ -129,7 +137,7 @@ class ClangBinarySearchPass(AbstractPass):
                 return DirBinaryState(state.file_index, attach_clang_delta_std(inner, state.inner.clang_delta_std))
             return self._state_from_file(
                 sources_of(test_case), state.file_index + 1, state.inner.clang_delta_std,
-                self._job_timeout, None, test_case
+                state.job_timeout, state.original_test_case, test_case
             )
         instances = succeeded_state.real_num_instances - succeeded_state.real_chunk()
         new_state = state.advance_on_success(instances)
