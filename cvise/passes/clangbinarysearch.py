@@ -2,9 +2,26 @@ import logging
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from cvise.passes.abstract import AbstractPass, BinaryState, PassResult
+from cvise.passes.clang import sources_of
+
+
+@dataclass
+class DirBinaryState:
+    """Binary search inside one translation unit of a directory test case.
+
+    The search itself only makes sense within a single unit, so the position in
+    the tree is carried alongside it and moves on when a unit is exhausted.
+    """
+
+    file_index: int
+    inner: BinaryState
+
+    def __repr__(self):
+        return f'DirBinaryState(file #{self.file_index}, {self.inner})'
 
 
 class ClangBinarySearchPass(AbstractPass):
@@ -27,6 +44,9 @@ class ClangBinarySearchPass(AbstractPass):
         )
         self._user_clang_delta_std = user_clang_delta_std
         self._clang_delta_preserve_routine = clang_delta_preserve_routine
+        # Remembered from new(), so that moving on to the next unit does not
+        # end up querying clang_delta without any time limit.
+        self._job_timeout = None
 
     def check_prerequisites(self):
         return self.check_external_program('clang_delta')
@@ -48,19 +68,69 @@ class ClangBinarySearchPass(AbstractPass):
         # Use the best standard option
         return best
 
+    def supports_dir_test_cases(self) -> bool:
+        return True
+
+    def _standard_for(self, test_case: Path, job_timeout):
+        if self._user_clang_delta_std:
+            return self._user_clang_delta_std
+        if self._compilation_database:
+            # The build says which standard the file uses; nothing to detect.
+            return None
+        return self.detect_best_standard(test_case, job_timeout)
+
+    def _state_from_file(self, sources, file_index: int, std, job_timeout, original_test_case, test_case: Path):
+        """First unit at or after file_index that has anything to transform."""
+        while file_index < len(sources):
+            target = sources[file_index]
+            key = target
+            if original_test_case is not None:
+                key = Path(original_test_case) / target.relative_to(test_case)
+            inner = BinaryState.create(self.count_instances(target, std, job_timeout, key))
+            if inner is not None:
+                return DirBinaryState(file_index=file_index, inner=attach_clang_delta_std(inner, std))
+            file_index += 1
+        return None
+
     def new(self, test_case: Path, job_timeout, *args, **kwargs):
-        if not self._user_clang_delta_std:
-            std = self.detect_best_standard(test_case, job_timeout)
-        else:
-            std = self._user_clang_delta_std
-        state = BinaryState.create(self.count_instances(test_case, std, job_timeout))
+        self._job_timeout = job_timeout
+        original_test_case = kwargs.get('original_test_case')
+        if test_case.is_dir():
+            sources = sources_of(test_case)
+            if not sources:
+                return None
+            std = self._standard_for(sources[0], job_timeout)
+            return self._state_from_file(sources, 0, std, job_timeout, original_test_case, test_case)
+
+        std = self._standard_for(test_case, job_timeout)
+        state = BinaryState.create(self.count_instances(test_case, std, job_timeout, original_test_case))
         return attach_clang_delta_std(state, std)
 
     def advance(self, test_case: Path, state):
+        if isinstance(state, DirBinaryState):
+            inner = state.inner.advance()
+            if inner is not None:
+                return DirBinaryState(state.file_index, attach_clang_delta_std(inner, state.inner.clang_delta_std))
+            # This unit is done; the pass is not.
+            return self._state_from_file(
+                sources_of(test_case), state.file_index + 1, state.inner.clang_delta_std,
+                self._job_timeout, None, test_case
+            )
         new_state = state.advance()
         return attach_clang_delta_std(new_state, state.clang_delta_std)
 
     def advance_on_success(self, test_case: Path, state, succeeded_state, *args, **kwargs):
+        if isinstance(state, DirBinaryState):
+            succeeded_inner = succeeded_state.inner
+            instances = succeeded_inner.real_num_instances - succeeded_inner.real_chunk()
+            inner = state.inner.advance_on_success(instances)
+            if inner is not None:
+                inner.real_num_instances = None
+                return DirBinaryState(state.file_index, attach_clang_delta_std(inner, state.inner.clang_delta_std))
+            return self._state_from_file(
+                sources_of(test_case), state.file_index + 1, state.inner.clang_delta_std,
+                self._job_timeout, None, test_case
+            )
         instances = succeeded_state.real_num_instances - succeeded_state.real_chunk()
         new_state = state.advance_on_success(instances)
         if new_state:
@@ -80,14 +150,14 @@ class ClangBinarySearchPass(AbstractPass):
             f'--compilation-database-key={Path(lookup_path).resolve()}',
         ]
 
-    def count_instances(self, test_case: Path, std, timeout):
+    def count_instances(self, test_case: Path, std, timeout, lookup_key=None):
         args = [
             self.external_programs['clang_delta'],
             f'--query-instances={self.arg}',
         ]
         if not self._compilation_database:
             args.append(f'--std={std}')
-        args += self._compilation_database_args(test_case)
+        args += self._compilation_database_args(test_case if lookup_key is None else lookup_key)
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
         cmd = args + [str(test_case)]
@@ -122,31 +192,61 @@ class ClangBinarySearchPass(AbstractPass):
                 # TODO: report?
                 pass
 
-    def transform(self, test_case: Path, state, process_event_notifier, *args, **kwargs):
+    def transform(
+        self,
+        test_case: Path,
+        state,
+        process_event_notifier,
+        original_test_case=None,
+        written_paths: set[Path] | None = None,
+        *args,
+        **kwargs,
+    ):
         logging.debug(f'TRANSFORM: {state}')
+
+        if isinstance(state, DirBinaryState):
+            sources = sources_of(test_case)
+            if state.file_index >= len(sources):
+                return (PassResult.STOP, state)
+            target = sources[state.file_index]
+            key = target
+            if original_test_case is not None:
+                key = Path(original_test_case) / target.relative_to(test_case)
+            inner = state.inner
+        else:
+            target = test_case
+            key = original_test_case if original_test_case is not None else test_case
+            inner = state
 
         args = [
             f'--transformation={self.arg}',
-            f'--counter={state.index + 1}',
-            f'--to-counter={state.end()}',
+            f'--counter={inner.index + 1}',
+            f'--to-counter={inner.end()}',
             '--warn-on-counter-out-of-bounds',
             '--report-instances-count',
         ]
         if not self._compilation_database:
-            args.append(f'--std={state.clang_delta_std}')
-        args += self._compilation_database_args(kwargs.get('original_test_case', test_case))
+            args.append(f'--std={inner.clang_delta_std}')
+        args += self._compilation_database_args(key)
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
         prog = self.external_programs['clang_delta']
         assert prog
-        cmd = [prog] + args + [str(test_case)]
+        cmd = [prog] + args + [str(target)]
         logging.debug(' '.join(cmd))
 
         stdout, stderr, returncode = process_event_notifier.run_process(cmd)
-        self.parse_stderr(state, stderr)
+        self.parse_stderr(inner, stderr)
         match returncode:
             case 0:
-                test_case.write_bytes(stdout)
+                # An empty result is not a reduction, it is a lost file.
+                if not stdout:
+                    return (PassResult.STOP, state)
+                target.write_bytes(stdout)
+                if written_paths is not None:
+                    # Whatever is not declared here is deleted from the test
+                    # case afterwards, so the whole tree has to be declared.
+                    written_paths.update(test_case.rglob('*') if test_case.is_dir() else [test_case])
                 return (PassResult.OK, state)
             case 255:
                 return (PassResult.STOP, state)
