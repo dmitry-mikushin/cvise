@@ -53,10 +53,12 @@ class ClangHintsPass(HintBasedPass):
         arg: str,
         external_programs: dict[str, str | None],
         user_clang_delta_std: str | None = None,
+        compilation_database: str | None = None,
         strategy: str | None = None,
         iterate_stds: bool | None = None,
         **kwargs,
     ):
+        self._compilation_database = compilation_database
         super().__init__(
             arg=arg, external_programs=external_programs, user_clang_delta_std=user_clang_delta_std, **kwargs
         )
@@ -158,6 +160,11 @@ class ClangHintsPass(HintBasedPass):
         options = [f'--transformation={self.arg}', '--generate-hints']
         if std is not None:
             options.append(f'--std={std}')
+        if self._compilation_database:
+            options.append(f'--compilation-database={self._compilation_database}')
+            # Hints are generated from a copy in a scratch directory, so the
+            # flags are looked up under the path the build system knows.
+            options.append(f'--compilation-database-key={Path(test_case).resolve()}')
 
         prog = self.external_programs['clang_delta']
         assert prog is not None

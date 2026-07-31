@@ -14,8 +14,10 @@ class ClangBinarySearchPass(AbstractPass):
         external_programs: dict[str, str | None],
         user_clang_delta_std: str | None = None,
         clang_delta_preserve_routine: str | None = None,
+        compilation_database: str | None = None,
         **kwargs,
     ):
+        self._compilation_database = compilation_database
         super().__init__(
             arg=arg,
             external_programs=external_programs,
@@ -65,12 +67,26 @@ class ClangBinarySearchPass(AbstractPass):
             new_state.real_num_instances = None
         return attach_clang_delta_std(new_state, state.clang_delta_std)
 
+    def _compilation_database_args(self, lookup_path: Path) -> list[str]:
+        """Options telling clang_delta to parse with the flags the build uses.
+
+        The pass may work on a copy in a scratch directory, so the flags are
+        looked up under the path the build system knows.
+        """
+        if not self._compilation_database:
+            return []
+        return [
+            f'--compilation-database={self._compilation_database}',
+            f'--compilation-database-key={Path(lookup_path).resolve()}',
+        ]
+
     def count_instances(self, test_case: Path, std, timeout):
         args = [
             self.external_programs['clang_delta'],
             f'--query-instances={self.arg}',
             f'--std={std}',
         ]
+        args += self._compilation_database_args(test_case)
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
         cmd = args + [str(test_case)]
@@ -116,6 +132,7 @@ class ClangBinarySearchPass(AbstractPass):
             '--report-instances-count',
         ]
         args.append(f'--std={state.clang_delta_std}')
+        args += self._compilation_database_args(kwargs.get('original_test_case', test_case))
         if self._clang_delta_preserve_routine:
             args.append(f'--preserve-routine="{self._clang_delta_preserve_routine}"')
         prog = self.external_programs['clang_delta']

@@ -82,7 +82,7 @@ def get_available_pass_groups():
 
         try:
             pass_group_dict = CVise.load_pass_group_file(path)
-            CVise.parse_pass_group_dict(pass_group_dict, set(), None, None, None, None, None, None)
+            CVise.parse_pass_group_dict(pass_group_dict, set(), None, None, None, None, None, None, None)
         except MissingPassGroupsError:
             logging.warning(f'Skipping file {path}. Not valid pass group.')
         else:
@@ -264,6 +264,13 @@ def main():
         help='Specify clang_delta C++ standard, it can rapidly speed up all clang_delta passes',
     )
     parser.add_argument(
+        '--compilation-database',
+        type=str,
+        help='Path to compile_commands.json, or to the build directory holding it. The clang_delta '
+        'passes then parse each file with the flags its build actually uses, instead of a bare '
+        'default invocation that cannot even find the project headers',
+    )
+    parser.add_argument(
         '--clang-delta-preserve-routine',
         type=str,
         help='Preserve the given function in replace-function-def-with-decl clang delta pass',
@@ -403,6 +410,7 @@ def do_reduce(args):
         args.remove_pass,
         args.clang_delta_std,
         args.clang_delta_preserve_routine,
+        args.compilation_database,
         args.not_c,
         args.renaming,
     )

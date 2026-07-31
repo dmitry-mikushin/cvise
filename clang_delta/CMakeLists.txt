@@ -497,10 +497,12 @@ else()
   set(CLANG_LIBS
     clangAST
     clangBasic
+    clangDriver
     clangFrontend
     clangParse
     clangLex
     clangRewrite
+    clangTooling
   )
 endif()
 

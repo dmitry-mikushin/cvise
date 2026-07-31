@@ -26,6 +26,14 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Parse/ParseAST.h"
+#include "clang/Tooling/CompilationDatabase.h"
+#if LLVM_VERSION_MAJOR >= 22
+#include "clang/Driver/CreateInvocationFromArgs.h"
+#else
+#include "clang/Frontend/Utils.h"
+#endif
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 
 #if LLVM_VERSION_MAJOR >= 20
 #include "llvm/Support/VirtualFileSystem.h"
@@ -88,6 +96,120 @@ bool TransformationManager::isOpenCLLangOpt()
           .OpenCL);
 }
 
+// Builds the parse configuration out of the command the build system recorded
+// for this file. Without it the file is parsed with a bare default invocation,
+// which does not even find the project's own headers: the transformations then
+// work on a truncated AST and silently make decisions they have no basis for.
+bool TransformationManager::setupInvocationFromCompilationDatabase(
+       std::string &ErrorMsg)
+{
+  // Accept either the database itself or the build directory holding it, the
+  // way -p works for the other clang tools.
+  llvm::SmallString<256> DBDir(CompilationDatabasePath);
+  if (llvm::sys::fs::is_regular_file(CompilationDatabasePath))
+    llvm::sys::path::remove_filename(DBDir);
+
+  std::string LoadError;
+  std::unique_ptr<clang::tooling::CompilationDatabase> DB =
+    clang::tooling::CompilationDatabase::loadFromDirectory(DBDir, LoadError);
+  if (!DB) {
+    ErrorMsg = "cannot load a compilation database from " + std::string(DBDir) +
+               ": " + LoadError;
+    return false;
+  }
+
+  llvm::SmallString<256> AbsSrc(SrcFileName);
+  if (std::error_code EC = llvm::sys::fs::make_absolute(AbsSrc)) {
+    ErrorMsg = "cannot resolve " + SrcFileName + ": " + EC.message();
+    return false;
+  }
+
+  // A reducer parses its own copy of the file, so the flags are looked up
+  // under the path the build system knows, when one was given.
+  llvm::SmallString<256> LookupPath(
+    CompilationDatabaseKey.empty() ? StringRef(AbsSrc)
+                                   : StringRef(CompilationDatabaseKey));
+  if (std::error_code EC = llvm::sys::fs::make_absolute(LookupPath)) {
+    ErrorMsg = "cannot resolve " + CompilationDatabaseKey + ": " + EC.message();
+    return false;
+  }
+
+  ResolvedSrcFileName = std::string(AbsSrc);
+
+  std::vector<clang::tooling::CompileCommand> Cmds =
+    DB->getCompileCommands(LookupPath);
+  if (Cmds.empty()) {
+    ErrorMsg = "the compilation database in " + std::string(DBDir) +
+               " has no entry for " + std::string(LookupPath) +
+               "; refusing to parse it without the flags it is built with";
+    return false;
+  }
+  const clang::tooling::CompileCommand &Cmd = Cmds.front();
+  // Clang's database plugins invent a command for a file they do not know, by
+  // copying one from a file with a similar name. That guess is exactly the
+  // blind parse this option exists to avoid, so say so instead of using it.
+  if (!Cmd.Heuristic.empty()) {
+    ErrorMsg = "the compilation database in " + std::string(DBDir) +
+               " has no entry for " + std::string(LookupPath) +
+               "; it only offers a command " + Cmd.Heuristic +
+               ", which is a guess, not the flags this file is built with";
+    return false;
+  }
+
+  // Keep the flags, drop the parts that describe producing an object file, and
+  // parse our copy of the source instead of the one the database names.
+  llvm::SmallString<256> DBSrc(Cmd.Filename);
+  if (llvm::sys::path::is_relative(DBSrc)) {
+    llvm::SmallString<256> Tmp(Cmd.Directory);
+    llvm::sys::path::append(Tmp, Cmd.Filename);
+    DBSrc = Tmp;
+  }
+
+  std::vector<std::string> Argv;
+  bool DropNext = false;
+  for (size_t I = 0; I < Cmd.CommandLine.size(); ++I) {
+    llvm::StringRef Arg = Cmd.CommandLine[I];
+    if (DropNext) {
+      DropNext = false;
+      continue;
+    }
+    if (I > 0) {
+      if (Arg == "-o") {
+        DropNext = true;
+        continue;
+      }
+      if (Arg.starts_with("-o") && Arg.size() > 2)
+        continue;
+      if (Arg == "-c")
+        continue;
+      if (!Arg.starts_with("-") && (Arg == DBSrc.str() || Arg == Cmd.Filename))
+        continue;
+    }
+    Argv.push_back(Arg.str());
+  }
+  // Relative include paths in the command are relative to where it was run.
+  Argv.insert(Argv.begin() + 1, "-working-directory=" + Cmd.Directory);
+  Argv.push_back("-fsyntax-only");
+  Argv.push_back(std::string(AbsSrc));
+
+  std::vector<const char *> CArgv;
+  CArgv.reserve(Argv.size());
+  for (const std::string &Arg : Argv)
+    CArgv.push_back(Arg.c_str());
+
+  clang::CreateInvocationOptions Opts;
+  Opts.Diags = &ClangInstance->getDiagnostics();
+  std::unique_ptr<CompilerInvocation> Inv = clang::createInvocation(CArgv, Opts);
+  if (!Inv) {
+    ErrorMsg = "cannot turn the compile command recorded for " +
+               std::string(AbsSrc) + " into a parse invocation";
+    return false;
+  }
+
+  ClangInstance->getInvocation() = *Inv;
+  return true;
+}
+
 bool TransformationManager::initializeCompilerInstance(std::string &ErrorMsg)
 {
   if (ClangInstance) {
@@ -97,7 +219,7 @@ bool TransformationManager::initializeCompilerInstance(std::string &ErrorMsg)
 
   ClangInstance = new CompilerInstance();
   assert(ClangInstance);
-  
+
 #if LLVM_VERSION_MAJOR < 20
   ClangInstance->createDiagnostics();
 #elif LLVM_VERSION_MAJOR < 22
@@ -106,6 +228,64 @@ bool TransformationManager::initializeCompilerInstance(std::string &ErrorMsg)
   ClangInstance->createVirtualFileSystem(llvm::vfs::getRealFileSystem());
   ClangInstance->createDiagnostics();
 #endif
+
+  // When the build's own flags are available, they decide the target, the
+  // language and the header search; nothing below has to be guessed.
+  if (UseCompilationDatabase) {
+    if (!setupInvocationFromCompilationDatabase(ErrorMsg))
+      return false;
+
+    CompilerInvocation &DBInvocation = ClangInstance->getInvocation();
+    InputKind DBIK = DBInvocation.getFrontendOpts().Inputs.empty()
+      ? FrontendOptions::getInputKindForExtension(
+          StringRef(SrcFileName).rsplit('.').second)
+      : DBInvocation.getFrontendOpts().Inputs[0].getKind();
+
+    TargetInfo *DBTarget =
+      TargetInfo::CreateTargetInfo(ClangInstance->getDiagnostics(),
+#if LLVM_VERSION_MAJOR > 20
+                                   DBInvocation.getTargetOpts()
+#else
+                                   DBInvocation.TargetOpts
+#endif
+                                  );
+    ClangInstance->setTarget(DBTarget);
+
+    ClangInstance->createFileManager();
+#if LLVM_VERSION_MAJOR < 22
+    ClangInstance->createSourceManager(ClangInstance->getFileManager());
+#else
+    ClangInstance->createSourceManager();
+#endif
+    ClangInstance->createPreprocessor(TU_Complete);
+
+    DiagnosticConsumer &DBClient = ClangInstance->getDiagnosticClient();
+    DBClient.BeginSourceFile(ClangInstance->getLangOpts(),
+                             &ClangInstance->getPreprocessor());
+    ClangInstance->createASTContext();
+
+    if (DoReplacement)
+      CurrentTransformationImpl->setReplacement(Replacement);
+    if (DoPreserveRoutine)
+      CurrentTransformationImpl->setPreserveRoutine(PreserveRoutine);
+    if (CheckReference)
+      CurrentTransformationImpl->setReferenceValue(ReferenceValue);
+
+    assert(CurrentTransformationImpl && "Bad transformation instance!");
+    ClangInstance->setASTConsumer(
+      std::unique_ptr<ASTConsumer>(CurrentTransformationImpl));
+    Preprocessor &DBPP = ClangInstance->getPreprocessor();
+    DBPP.getBuiltinInfo().initializeBuiltins(DBPP.getIdentifierTable(),
+                                             DBPP.getLangOpts());
+
+    if (!ClangInstance->InitializeSourceManager(
+          FrontendInputFile(ResolvedSrcFileName, DBIK))) {
+      ErrorMsg = "Cannot open source file!";
+      return false;
+    }
+
+    return true;
+  }
 
   TargetOptions &TargetOpts = ClangInstance->getTargetOpts();
   if (const char *env = getenv("CVISE_TARGET_TRIPLE")) {
@@ -456,6 +636,8 @@ TransformationManager::TransformationManager()
     ReferenceValue(""),
     SetCXXStandard(false),
     CXXStandard(""),
+    UseCompilationDatabase(false),
+    CompilationDatabasePath(""),
     WarnOnCounterOutOfBounds(false),
     ReportInstancesCount(false)
 {

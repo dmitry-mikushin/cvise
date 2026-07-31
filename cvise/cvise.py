@@ -128,6 +128,7 @@ class CVise:
         remove_pass,
         clang_delta_std,
         clang_delta_preserve_routine,
+        compilation_database,
         not_c,
         renaming,
     ):
@@ -191,6 +192,7 @@ class CVise:
                     external_programs=external_programs,
                     user_clang_delta_std=clang_delta_std,
                     clang_delta_preserve_routine=clang_delta_preserve_routine,
+                    compilation_database=compilation_database,
                     max_transforms=max_transforms,
                     strategy=pass_dict.get('strategy'),
                     iterate_stds=pass_dict.get('iterate-stds'),

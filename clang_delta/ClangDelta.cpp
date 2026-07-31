@@ -106,6 +106,15 @@ static void PrintHelpMessage()
   llvm::outs() << "specify C++ standard used (c++98, c++11, c++14, c++17, c++20) ";
   llvm::outs() << "\n";
 
+  llvm::outs() << "  --compilation-database=<path>: ";
+  llvm::outs() << "parse the file with the flags its build uses, taken from ";
+  llvm::outs() << "compile_commands.json (give the file or the build ";
+  llvm::outs() << "directory holding it)\n";
+
+  llvm::outs() << "  --compilation-database-key=<path>: ";
+  llvm::outs() << "look the flags up under this path, for when the file being ";
+  llvm::outs() << "transformed is a copy the build system does not know\n";
+
   llvm::outs() << "  --report-instances-count: ";
   llvm::outs() << "report number of transformation instances on stderr ";
   llvm::outs() << "\n";
@@ -195,6 +204,12 @@ static void HandleOneArgValue(const std::string &ArgValueStr, size_t SepPos)
   }
   else if (!ArgName.compare("std")) {
     TransMgr->setCXXStandard(ArgValue);
+  }
+  else if (!ArgName.compare("compilation-database")) {
+    TransMgr->setCompilationDatabase(ArgValue);
+  }
+  else if (!ArgName.compare("compilation-database-key")) {
+    TransMgr->setCompilationDatabaseKey(ArgValue);
   }
   else {
     DieOnBadCmdArg("--" + ArgValueStr);

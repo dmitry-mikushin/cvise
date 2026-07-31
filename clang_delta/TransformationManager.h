@@ -107,6 +107,18 @@ public:
     SetCXXStandard = true;
   }
 
+  void setCompilationDatabase(const std::string &Str) {
+    CompilationDatabasePath = Str;
+    UseCompilationDatabase = true;
+  }
+
+  // The reducer parses a copy of the file in a scratch directory, which the
+  // build system has never heard of; this says under which path to look its
+  // flags up.
+  void setCompilationDatabaseKey(const std::string &Str) {
+    CompilationDatabaseKey = Str;
+  }
+
   void setReportInstancesCount(bool Flag) {
     ReportInstancesCount = Flag;
   }
@@ -138,6 +150,11 @@ private:
   llvm::raw_ostream *getOutStream();
 
   void closeOutStream(llvm::raw_ostream *OutStream);
+
+  // Configures the parse from the entry the build system recorded for this
+  // file, so that its include paths, macros and language options are the ones
+  // the file is actually compiled with.
+  bool setupInvocationFromCompilationDatabase(std::string &ErrorMsg);
 
   static TransformationManager *Instance;
 
@@ -178,6 +195,20 @@ private:
   bool SetCXXStandard;
 
   std::string CXXStandard;
+
+  // Path to a compile_commands.json, or to the build directory holding it.
+  // When set, the file is parsed with the very flags its build uses, instead
+  // of a bare default invocation which cannot even find the project headers.
+  bool UseCompilationDatabase;
+
+  std::string CompilationDatabasePath;
+
+  std::string CompilationDatabaseKey;
+
+  // Absolute path of the file to parse, resolved while looking its flags up.
+  // The build's own working directory comes along with those flags, and a
+  // relative path would then be resolved against it instead of against ours.
+  std::string ResolvedSrcFileName;
 
   bool WarnOnCounterOutOfBounds;
 
