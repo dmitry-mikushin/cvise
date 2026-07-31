@@ -191,6 +191,26 @@ int x ;
 1. C-Vise creates temporary directories in `$TMPDIR` and so usage
 of a `tmpfs` directory is recommended.
 
+1. A reduction of a large file runs for a long time, and it does not have
+to be lost when the machine reboots or the run is killed. Pass
+`--checkpoint <file>` and C-Vise records how far it got; running the same
+command again continues from there:
+
+   ```
+   cvise --checkpoint=reduction.json ./test.sh prog.cc
+   ```
+
+   The file being reduced is not kept in the checkpoint, because C-Vise
+   overwrites it with every smaller interesting variant, so what is on disk
+   is already the best result so far. The checkpoint is tied to the reduction
+   through the pristine input (kept as `prog.cc.orig`) and the interestingness
+   test; if either changed, or if the file to reduce grew, the resume is
+   refused with an explanation instead of silently continuing from a position
+   that no longer means anything. The checkpoint file is deleted once the
+   reduction finishes. Passes that run interleaved form a single unit, so an
+   interruption inside such a category replays it over the already reduced
+   file.
+
 1. Each invocation of the interestingness test is performed in a fresh
 temporary directory containing a copy of the file that is being
 reduced. If your interestingness test requires access to other files,
