@@ -27,6 +27,10 @@ from pathlib import Path
 CVISE = os.environ.get('CVISE_CLI', '')
 LIB = os.environ.get('FAKECHROOT_LIB', '')
 MARKER = 'KEEP-THIS-STRING-42'
+# Whichever C++ compiler this environment actually has: the reduction image
+# carries clang, a desktop usually has g++, and hardcoding either makes the
+# test report a broken overlay when the only thing missing is a compiler.
+CXX = os.environ.get('CXX') or shutil.which('g++') or shutil.which('clang++-19') or shutil.which('clang++')
 
 PROJECT = {
     'core.hpp': '#pragma once\nconst char* core_message();\nint core_padding();\n',
@@ -65,14 +69,14 @@ def write_test_script(path: Path, project: Path, witness: Path):
         '# if the overlay is doing its job, these are the candidate sources.\n'
         f'cd {project} || exit 125\n'
         f'md5sum *.cpp *.hpp >> {witness} 2>/dev/null\n'
-        'g++ -O0 -o prog main.cpp core.cpp extra.cpp 2>/dev/null || exit 1\n'
+        f'{CXX} -O0 -o prog main.cpp core.cpp extra.cpp 2>/dev/null || exit 1\n'
         f'./prog 2>/dev/null | grep -q {MARKER}\n'
     )
     path.chmod(0o755)
 
 
-@pytest.mark.skipif(not CVISE or not Path(LIB).exists(),
-                    reason='needs CVISE_CLI and FAKECHROOT_LIB pointing at built halves')
+@pytest.mark.skipif(not CVISE or not Path(LIB).exists() or not CXX,
+                    reason='needs CVISE_CLI, FAKECHROOT_LIB and a C++ compiler')
 def test_reduction_through_the_overlay(tmp_path):
     work = tmp_path
     if True:
