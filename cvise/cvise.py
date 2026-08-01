@@ -218,10 +218,9 @@ class CVise:
 
     def reduce(self, pass_group, skip_initial):
         self._check_prerequisites(pass_group)
-        if memory.ceiling_required():
-            ceiling = memory.guard_memory_ceiling()
-            logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
-        if overlay.overlay_required():
+        ceiling = memory.guard_memory_ceiling()
+        logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
+        if overlay.overlay_configured():
             answer = overlay.prove_overlay()
             logging.info('reduction overlay proved itself (challenge answered %d)', answer)
         if not self.skip_interestingness_test_check:
@@ -283,12 +282,10 @@ class CVise:
 
     def _run_passes(self, passes: list[AbstractPass], interleaving: bool, check_threshold: bool) -> bool:
         """Runs the given passes once; returns whether the stopping threshold was met."""
-        available_passes = []
-        for p in passes:
-            if not p.check_prerequisites():
-                logging.error(f'Skipping pass {p}')
-            else:
-                available_passes.append(p)
+        # No second, quieter opinion: _check_prerequisites already refused to
+        # start a schedule that cannot be honoured, and a pass silently dropped
+        # here would make that refusal a lie.
+        available_passes = list(passes)
         if not available_passes:
             return False
 

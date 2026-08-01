@@ -114,6 +114,20 @@ class AdvanceOnSuccessEnvironment:
 # interesting", as it always did.
 UNDECIDED_EXIT_CODE = 125
 
+
+def is_undecided(exitcode: int) -> bool:
+    """Did the test fail to reach a verdict, rather than return one?
+
+    A cooperative test says so with UNDECIDED_EXIT_CODE. But the case this
+    exists for -- the test killed by the OOM killer -- is not cooperative at
+    all: the process dies by signal and never gets to choose an exit code. The
+    kernel is the one answering, and subprocess reports that as a NEGATIVE
+    return code. Reading that as "not interesting" is exactly the silent bias
+    this is meant to prevent, and it is the common case, not the rare one, so a
+    mechanism that only honours the cooperative code protects almost nothing.
+    """
+    return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
+
 # How many such answers a run tolerates before concluding that the environment,
 # not the candidate, is what cannot be judged.
 UNDECIDED_BUDGET = 16
@@ -460,6 +474,7 @@ class TestManager:
         self.no_give_up = no_give_up
         self.also_interesting = also_interesting
         self.undecided_count = 0
+        self.undecided_in_pass = 0
         self.start_with_pass = start_with_pass
         self.skip_after_n_transforms = skip_after_n_transforms
         self.stopping_threshold = stopping_threshold
@@ -690,6 +705,12 @@ class TestManager:
         self.tmp_dir_manager.delete_dir(folder)
         if returncode == 0:
             logging.debug('sanity check successful')
+        elif is_undecided(returncode):
+            # The unmodified input did not fail the test -- the test never ran
+            # to a verdict. Calling the input insane here would send the user
+            # hunting a bug in their own test script when the machine is what
+            # was out of memory.
+            raise UndecidedTestError(1)
         else:
             raise InsaneTestCaseError(self.test_cases, self.test_script, stdout, stderr)
 
@@ -713,6 +734,7 @@ class TestManager:
         all, and continuing would only produce a confidently biased answer.
         """
         self.undecided_count += 1
+        self.undecided_in_pass += 1
         logging.warning(
             'the interestingness test could not decide (exit %d); the candidate keeps its '
             'previous state -- %d of these so far, budget %d',
@@ -877,7 +899,7 @@ class TestManager:
         match test_env.result:
             case PassResult.OK:
                 assert test_env.exitcode
-                if test_env.exitcode == UNDECIDED_EXIT_CODE:
+                if is_undecided(test_env.exitcode):
                     return self._handle_undecided(job)
                 if self.also_interesting is not None and test_env.exitcode == self.also_interesting:
                     self.save_extra_dir(test_env.test_case_path)
@@ -1039,6 +1061,7 @@ class TestManager:
             self.pass_contexts.append(PassContext.create(pass_))
         self.jobs = []
 
+        self.undecided_in_pass = 0
         if not self.no_cache:
             hash_before_pass = fileutil.hash_test_case(test_case)
             if cached_path := self.cache.lookup(augmented_passes, hash_before_pass):
@@ -1098,7 +1121,14 @@ class TestManager:
 
         if not self.no_cache:
             assert hash_before_pass is not None
-            self.cache.add(augmented_passes, hash_before_pass, test_case)
+            if self.undecided_in_pass:
+                # Some candidate in this pass never got a verdict, so "this pass
+                # achieves nothing here" is not something we learned -- it is
+                # something we failed to find out. Caching it would turn one
+                # transient out-of-memory into a permanent hole in the schedule.
+                logging.info('not caching this pass: %d candidates went unjudged', self.undecided_in_pass)
+            else:
+                self.cache.add(augmented_passes, hash_before_pass, test_case)
 
     def process_result(self) -> None:
         assert self.success_candidate

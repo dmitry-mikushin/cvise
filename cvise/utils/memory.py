@@ -28,7 +28,6 @@ care how many jobs run underneath it.
 """
 
 import os
-import resource
 from pathlib import Path
 
 from cvise.utils.error import CViseError
@@ -54,12 +53,18 @@ class NoMemoryCeilingError(CViseError):
 
 
 def current_cgroup() -> str:
+    """The v2 path for this process, or '/' when it is in the root cgroup.
+
+    An empty string means "not on cgroup v2 at all", which is a different thing
+    from "in the root cgroup" and must not be confused with it: the root cgroup
+    has a readable memory.max like any other.
+    """
     try:
         with open('/proc/self/cgroup') as f:
             for line in f:
                 parts = line.strip().split(':', 2)
                 if len(parts) == 3 and parts[0] == '0':
-                    return parts[2]
+                    return parts[2] or '/'
     except OSError:
         pass
     return ''
@@ -75,6 +80,12 @@ def memory_ceiling() -> int | None:
     if not rel:
         return None
     node = CGROUP_ROOT / rel.lstrip('/')
+    if not node.exists():
+        # A cgroup namespace reports a path that does not exist in the
+        # /sys/fs/cgroup this process can see. Saying "no ceiling" would refuse
+        # to run in a perfectly bounded container, so say "cannot tell" and let
+        # the caller decide.
+        return None
     while True:
         try:
             value = (node / 'memory.max').read_text().strip()
@@ -87,24 +98,30 @@ def memory_ceiling() -> int | None:
         node = node.parent
 
 
-def guard_memory_ceiling(required: bool = True) -> int | None:
-    """Refuse to run without a ceiling, when one is demanded."""
+def total_ram() -> int:
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def guard_memory_ceiling() -> int:
+    """Refuse to run without a ceiling that is actually below the RAM."""
     ceiling = memory_ceiling()
-    if ceiling is None and required:
+    if ceiling is None:
         raise NoMemoryCeilingError(current_cgroup() or '<unknown>')
+    ram = total_ram()
+    if ram and ceiling >= ram:
+        # A limit at or above physical memory is a number, not a ceiling: the
+        # machine dies of its own scratch space long before the cgroup notices.
+        raise NoMemoryCeilingError(
+            f'{current_cgroup() or "<unknown>"} (memory.max is {ceiling >> 30} GiB, '
+            f'at or above the {ram >> 30} GiB this machine has)'
+        )
     return ceiling
 
 
-def ceiling_required() -> bool:
-    return os.environ.get('CVISE_REQUIRE_MEMORY_CEILING', '') not in ('', '0')
-
-
-def apply_test_memory_limit(limit_bytes: int) -> None:
-    """Bound one interestingness test, to be called in the child before exec.
-
-    A second line only: where cgroups are available they bound everything the
-    test spawns, including its tmpfs writes, which an rlimit cannot do.
-    """
-    if limit_bytes <= 0:
-        return
-    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))

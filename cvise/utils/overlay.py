@@ -29,7 +29,6 @@ from cvise.utils.error import CViseError
 OVERLAY_MAGIC = 0x6376697365D1AC70
 PROBE_PATH = '/.cvise-overlay-probe'
 DELTA_ENV = 'CVISE_OVERLAY_DELTA'
-REQUIRE_ENV = 'CVISE_REQUIRE_OVERLAY'
 SYMBOL = 'cvise_overlay_selfcheck'
 
 
@@ -47,8 +46,15 @@ class OverlayNotProvenError(CViseError):
         )
 
 
-def overlay_required() -> bool:
-    return os.environ.get(REQUIRE_ENV, '') not in ('', '0')
+def overlay_configured() -> bool:
+    """Is this run supposed to go through the overlay at all?
+
+    Asking for a delta IS the request to use the overlay, so that is the
+    condition. There is no separate switch to forget: a run that names a delta
+    and does not get redirection is a run whose every verdict is meaningless,
+    and it must not start.
+    """
+    return bool(os.environ.get(DELTA_ENV, ''))
 
 
 def prove_overlay() -> int:
@@ -59,7 +65,7 @@ def prove_overlay() -> int:
 
     try:
         fn = ctypes.CDLL(None)[SYMBOL]
-    except (AttributeError, KeyError):
+    except AttributeError:
         raise OverlayNotProvenError(
             f'the symbol {SYMBOL} is not in this process, so the overlay library is not loaded'
         )
