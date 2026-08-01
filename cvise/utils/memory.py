@@ -29,6 +29,10 @@ care how many jobs run underneath it.
 
 import logging
 import os
+import shutil
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 from cvise.utils.error import CViseError
@@ -40,6 +44,10 @@ CGROUP_ROOT = Path('/sys/fs/cgroup')
 # this process is not allowed to see.
 UNKNOWN_CEILING = -1
 
+# How much of what the machine has free a reduction may claim. The rest is for
+# everything else on the machine, including the page cache the compilers need.
+CEILING_FRACTION = 0.75
+
 
 class NoMemoryCeilingError(CViseError):
     def __init__(self, cgroup):
@@ -47,15 +55,70 @@ class NoMemoryCeilingError(CViseError):
 
     def __str__(self):
         return (
-            f'This reduction is running in cgroup {self.cgroup}, which has no memory ceiling. '
-            'Refusing to start: the scratch space is a tmpfs, tmpfs pages are not reclaimable, '
-            'and the OOM killer cannot free them -- so a reduction that outgrows RAM takes the '
-            'machine with it instead of failing. Start it under a ceiling, for example:\n'
-            '    systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 cvise ...\n'
-            'The ceiling bounds the scratch space and the compilers together, because tmpfs '
-            'pages are charged to the cgroup that writes them. It is not a limit on how many '
-            'jobs run at once, and lowering the job count is not an alternative to it.'
+            f'This reduction is running in cgroup {self.cgroup}, which has no memory ceiling, '
+            'and C-Vise could not give itself one. Refusing to start: the scratch space is a '
+            'tmpfs, tmpfs pages are not reclaimable, and the OOM killer cannot free them -- so '
+            'a reduction that outgrows RAM takes the machine with it instead of failing. '
+            'Normally C-Vise places itself under a limit automatically; that needs a systemd '
+            'user session with the memory controller delegated. Without one, run it inside '
+            'anything that bounds memory -- a container with --memory, or a cgroup of your own.'
         )
+
+
+RELAUNCH_MARKER = 'CVISE_UNDER_MEMORY_CEILING'
+
+
+def relaunch_under_ceiling(argv: list[str]) -> bool:
+    """Put this process under a memory limit, rather than asking the user to.
+
+    The limit is not a user-facing decision: it is what keeps a reduction from
+    taking the machine down, and there is one right answer -- most of what the
+    machine has free, and no swap, since swapping at this scale is just a slower
+    death. Making the user write `systemd-run --user --scope -p MemoryMax=...`
+    in front of every invocation exposes an implementation detail and gets
+    forgotten exactly once.
+
+    Returns True when it has re-executed C-Vise inside a scope, in which case
+    the caller should stop.
+    """
+    if os.environ.get(RELAUNCH_MARKER):
+        return False  # this IS the relaunched process
+    if memory_ceiling() is not None:
+        return False  # already bounded by whoever started us
+    if shutil.which('systemd-run') is None:
+        return False
+
+    budget = int(available_ram() * CEILING_FRACTION)
+    if budget <= 0:
+        return False
+
+    env = dict(os.environ, **{RELAUNCH_MARKER: '1'})
+    command = [
+        'systemd-run', '--user', '--scope', '--quiet',
+        '-p', f'MemoryMax={budget}',
+        '-p', 'MemorySwapMax=0',
+        '--',
+    ] + argv
+    logging.info('placing this reduction under a %.1f GiB memory ceiling', budget / 2**30)
+    try:
+        child = subprocess.Popen(command, env=env)
+    except OSError:
+        return False
+
+    # The reduction now lives inside the scope, so the process the user can see
+    # and signal is this one. Without forwarding, Control-C reaches the wrapper
+    # and the reduction carries on -- the ceiling would have cost the user the
+    # ability to stop their own run.
+    def forward(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+
+    sys.exit(child.wait())
 
 
 def current_cgroup() -> str:
@@ -103,6 +166,18 @@ def memory_ceiling() -> int | None:
         if node == CGROUP_ROOT or CGROUP_ROOT not in node.parents:
             return None
         node = node.parent
+
+
+def available_ram() -> int:
+    """What the machine can actually spare right now, not what it has in total."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
 
 
 def total_ram() -> int:

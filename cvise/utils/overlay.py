@@ -30,13 +30,24 @@ import secrets
 
 from cvise.utils.error import CViseError
 
-# Must match src/libfakechroot.h in the overlay.
+# Must match overlay/src/libfakechroot.h, which is built alongside this.
 OVERLAY_MAGIC = 0x6376697365D1AC70
 PROBE_PATH = '/.cvise-overlay-probe'
 DELTA_ENV = 'CVISE_OVERLAY_DELTA'
 SYMBOL = 'cvise_overlay_selfcheck'
 LIB_ENV = 'CVISE_OVERLAY_LIB'
 ROOT_ENV = 'CVISE_OVERLAY_ROOT'
+
+
+class OverlayMissingError(CViseError):
+    def __str__(self):
+        return (
+            'The reduction overlay is not installed. Refusing to start: without it every '
+            'candidate is prepared by copying the project, which restamps every file, so the '
+            'build system rebuilds everything for every candidate and a reduction of any real '
+            'project does not finish. This is built as part of C-Vise, so its absence means an incomplete '
+            f'installation: it belongs at {INSTALLED_LIB}.'
+        )
 
 
 class OverlayNotProvenError(CViseError):
@@ -48,7 +59,7 @@ class OverlayNotProvenError(CViseError):
             f'The reduction overlay could not prove itself: {self.reason}. '
             'Refusing to continue: without the overlay the compiler reads the original '
             'sources, so every candidate would be graded against code the reduction never '
-            f'changed. Check that libfakechroot is in LD_PRELOAD and that {DELTA_ENV} points '
+            f'changed. Check that the overlay library is in LD_PRELOAD and that {DELTA_ENV} points '
             'at the delta directory of this run.'
         )
 
@@ -113,9 +124,32 @@ def prove_overlay() -> int:
     return answer
 
 
+# Where the library is installed alongside C-Vise's other helpers, filled in at
+# configure time exactly as they are.
+INSTALLED_LIB = os.path.join('@CMAKE_INSTALL_FULL_LIBEXECDIR@', '@cvise_PACKAGE@', 'libcvise_overlay.so')
+
+
 def library_path() -> str:
-    """The overlay library to preload into the interestingness test, if any."""
-    return os.environ.get(LIB_ENV, '')
+    """The overlay library, found the way every other helper is found.
+
+    This is not a knob. Whether the reduction goes through an overlay is a
+    property of how C-Vise is built and installed, not a decision to leave on
+    the command line: a user who forgets it gets a reduction that copies the
+    whole tree for every candidate, and one who mistypes it gets no overlay at
+    all with no indication that anything is different. The environment variable
+    stays only so that a developer can point at a build tree.
+    """
+    override = os.environ.get(LIB_ENV, '')
+    if override:
+        return override
+    for candidate in (
+        INSTALLED_LIB,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     '@cvise_SCRIPT_TO_PACKAGE_PATH@', 'libcvise_overlay.so'),
+    ):
+        if '@' not in candidate and os.path.exists(candidate):
+            return candidate
+    return ''
 
 
 def prepare_job_delta(folder, variants) -> Path:

@@ -25,7 +25,12 @@ import tempfile
 from pathlib import Path
 
 CVISE = os.environ.get('CVISE_CLI', '')
-LIB = os.environ.get('FAKECHROOT_LIB', '')
+# The library is built with C-Vise now, so the test finds it the way the
+# reducer does rather than being told where it is.
+LIB = os.environ.get('CVISE_OVERLAY_LIB', '')
+if not LIB:
+    from cvise.utils import overlay as _overlay
+    LIB = _overlay.library_path()
 MARKER = 'KEEP-THIS-STRING-42'
 # Whichever C++ compiler this environment actually has: the reduction image
 # carries clang, a desktop usually has g++, and hardcoding either makes the

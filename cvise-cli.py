@@ -28,6 +28,7 @@ import psutil  # noqa: E402
 
 from cvise.cvise import CVise  # noqa: E402
 from cvise.passes.abstract import AbstractPass  # noqa: E402
+from cvise.utils import memory  # noqa: E402
 from cvise.utils import project as project_utils  # noqa: E402
 from cvise.utils import statistics, testing  # noqa: E402
 from cvise.utils.error import CViseError, MissingPassGroupsError  # noqa: E402
@@ -311,6 +312,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # A reduction that outgrows RAM takes the machine down rather than failing,
+    # so it runs under a memory limit -- one C-Vise arranges for itself. Making
+    # the user prefix every invocation with systemd-run would put an
+    # implementation detail in the interface, and it would be forgotten exactly
+    # once. Nothing below runs in this process if the relaunch happens.
+    if not args.list_passes:
+        memory.relaunch_under_ceiling([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
     if not args.list_passes and (not args.project or not args.interestingness_test):
         parser.error('the following arguments are required: CMAKELISTS, INTERESTINGNESS_TEST')

@@ -219,6 +219,7 @@ include(GNUInstallDirs)
 add_subdirectory(clang_delta)
 add_subdirectory(clang_include_graph)
 add_subdirectory(clex)
+add_subdirectory(overlay)
 add_subdirectory(cvise)
 add_subdirectory(delta)
 add_subdirectory(treesitter_delta)
@@ -240,6 +241,12 @@ configure_file(
 configure_file(
   "${PROJECT_SOURCE_DIR}/cvise/utils/externalprograms.py"
   "${PROJECT_BINARY_DIR}/cvise/utils/externalprograms.py"
+  @ONLY
+)
+
+configure_file(
+  "${PROJECT_SOURCE_DIR}/cvise/utils/overlay.py"
+  "${PROJECT_BINARY_DIR}/cvise/utils/overlay.py"
   @ONLY
 )
 

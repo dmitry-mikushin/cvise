@@ -1,0 +1,49 @@
+/*
+    libfakechroot -- fake chroot environment
+    Copyright (c) 2010, 2013 Piotr Roszatycki <dexter@debian.org>
+
+    This library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public
+    License along with this library; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307  USA
+*/
+
+
+#include <config.h>
+
+#ifdef HAVE_SCANDIR
+
+#include <dirent.h>
+#include "libfakechroot.h"
+
+
+wrapper(scandir, int, (const char * dir, struct dirent *** namelist, SCANDIR_TYPE_ARG3(filter), SCANDIR_TYPE_ARG4(compar)))
+{
+    char fakechroot_abspath[FAKECHROOT_PATH_MAX];
+    debug("scandir(\"%s\", &namelist, &filter, &compar)", dir);
+    /* Directories are NOT served from the delta.
+       A delta directory holds only what this job happened to write, so
+       redirecting the listing answers "what is in here?" with "the two object
+       files I just produced" and hides every source file in the shared tree.
+       That is a silently wrong answer to the one question a build asks about a
+       directory, and it fires on the first write into it. Listing the original
+       is the honest half-answer: everything shared is visible, a file this job
+       created is reachable by name even though it is not listed, and a file it
+       deleted is listed but opens as ENOENT. Merging the two listings is the
+       full answer and wants a readdir that walks both. */
+    expand_chroot_path_nodelta(dir);
+    return nextcall(scandir)(dir, namelist, filter, compar);
+}
+
+#else
+typedef int empty_translation_unit;
+#endif

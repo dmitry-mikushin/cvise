@@ -223,9 +223,13 @@ class CVise:
         ceiling = memory.guard_memory_ceiling(required=overlay.overlay_configured())
         if ceiling:
             logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
-        if overlay.overlay_configured():
-            answer = overlay.prove_overlay()
-            logging.info('reduction overlay proved itself (challenge answered %d)', answer)
+        # Not a choice: a reduction without the overlay copies the whole project
+        # for every candidate and rebuilds all of it, which does not finish. An
+        # absent overlay is a broken installation, not a mode.
+        if not overlay.overlay_configured():
+            raise overlay.OverlayMissingError()
+        answer = overlay.prove_overlay()
+        logging.info('reduction overlay proved itself (challenge answered %d)', answer)
         if not self.skip_interestingness_test_check:
             self.test_manager.check_sanity()
 
