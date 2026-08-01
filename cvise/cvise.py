@@ -218,8 +218,11 @@ class CVise:
 
     def reduce(self, pass_group, skip_initial):
         self._check_prerequisites(pass_group)
-        ceiling = memory.guard_memory_ceiling()
-        logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
+        # Reducing a whole project through the overlay is the workload that can
+        # take the machine down, so that is the one that must be bounded.
+        ceiling = memory.guard_memory_ceiling(required=overlay.overlay_configured())
+        if ceiling:
+            logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
         if overlay.overlay_configured():
             answer = overlay.prove_overlay()
             logging.info('reduction overlay proved itself (challenge answered %d)', answer)

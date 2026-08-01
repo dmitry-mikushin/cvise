@@ -27,12 +27,18 @@ one if it is not. It does not lower the ceiling for anyone, and it does not
 care how many jobs run underneath it.
 """
 
+import logging
 import os
 from pathlib import Path
 
 from cvise.utils.error import CViseError
 
 CGROUP_ROOT = Path('/sys/fs/cgroup')
+
+# Returned when the cgroup hierarchy cannot be inspected from here -- typically
+# inside a cgroup namespace, where the workload may well be bounded by a limit
+# this process is not allowed to see.
+UNKNOWN_CEILING = -1
 
 
 class NoMemoryCeilingError(CViseError):
@@ -82,10 +88,11 @@ def memory_ceiling() -> int | None:
     node = CGROUP_ROOT / rel.lstrip('/')
     if not node.exists():
         # A cgroup namespace reports a path that does not exist in the
-        # /sys/fs/cgroup this process can see. Saying "no ceiling" would refuse
-        # to run in a perfectly bounded container, so say "cannot tell" and let
-        # the caller decide.
-        return None
+        # /sys/fs/cgroup this process can see. That is not "no ceiling", it is
+        # "cannot tell", and the two must not share a return value: a bounded
+        # container reports exactly this, and refusing there would be the
+        # opposite of the intent.
+        return UNKNOWN_CEILING
     while True:
         try:
             value = (node / 'memory.max').read_text().strip()
@@ -109,13 +116,33 @@ def total_ram() -> int:
     return 0
 
 
-def guard_memory_ceiling() -> int:
-    """Refuse to run without a ceiling that is actually below the RAM."""
+def guard_memory_ceiling(required: bool) -> int | None:
+    """Check for a ceiling; refuse only when this run demands one.
+
+    Demanding one unconditionally would make an ordinary reduction of a single
+    file refuse to start on a normal desktop, which trades one failure mode for
+    a worse one. The ceiling matters for the workload that actually threatens
+    the machine -- a whole project, many jobs, a RAM-backed scratch -- so that
+    is where it is required, and everywhere else it is said out loud and left
+    to the operator.
+    """
     ceiling = memory_ceiling()
+    if ceiling == UNKNOWN_CEILING:
+        logging.info('cannot inspect the cgroup hierarchy from here; assuming the '
+                     'workload is bounded by a limit set outside this namespace')
+        return None
     if ceiling is None:
+        if not required:
+            logging.warning(
+                'no memory ceiling on this cgroup: a reduction that outgrows RAM will take '
+                'the machine down rather than fail, because tmpfs pages are not reclaimable '
+                'and the OOM killer cannot free them. Consider: '
+                'systemd-run --user --scope -p MemoryMax=... -p MemorySwapMax=0 cvise ...'
+            )
+            return None
         raise NoMemoryCeilingError(current_cgroup() or '<unknown>')
     ram = total_ram()
-    if ram and ceiling >= ram:
+    if ceiling is not None and ram and ceiling >= ram:
         # A limit at or above physical memory is a number, not a ceiling: the
         # machine dies of its own scratch space long before the cgroup notices.
         raise NoMemoryCeilingError(
