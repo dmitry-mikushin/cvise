@@ -26,7 +26,7 @@ import pebble
 from cvise.cvise import CVise
 from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
-from cvise.utils import cache, fileutil, mplogging, sigmonitor
+from cvise.utils import cache, fileutil, mplogging, overlay, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
     AbsolutePathTestCaseError,
@@ -240,6 +240,16 @@ class TestEnvironment:
         # interestingness test, or because C-Vise abruptly kills our job without a chance for a proper cleanup).
         with tempfile.TemporaryDirectory(dir=self.folder, prefix='overridetmp') as tmp_override:
             env = override_tmpdir_env(os.environ.copy(), Path(tmp_override))
+            if overlay.library_path():
+                # Without this the test builds the project from the pristine
+                # sources and answers a question about code this candidate never
+                # touched -- which looks exactly like a working reduction.
+                variants = [(tc.resolve(), self.folder / tc) for tc in self.all_test_cases]
+                delta = overlay.prepare_job_delta(self.folder, variants)
+                root = os.path.commonpath([str(tc.resolve()) for tc in self.all_test_cases])
+                if not Path(root).is_dir():
+                    root = str(Path(root).parent)
+                env = overlay.job_environment(env, delta, Path(root))
             stdout, stderr, returncode = ProcessEventNotifier(self.pid_queue).run_process(
                 str(self.test_script), shell=True, env=env, cwd=self.folder
             )

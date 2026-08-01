@@ -21,6 +21,8 @@ Either question unanswered is fatal.
 
 import ctypes
 import os
+import shutil
+from pathlib import Path
 import secrets
 
 from cvise.utils.error import CViseError
@@ -30,6 +32,8 @@ OVERLAY_MAGIC = 0x6376697365D1AC70
 PROBE_PATH = '/.cvise-overlay-probe'
 DELTA_ENV = 'CVISE_OVERLAY_DELTA'
 SYMBOL = 'cvise_overlay_selfcheck'
+LIB_ENV = 'CVISE_OVERLAY_LIB'
+ROOT_ENV = 'CVISE_OVERLAY_ROOT'
 
 
 class OverlayNotProvenError(CViseError):
@@ -87,3 +91,47 @@ def prove_overlay() -> int:
             f'{SYMBOL} is not the overlay this build expects'
         )
     return answer
+
+
+def library_path() -> str:
+    """The overlay library to preload into the interestingness test, if any."""
+    return os.environ.get(LIB_ENV, '')
+
+
+def prepare_job_delta(folder, variants) -> Path:
+    """Put this job's variants where the overlay will serve them from.
+
+    The reducer produces a candidate as a file in the job's own scratch
+    directory, but the build under test opens the project by its real path and
+    knows nothing about scratch directories. The overlay bridges that: a file
+    placed at <delta>/<original absolute path> is what every process in this job
+    sees when it opens the original. Nothing is copied except the files the
+    candidate actually changed.
+    """
+    delta = Path(folder) / '.cvise-delta'
+    for original, produced in variants:
+        target = delta / str(original).lstrip('/')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if produced.is_dir():
+            shutil.copytree(produced, target, dirs_exist_ok=True)
+        else:
+            shutil.copyfile(produced, target)
+    return delta
+
+
+def job_environment(env: dict, delta: Path, root: Path) -> dict:
+    """Point one job's processes at its own delta.
+
+    The proof that the overlay is loaded has to happen where the compiling
+    happens. Checking it once in the parent says nothing about the children,
+    which is where the redirection actually has to work.
+    """
+    lib = library_path()
+    if not lib:
+        return env
+    env = dict(env)
+    preload = env.get('LD_PRELOAD', '')
+    env['LD_PRELOAD'] = f'{lib}:{preload}' if preload else lib
+    env[DELTA_ENV] = str(delta)
+    env[ROOT_ENV] = str(root)
+    return env
