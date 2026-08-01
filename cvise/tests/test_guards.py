@@ -202,28 +202,39 @@ def _fake_cgroup_file():
 
 
 class TestOverlayProof:
-    def test_asking_for_a_delta_is_asking_for_the_overlay(self, monkeypatch):
-        """There is no second switch to forget."""
-        monkeypatch.setenv(overlay.DELTA_ENV, '/somewhere')
+    def test_naming_the_library_is_asking_for_the_overlay(self, monkeypatch):
+        """There is no second switch to forget.
+
+        It cannot key off the delta: there is one per job now, created by
+        C-Vise itself, so the guard would be reading a variable the user never
+        sets and would never fire in the only mode that uses the overlay.
+        """
+        monkeypatch.setenv(overlay.LIB_ENV, '/somewhere/libfakechroot.so')
         assert overlay.overlay_configured()
 
-    def test_without_a_delta_the_overlay_is_not_expected(self, monkeypatch):
-        monkeypatch.delenv(overlay.DELTA_ENV, raising=False)
+    def test_without_a_library_the_overlay_is_not_expected(self, monkeypatch):
+        monkeypatch.delenv(overlay.LIB_ENV, raising=False)
         assert not overlay.overlay_configured()
 
-    def test_a_missing_library_is_refused(self, monkeypatch, tmp_path):
+    def test_a_library_that_is_not_there_is_refused(self, monkeypatch, tmp_path):
         """The whole point: an absent overlay must not look like a working one.
 
         Without redirection the compiler reads the original sources, every
         candidate is "interesting", and the run confidently reduces nothing.
         """
-        monkeypatch.setenv(overlay.DELTA_ENV, str(tmp_path))
-        if 'libfakechroot' in os.environ.get('LD_PRELOAD', ''):
-            pytest.skip('the overlay is loaded into this process')
+        monkeypatch.setenv(overlay.LIB_ENV, str(tmp_path / 'not-built.so'))
         with pytest.raises(OverlayNotProvenError):
             overlay.prove_overlay()
 
-    def test_a_missing_delta_is_refused(self, monkeypatch):
-        monkeypatch.delenv(overlay.DELTA_ENV, raising=False)
+    def test_a_library_that_does_not_redirect_is_refused(self, monkeypatch, tmp_path):
+        """Loaded is not the same as working."""
+        impostor = tmp_path / 'impostor.so'
+        impostor.write_bytes(b'not an object file')
+        monkeypatch.setenv(overlay.LIB_ENV, str(impostor))
+        with pytest.raises(OverlayNotProvenError):
+            overlay.prove_overlay()
+
+    def test_no_library_named_means_nothing_to_prove(self, monkeypatch):
+        monkeypatch.delenv(overlay.LIB_ENV, raising=False)
         with pytest.raises(OverlayNotProvenError):
             overlay.prove_overlay()

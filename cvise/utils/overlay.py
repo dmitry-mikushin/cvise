@@ -22,6 +22,9 @@ Either question unanswered is fatal.
 import ctypes
 import os
 import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 import secrets
 
@@ -53,42 +56,59 @@ class OverlayNotProvenError(CViseError):
 def overlay_configured() -> bool:
     """Is this run supposed to go through the overlay at all?
 
-    Asking for a delta IS the request to use the overlay, so that is the
-    condition. There is no separate switch to forget: a run that names a delta
-    and does not get redirection is a run whose every verdict is meaningless,
-    and it must not start.
+    Naming the library IS the request to use it. The delta cannot be the
+    condition: there is one per job now, created by C-Vise itself, so keying
+    off it meant the check never fired in the only mode that uses the overlay
+    -- the guard was reading a variable that the user no longer sets.
     """
-    return bool(os.environ.get(DELTA_ENV, ''))
+    return bool(library_path())
 
 
 def prove_overlay() -> int:
-    """Run both halves of the self-check. Returns the answer for logging."""
-    delta = os.environ.get(DELTA_ENV, '')
-    if not delta:
-        raise OverlayNotProvenError(f'{DELTA_ENV} is not set')
+    """Prove the overlay works in a process built exactly like a job's.
 
-    try:
-        fn = ctypes.CDLL(None)[SYMBOL]
-    except AttributeError:
-        raise OverlayNotProvenError(
-            f'the symbol {SYMBOL} is not in this process, so the overlay library is not loaded'
-        )
-    fn.restype = ctypes.c_uint64
-    fn.argtypes = [ctypes.c_uint64]
+    Asking the question inside C-Vise itself would answer about the wrong
+    process: the library is preloaded into the interestingness test and its
+    compilers, not into the reducer. So the proof is run in a child set up the
+    same way a job will be -- same library, same kind of delta -- and what it
+    demonstrates is what the jobs will get.
+    """
+    lib = library_path()
+    if not lib:
+        raise OverlayNotProvenError(f'{LIB_ENV} is not set')
+    if not Path(lib).exists():
+        raise OverlayNotProvenError(f'{LIB_ENV}={lib} does not exist')
 
     challenge = secrets.randbits(64)
-    answer = fn(challenge)
-    expected_loaded = (challenge ^ OVERLAY_MAGIC) & 0xFFFFFFFFFFFFFFFF
+    expected = ((challenge ^ OVERLAY_MAGIC) + 1) & 0xFFFFFFFFFFFFFFFF
 
-    if answer == expected_loaded:
-        raise OverlayNotProvenError(
-            f'the library answers, but it does not redirect {PROBE_PATH} -- '
-            f'{DELTA_ENV}={delta} holds no probe, so the overlay is loaded but inert'
+    with tempfile.TemporaryDirectory(prefix='cvise-overlay-proof-') as delta:
+        probe = Path(delta) / PROBE_PATH.lstrip('/')
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text('probe\n')
+        env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: delta, ROOT_ENV: '/'}
+        code = (
+            'import ctypes\n'
+            'fn = ctypes.CDLL(None)[%r]\n'
+            'fn.restype = ctypes.c_uint64\n'
+            'fn.argtypes = [ctypes.c_uint64]\n'
+            'print(fn(%d))\n' % (SYMBOL, challenge)
         )
-    if answer != (expected_loaded + 1) & 0xFFFFFFFFFFFFFFFF:
+        proc = subprocess.run([sys.executable, '-c', code], capture_output=True,
+                              text=True, env=env)
+
+    if proc.returncode != 0:
         raise OverlayNotProvenError(
-            f'the answer to the challenge is wrong ({answer}), so whatever exports '
-            f'{SYMBOL} is not the overlay this build expects'
+            f'a child with {lib} preloaded could not answer: {proc.stderr.strip()[:200]}'
+        )
+    try:
+        answer = int(proc.stdout.strip())
+    except ValueError:
+        raise OverlayNotProvenError(f'the answer was not a number: {proc.stdout.strip()[:80]}')
+    if answer != expected:
+        raise OverlayNotProvenError(
+            f'the answer to the challenge is wrong ({answer} instead of {expected}), so the '
+            'library either does not redirect or is not the overlay this build expects'
         )
     return answer
 
