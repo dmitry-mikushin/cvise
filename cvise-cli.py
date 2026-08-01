@@ -8,6 +8,7 @@ import multiprocessing
 import multiprocessing.forkserver
 import os
 import os.path
+import shutil
 import sys
 import tempfile
 import time
@@ -27,11 +28,10 @@ import psutil  # noqa: E402
 
 from cvise.cvise import CVise  # noqa: E402
 from cvise.passes.abstract import AbstractPass  # noqa: E402
+from cvise.utils import project as project_utils  # noqa: E402
 from cvise.utils import statistics, testing  # noqa: E402
 from cvise.utils.error import CViseError, MissingPassGroupsError  # noqa: E402
 from cvise.utils.externalprograms import find_external_programs  # noqa: E402
-from cvise.utils.fileutil import CloseableTemporaryFile  # noqa: E402
-from cvise.utils.hint import apply_hints, load_hints  # noqa: E402
 
 
 class DeltaTimeFormatter(logging.Formatter):
@@ -132,12 +132,6 @@ def main():
         description='C-Vise',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG_TEXT,
-    )
-    parser.add_argument(
-        '--action',
-        choices=['reduce', 'apply-hints'],
-        default='reduce',
-        help='Action to perform ("reduce" by default)',
     )
     parser.add_argument(
         '--n',
@@ -264,13 +258,6 @@ def main():
         help='Specify clang_delta C++ standard, it can rapidly speed up all clang_delta passes',
     )
     parser.add_argument(
-        '--compilation-database',
-        type=str,
-        help='Path to compile_commands.json, or to the build directory holding it. The clang_delta '
-        'passes then parse each file with the flags its build actually uses, instead of a bare '
-        'default invocation that cannot even find the project headers',
-    )
-    parser.add_argument(
         '--clang-delta-preserve-routine',
         type=str,
         help='Preserve the given function in replace-function-def-with-decl clang delta pass',
@@ -293,12 +280,6 @@ def main():
         + (f' ({CVise.Info.GIT_VERSION})' if CVise.Info.GIT_VERSION != 'unknown' else ''),
     )
     parser.add_argument(
-        '--commands',
-        '-c',
-        help='Use shell commands instead of an interestingness test case',
-    )
-    parser.add_argument('--shell', default='bash', help='Use selected shell for the --commands option')
-    parser.add_argument(
         '--to-utf8',
         action='store_true',
         help='Convert any non-UTF-8 encoded input file to UTF-8',
@@ -309,42 +290,30 @@ def main():
         help='Skip each pass after N successful transformations',
     )
     parser.add_argument(
+        'project',
+        metavar='CMAKELISTS',
+        nargs='?',
+        help='CMakeLists.txt of the project to reduce. C-Vise runs CMake once on it to obtain '
+        'compile_commands.json, and takes everything else from there: which files exist and '
+        'what flags each one is compiled with',
+    )
+    parser.add_argument(
         'interestingness_test',
         metavar='INTERESTINGNESS_TEST',
         nargs='?',
-        help='Executable to check interestingness of test cases',
+        help='Executable that decides whether a variant of the project is still interesting',
     )
-    parser.add_argument('test_cases', metavar='TEST_CASE', nargs='*', help='Test cases (files or directories)')
     parser.add_argument(
         '--stopping-threshold',
         default=1.0,
         type=float,
         help='CVise will stop reducing a test case once it has reduced by this fraction of its original size.  Between 0.0 and 1.0.',
     )
-    parser.add_argument(
-        '--hints-file', help='Path to file containing reduction hints (used only for --action=apply-hints)'
-    )
-    parser.add_argument(
-        '--hint-begin-index',
-        type=int,
-        help='Index of the first hint to apply; 0-based (used only for --action=apply-hints)',
-    )
-    parser.add_argument(
-        '--hint-end-index',
-        type=int,
-        help='Index past the last hint to apply; 0-based (used only for --action=apply-hints)',
-    )
 
     args = parser.parse_args()
 
-    # Shift interestingness_test to test_cases if --commands is used,
-    # or if it's the only positional argument (to match argparse nargs='+' behavior)
-    if args.interestingness_test is not None and (args.commands is not None or not args.test_cases):
-        args.test_cases.insert(0, args.interestingness_test)
-        args.interestingness_test = None
-
-    if not args.list_passes and not args.test_cases:
-        parser.error('the following arguments are required: TEST_CASE')
+    if not args.list_passes and (not args.project or not args.interestingness_test):
+        parser.error('the following arguments are required: CMAKELISTS, INTERESTINGNESS_TEST')
 
     log_config = {}
 
@@ -373,13 +342,9 @@ def main():
         syslog.setFormatter(formatter)
         root_logger.addHandler(syslog)
 
-    match args.action:
-        case 'reduce':
-            do_reduce(args)
-        case 'apply-hints':
-            do_apply_hints(args)
-        case _:
-            logging.error('Unknown action to perform: {args.action}')
+    # One action, because there is one thing to do: reduce the project the
+    # CMakeLists.txt describes.
+    do_reduce(args)
 
     logging.shutdown()
 
@@ -393,6 +358,7 @@ def do_reduce(args):
     if args.sllooww:
         pass_options.add(AbstractPass.Option.slow)
 
+
     if args.pass_group is not None:
         pass_group_file = get_pass_group_path(args.pass_group)
     elif args.pass_group_file is not None:
@@ -403,18 +369,21 @@ def do_reduce(args):
     external_programs = find_external_programs()
 
     pass_group_dict = CVise.load_pass_group_file(pass_group_file)
-    pass_group = CVise.parse_pass_group_dict(
-        pass_group_dict,
-        pass_options,
-        external_programs,
-        args.remove_pass,
-        args.clang_delta_std,
-        args.clang_delta_preserve_routine,
-        args.compilation_database,
-        args.not_c,
-        args.renaming,
-    )
+
     if args.list_passes:
+        # This question is about C-Vise, not about any project, so it must not
+        # be made to configure one.
+        pass_group = CVise.parse_pass_group_dict(
+            pass_group_dict,
+            pass_options,
+            external_programs,
+            args.remove_pass,
+            args.clang_delta_std,
+            args.clang_delta_preserve_routine,
+            None,
+            args.not_c,
+            args.renaming,
+        )
         print('Available passes:')
         for cat in CVise.PASS_CATEGORIES:
             if cat.name in pass_group:
@@ -422,6 +391,38 @@ def do_reduce(args):
                 for p in pass_group[cat.name]:
                     print(str(p))
         sys.exit(0)
+
+    # Everything the reduction needs to know about the project comes from one
+    # file, and it is not the CMakeLists.txt -- it is the compile_commands.json
+    # CMake writes from it. Asking the user for the file list or the flags on
+    # top of that is asking them to repeat what CMake already knows, and every
+    # such question is another way for the answer to disagree with the build.
+    # CMake needs somewhere to write; that somewhere is C-Vise's, it holds
+    # nothing but the database, and it is removed when the run ends. Leaving it
+    # behind would litter the user's TMPDIR once per invocation.
+    cmake_dir = Path(tempfile.mkdtemp(prefix='cvise-cmake-'))
+    project = project_utils.configure(Path(args.project), cmake_dir)
+    logging.info(
+        '%s: %d translation units under %s',
+        project.compilation_database,
+        len(project.sources),
+        project.root,
+    )
+    test_cases = [
+        p.relative_to(Path.cwd()) if p.is_relative_to(Path.cwd()) else p for p in project.sources
+    ]
+
+    pass_group = CVise.parse_pass_group_dict(
+        pass_group_dict,
+        pass_options,
+        external_programs,
+        args.remove_pass,
+        args.clang_delta_std,
+        args.clang_delta_preserve_routine,
+        str(project.compilation_database),
+        args.not_c,
+        args.renaming,
+    )
 
     pass_statistic = statistics.PassStatistic()
 
@@ -434,11 +435,6 @@ def do_reduce(args):
             )
             sys.exit(1)
 
-    if not args.interestingness_test and not args.commands:
-        print('Either INTERESTINGNESS_TEST or --commands must be used!')
-        sys.exit(1)
-
-    test_cases = [Path(s) for s in args.test_cases]
 
     if args.to_utf8:
         for test_case in test_cases:
@@ -450,13 +446,6 @@ def do_reduce(args):
                 test_case.write_text(data)
 
     script = None
-    if args.commands:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as script:
-            script.write(f'#!/usr/bin/env {args.shell}\n\n')
-            script.write(args.commands + '\n')
-        os.chmod(script.name, 0o744)
-        logging.info(f'Using temporary interestingness test: {script.name}')
-        args.interestingness_test = script.name
     assert args.interestingness_test
 
     # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
@@ -553,25 +542,7 @@ def do_reduce(args):
     finally:
         if script:
             os.unlink(script.name)
-
-
-def do_apply_hints(args):
-    if args.hints_file is None:
-        sys.exit('--hints-file is mandatory for --action=apply-hints')
-    if (
-        args.hint_begin_index is not None
-        and args.hint_end_index is not None
-        and args.hint_begin_index >= args.hint_end_index
-    ):
-        sys.exit('HINT_BEGIN_INDEX must be smaller than HINT_END_INDEX')
-    if len(args.test_cases) > 1:
-        sys.exit('exactly one TEST_CASE must be supplied')
-    bundle = load_hints(Path(args.hints_file), args.hint_begin_index, args.hint_end_index)
-    with CloseableTemporaryFile('wb') as tmp_file:
-        tmp_path = Path(tmp_file.name)
-        tmp_file.close()
-        apply_hints([bundle], source_path=Path(args.test_cases[0]), destination_path=tmp_path)
-        sys.stdout.buffer.write(tmp_path.read_bytes())
+        shutil.rmtree(cmake_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':

@@ -11,24 +11,17 @@ LLVM-based C/C++ reduction tool named `clang_delta`.
 
 **This project is looking for maintainers — reach out to [@marxin] if you're interested.**
 
-C-Vise is a tool that takes a large C, C++ or OpenCL program that
-has a property of interest (such as triggering a compiler bug) and
-automatically produces a much smaller C/C++ or OpenCL program that has
-the same property.  It is intended for use by people who discover and
-report bugs in compilers and other tools that process C/C++ or OpenCL
-code.
+C-Vise takes a CMake project that has a property of interest -- it triggers a
+compiler bug, or produces a particular output, or fails a particular test -- and
+produces a much smaller project that still has it. What survives the reduction
+is, by construction, the code responsible for that property; what it deletes is
+code that provably had nothing to do with it.
 
-The project also contains a simple wrapper `cvise-delta` which simulates
-the same behavior as original [delta](http://delta.tigris.org/) tool
-(but in super-parallel way).
-
-*NOTE*: C-Vise happens to do a pretty good job reducing the size of
-programs in languages other than C/C++, such as JavaScript and Rust.
-If you need to reduce programs in some other language, please give it
-a try.
-
-*NOTE*: Binary pass group (`--pass-group=binary`) contains an experimental pass
-that can reduce GCC's `.gcda` files.
+This fork reduces projects, not files. Upstream C-Vise accepts a single file, a
+list of files, a directory, or a hand-written compilation database, and can also
+apply hints instead of reducing; all of that is gone. The project's own build
+system already knows which files exist and how each is compiled, so it is asked,
+once, and everything follows from its answer.
 
 ## Speed Comparison
 
@@ -46,191 +39,102 @@ machine with the following results:
 
 See [INSTALL.md](INSTALL.md).
 
-## Usage example
+## Usage
 
-The C-Vise can be used for a reduction of a compiler crash. In this case,
-let's consider an existing [PR94534](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=94534):
-
-Original test-case (`pr94534.C` file):
-```c++
-template<typename T>
-class Demo
-{
-  struct
-  {
-    Demo* p;
-  } payload{this};
-  friend decltype(payload);
-};
-
-int main()
-{
-  Demo<int> d;
-}
-```
-
-The program crashes in GCC, but is accepted with Clang:
-```console
-$ g++ pr94534.C -c
-pr94534.C: In instantiation of ‘class Demo<int>’:
-pr94534.C:13:13:   required from here
-pr94534.C:7:5: internal compiler error: Segmentation fault
-    7 |   } payload{this};
-      |     ^~~~~~~
-0x10a1d8f crash_signal
-	/home/marxin/Programming/gcc/gcc/toplev.c:328
-0x7ffff78fef1f ???
-	/usr/src/debug/glibc-2.31-4.1.x86_64/signal/../sysdeps/unix/sysv/linux/x86_64/sigaction.c:0
-0xae31a8 instantiate_class_template_1
-	/home/marxin/Programming/gcc/gcc/cp/pt.c:11973
-...
-$ clang++ pr94534.C -c
-```
-
-So let's build a reduction script so that it will grep for `instantiate_class_template_1`
-on the standard error output and that it compiles with Clang:
-
-`reduce-ice.sh`:
-```shell
-#!/bin/sh
-g++ pr94534.C -c 2>&1 | grep 'instantiate_class_template_1' && clang++ -c pr94534.C
-```
-
-The reduction can be then run with:
-```console
-$ cvise ./reduce-ice.sh pr94534.C
-INFO ===< 30356 >===
-INFO running 16 interestingness tests in parallel
-INFO INITIAL PASSES
-INFO ===< IncludesPass >===
-...
-template <typename> class a {
-  int b;
-  friend decltype(b);
-};
-void c() { a<int> d; }
-```
-
-## Usage with multi-file inputs
-
-C-Vise can also reduce test cases containing multiple files - they can be
-passed in the command line individually or as whole directories. The latter is
-generally more efficient and allows C-Vise perform following reductions:
-
-* deleting some of input files;
-* merging files (e.g., inlining C/C++ headers that are only included once);
-* reducing compilation flags and targets from a `Makefile`.
-
-For example, assuming the following directory tree:
-
-```
-//--- repro/h1.h
-int x;
-
-//--- repro/h2.h
-#include "h1.h"
-
-//--- repro/src1.c
-#include "h2.h"
-
-//--- repro/src2.c
-// duplicate!
-int x;
-
-//--- repro/src3.c
-int main() {
-	return 0;
-}
-
-//--- repro/Makefile
-.PHONY: all clean
-all: prog
-src1.o:
-	gcc -c src1.c
-src2.o:
-	gcc -c src2.c
-src3.o:
-	gcc -c src3.c
-prog: src1.o src2.o src3.o
-	gcc -o prog src1.o src2.o src3.o
-clean:
-	rm -f src1.o src2.o src3.o prog
-```
-
-The reduction can be then run with:
-```console
-$ cvise repro -c "(make -C repro 2>&1 || true) | grep 'multiple definition'"
-...
-Reduced test-cases:
-
---- repro ---
-
-//--- repro/Makefile
-.PHONY: all clean
-all: prog
-src1.o:
-	gcc -c src1.c
-src2.o:
-	gcc -c src2.c
-prog: src1.o src2.o
-	gcc -o prog src1.o src2.o
-clean:
-	rm -f src1.o src2.o prog
-
-
-//--- repro/src1.c
-int x ;
-
-
-//--- repro/src2.c
-int x ;
-```
-
-## Reducing a real project: `--compilation-database`
-
-A directory of loose files reduces with the default compiler invocation, but a
-real project does not compile that way: its files need include paths, macro
-definitions, a language standard and a sysroot that only its build system knows.
-Without them the C++ passes — the ones that delete functions, classes, whole
-templates — cannot even parse the file, so they contribute nothing and the
-reduction falls back to deleting lines.
-
-Point C-Vise at the `compile_commands.json` your build already produces (CMake
-writes one with `CMAKE_EXPORT_COMPILE_COMMANDS=ON`), and every `clang_delta`
-pass parses each file with the flags its own build uses:
+C-Vise reduces a CMake project. It takes two things, and nothing else:
 
 ```console
-$ cvise --compilation-database build/ ./interesting.sh src include
+$ cvise path/to/CMakeLists.txt ./interesting.sh
 ```
 
-The argument is the database file or the directory holding it. C-Vise reduces a
-copy of the test case in a scratch directory, so it also tells `clang_delta`
-which original path each copy stands for, and the flags are looked up under that
-path.
+The CMakeLists.txt is the one that drives the project's build. C-Vise runs CMake
+on it once, purely to obtain `compile_commands.json`, and takes everything else
+from that file: which translation units exist, and what flags each one is
+compiled with. There is nothing else to tell it, because there is nothing else
+it needs to know that the build system does not already know -- and every extra
+question would be another way for the answer to disagree with the build.
 
-Two consequences are worth knowing before you start:
+The interestingness test is an executable that answers one question about a
+variant of the project: is it still interesting? It takes no arguments and is
+hard-coded to refer to the project it is testing. It should exit 0 for
+interesting, nonzero for not, and 125 for "I could not decide" -- see below.
 
-* **Reduce with the compiler the project builds with.** `clang_delta` links one
-  specific Clang, and the flags in the database were written for another one. If
-  they disagree — a different standard library, a different sysroot, headers
-  that only exist in a build container — `clang_delta` parses something the
-  build never sees, and its transformations are guesses. Run the reduction in
-  the same environment as the build.
+That is the whole interface. Reducing a single file, a list of files, a
+directory, a Makefile project, or anything described by a hand-written
+compilation database used to be separate ways in, and they are gone: a tool with
+five entrances has five sets of assumptions to keep straight, and the one that
+matters here is the one the build system can state for itself.
 
-* **The test case paths must be relative** to the working directory, and the
-  working directory should be the tree the build refers to, so that the paths in
-  the database resolve.
+### Why the flags matter
+
+A file compiled without its project's flags cannot be parsed: it will not find
+its own headers, its language standard is a guess, and the C++ passes -- the
+ones that delete functions, classes and whole templates -- have nothing to work
+on. MEASURED on one project: with the flags from `compile_commands.json`, 32
+transformations found 2900+ instances between them; without, none did.
+
+### Reduce with the compiler the project builds with
+
+`clang_delta` links one specific Clang, and the flags in the database were
+written for whatever compiler the project uses. If they disagree -- a different
+standard library, a different sysroot, headers that exist only inside a build
+container -- then `clang_delta` parses something the build never sees, and its
+transformations are guesses. Run the reduction in the same environment as the
+build.
+
+### Reducing in place, without copying the tree
+
+By default each candidate is prepared in a scratch directory. For a project of
+any size that is the wrong shape: the build system decides what to rebuild from
+timestamps, and a copied tree has none of the original ones, so every candidate
+costs a full rebuild.
+
+Set `CVISE_OVERLAY_LIB` to an overlay library and C-Vise gives each parallel job
+its own private view of the project instead. The job's candidate is served at
+the project's real path, everything it did not change is read from the one
+shared tree, and everything it writes lands in its own directory -- so nothing
+is copied, no timestamp is disturbed, and no job can disturb another.
+
+```console
+$ CVISE_OVERLAY_LIB=/path/to/libfakechroot.so \
+      cvise path/to/CMakeLists.txt ./interesting.sh
+```
+
+C-Vise refuses to start this way unless two things hold. The overlay must prove
+itself -- in a child process built exactly like a job's, because that is where
+redirection has to work -- since an overlay that is loaded but inert lets every
+build read the pristine sources, which looks exactly like a reduction that is
+going well. And the run must be under a cgroup memory limit below the machine's
+RAM, because the scratch space of a parallel reduction is not reclaimable
+memory: when it fills, the OOM killer can free none of it, and the machine dies
+rather than the reduction failing.
+
+```console
+$ systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
+      env CVISE_OVERLAY_LIB=/path/to/libfakechroot.so \
+      cvise path/to/CMakeLists.txt ./interesting.sh
+```
+
+### When the test cannot answer
+
+An interestingness test that is killed -- by the OOM killer, or because its
+filesystem filled -- has not said "not interesting"; it has said nothing. Read
+as a verdict, it silently discards a candidate that was probably fine, and the
+closer the machine is to its limits the more it discards. A test may exit 125 to
+say so explicitly, and a test that dies by signal is treated the same way. Such
+a candidate keeps its previous state and is not counted against the pass.
 
 ## Notes
 
 1. C-Vise creates temporary directories in `$TMPDIR` and so usage
 of a `tmpfs` directory is recommended.
 
-1. Each invocation of the interestingness test is performed in a fresh
-temporary directory containing a copy of the file that is being
-reduced. If your interestingness test requires access to other files,
-you should either copy them into the current working directory or else
-refer to them using an absolute path.
+1. By default each invocation of the interestingness test runs in a fresh
+temporary directory holding a copy of the files being reduced, so a test that
+needs anything else must refer to it by absolute path. With `CVISE_OVERLAY_LIB`
+this is no longer so: the test sees the project at its real path, and the only
+thing that differs from an ordinary build is the content of the files this
+candidate changed.
 
 1. If you copy the compiler invocation line from your build tool, remove
 -Werror if present. Some C-Vise passes introduce warnings, so -Werror

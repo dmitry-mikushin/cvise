@@ -32,6 +32,12 @@ MARKER = 'KEEP-THIS-STRING-42'
 # test report a broken overlay when the only thing missing is a compiler.
 CXX = os.environ.get('CXX') or shutil.which('g++') or shutil.which('clang++-19') or shutil.which('clang++')
 
+CMAKELISTS = (
+    'cmake_minimum_required(VERSION 3.20)\n'
+    'project(demo CXX)\n'
+    'add_executable(prog main.cpp core.cpp extra.cpp)\n'
+)
+
 PROJECT = {
     'core.hpp': '#pragma once\nconst char* core_message();\nint core_padding();\n',
     'core.cpp': (
@@ -58,6 +64,7 @@ PROJECT = {
 
 def write_project(root: Path):
     root.mkdir(parents=True)
+    (root / 'CMakeLists.txt').write_text(CMAKELISTS)
     for name, text in PROJECT.items():
         (root / name).write_text(text)
 
@@ -94,8 +101,11 @@ def test_reduction_through_the_overlay(tmp_path):
         }
         (work / 'tmp').mkdir()
 
+        # The whole interface: the CMakeLists.txt that drives the build, and
+        # the question to ask about each variant. Everything else -- which files
+        # exist, what flags they need -- comes from the database CMake writes.
         cmd = [sys.executable, CVISE, '--n', '4', '--timeout', '60',
-               str(script)] + sorted(PROJECT)
+               str(project / 'CMakeLists.txt'), str(script)]
         proc = subprocess.run(cmd, cwd=project, env=env, capture_output=True,
                               text=True, timeout=900)
         print(f'cvise exit {proc.returncode}')
