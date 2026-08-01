@@ -186,6 +186,41 @@ int x ;
 int x ;
 ```
 
+## Reducing a real project: `--compilation-database`
+
+A directory of loose files reduces with the default compiler invocation, but a
+real project does not compile that way: its files need include paths, macro
+definitions, a language standard and a sysroot that only its build system knows.
+Without them the C++ passes — the ones that delete functions, classes, whole
+templates — cannot even parse the file, so they contribute nothing and the
+reduction falls back to deleting lines.
+
+Point C-Vise at the `compile_commands.json` your build already produces (CMake
+writes one with `CMAKE_EXPORT_COMPILE_COMMANDS=ON`), and every `clang_delta`
+pass parses each file with the flags its own build uses:
+
+```console
+$ cvise --compilation-database build/ ./interesting.sh src include
+```
+
+The argument is the database file or the directory holding it. C-Vise reduces a
+copy of the test case in a scratch directory, so it also tells `clang_delta`
+which original path each copy stands for, and the flags are looked up under that
+path.
+
+Two consequences are worth knowing before you start:
+
+* **Reduce with the compiler the project builds with.** `clang_delta` links one
+  specific Clang, and the flags in the database were written for another one. If
+  they disagree — a different standard library, a different sysroot, headers
+  that only exist in a build container — `clang_delta` parses something the
+  build never sees, and its transformations are guesses. Run the reduction in
+  the same environment as the build.
+
+* **The test case paths must be relative** to the working directory, and the
+  working directory should be the tree the build refers to, so that the paths in
+  the database resolve.
+
 ## Notes
 
 1. C-Vise creates temporary directories in `$TMPDIR` and so usage
