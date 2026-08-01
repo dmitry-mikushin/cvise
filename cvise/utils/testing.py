@@ -52,6 +52,10 @@ class PassCheckingOutcome(Enum):
     ACCEPT = auto()
     IGNORE = auto()
     STOP = auto()
+    # The test never reached a verdict, so this candidate tells us nothing --
+    # neither that the transformation is good nor that it is bad. Recording it
+    # as a failure would let one out-of-memory permanently bias the search.
+    UNDECIDED = auto()
 
 
 @dataclass(slots=True)
@@ -744,7 +748,7 @@ class TestManager:
         )
         if self.undecided_count > UNDECIDED_BUDGET:
             raise UndecidedTestError(self.undecided_count)
-        return PassCheckingOutcome.IGNORE
+        return PassCheckingOutcome.UNDECIDED
 
     def release_job(self, job: Job) -> None:
         if job.temporary_folder is not None:
@@ -872,6 +876,13 @@ class TestManager:
                 self.pass_statistic.add_failure(job.pass_)
                 if self.interleaving:
                     self.folding_manager.on_transform_job_failure(env.state)
+            case PassCheckingOutcome.UNDECIDED:
+                # Deliberately nothing: not a failure in the statistics, and
+                # above all not a banned fold. The folding manager never retries
+                # a state it has seen fail, so counting an unjudged candidate
+                # there would remove it from the search for the rest of the run
+                # on the strength of a machine hiccup.
+                pass
             case PassCheckingOutcome.ACCEPT:
                 self.pass_statistic.add_success(job.pass_)
                 self.maybe_update_success_candidate(job.order, job.pass_, job.pass_id, env)
