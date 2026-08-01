@@ -66,6 +66,16 @@ class FoldingManager:
             # random-based sense) in future folds: see maybe_prepare_folding_job().
             self.failed_folds.append(state)
 
+    def on_transform_job_undecided(self, state: Any) -> None:
+        if isinstance(state, FoldingStateOut):
+            # A fold that came back undecided was never really judged. It was already recorded in
+            # attempted_folds at schedule time (see maybe_prepare_folding_job), but that record is a
+            # verdict -- and we don't have one. Leaving it there would permanently ban a perfectly good
+            # reduction on the strength of a single out-of-memory hiccup, exactly the silent drop the
+            # pass-result undecided handling exists to prevent. Undo the schedule-time bookkeeping so the
+            # fold stays retryable.
+            self.attempted_folds.discard(FoldingStateIn(sub_states=state.sub_states))
+
     def maybe_prepare_folding_job(self, job_order: int, best_success_state: Any) -> FoldingStateIn | None:
         if len(self.folding_candidates) < 2:
             # Nothing to fold.

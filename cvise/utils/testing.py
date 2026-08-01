@@ -887,12 +887,13 @@ class TestManager:
                 if self.interleaving:
                     self.folding_manager.on_transform_job_failure(env.state)
             case PassCheckingOutcome.UNDECIDED:
-                # Deliberately nothing: not a failure in the statistics, and
-                # above all not a banned fold. The folding manager never retries
-                # a state it has seen fail, so counting an unjudged candidate
-                # there would remove it from the search for the rest of the run
-                # on the strength of a machine hiccup.
-                pass
+                # Not a failure in the statistics, and above all not a banned fold. The folding manager
+                # recorded this state in attempted_folds at schedule time (before any verdict existed), so
+                # without undoing that an unjudged candidate would be permanently removed from the fold
+                # search for the rest of the run -- the same class of silent drop the pass-result undecided
+                # handling exists to prevent.
+                if self.interleaving:
+                    self.folding_manager.on_transform_job_undecided(env.state)
             case PassCheckingOutcome.ACCEPT:
                 self.pass_statistic.add_success(job.pass_)
                 self.maybe_update_success_candidate(job.order, job.pass_, job.pass_id, env)

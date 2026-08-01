@@ -12,12 +12,15 @@ quietly reverting to that.
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from cvise.passes.hint_based import HintState
 from cvise.utils import memory, overlay
 from cvise.utils.error import UndecidedTestError
+from cvise.utils.folding import FoldingManager, FoldingStateIn, FoldingStateOut
 from cvise.utils.memory import NoMemoryCeilingError
 from cvise.utils.overlay import OverlayNotProvenError
 from cvise.utils.testing import (
@@ -98,6 +101,60 @@ class TestUndecidedAccounting:
         manager._handle_undecided(job=None)
         manager._handle_undecided(job=None)
         assert manager.undecided_in_pass == 2
+
+
+class TestUndecidedFoldIsRetryable:
+    """The fold analogue of the pass-result undecided handling.
+
+    maybe_prepare_folding_job records a fold in attempted_folds at schedule
+    time -- before any verdict exists. handle_finished_transform_job then does
+    nothing for an undecided fold (it never judged it). Unless that
+    schedule-time record is undone, one transient out-of-memory permanently
+    bans a good reduction from the fold search for the rest of the run.
+    """
+
+    @staticmethod
+    def _manager_with_two_candidates():
+        manager = FoldingManager()
+        # Two distinct, hashable HintState instances is the minimum
+        # maybe_prepare_folding_job will fold. Only the identity/hash matters here;
+        # the underlying enumeration state is never exercised.
+        candidate_a = HintState(
+            tmp_dir=Path('/a'),
+            per_type_states=(),
+            ptr=0,
+            special_hints=(),
+        )
+        candidate_b = HintState(
+            tmp_dir=Path('/b'),
+            per_type_states=(),
+            ptr=0,
+            special_hints=(),
+        )
+        manager.on_transform_job_success(candidate_a)
+        manager.on_transform_job_success(candidate_b)
+        return manager
+
+    def test_an_unjudged_fold_is_not_permanently_banned(self):
+        manager = self._manager_with_two_candidates()
+        # Schedule a fold exactly as the reducer does: this records it in
+        # attempted_folds before any test runs.
+        first = manager.maybe_prepare_folding_job(job_order=0, best_success_state=None)
+        assert first is not None
+        # The fold comes back undecided. Replicate the real UNDECIDED branch in
+        # handle_finished_transform_job: it must hand the returned state back to
+        # the manager so the schedule-time ban is undone. The transform returns a
+        # FoldingStateOut carrying the same sub_states as the scheduled
+        # FoldingStateIn, so reconstruct that shape.
+        returned = FoldingStateOut(
+            sub_states=first.sub_states,
+            size_delta_per_pass={},
+            passes_ordered_by_delta=[],
+        )
+        manager.on_transform_job_undecided(returned)
+        # The fold must be re-schedulable: it was never judged against it.
+        again = manager.maybe_prepare_folding_job(job_order=0, best_success_state=None)
+        assert again is not None
 
 
 class TestMemoryCeiling:
