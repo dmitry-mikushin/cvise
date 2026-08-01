@@ -32,7 +32,8 @@ from cvise.passes.ternary import TernaryPass
 from cvise.passes.treesitter import TreeSitterPass
 from cvise.passes.unifdef import UnIfDefPass
 from cvise.utils import sigmonitor
-from cvise.utils.error import CViseError, PassOptionError
+from cvise.utils import overlay
+from cvise.utils.error import CViseError, PassOptionError, PrerequisitesNotFoundError
 
 
 class CVise:
@@ -218,6 +219,9 @@ class CVise:
 
     def reduce(self, pass_group, skip_initial):
         self._check_prerequisites(pass_group)
+        if overlay.overlay_required():
+            answer = overlay.prove_overlay()
+            logging.info('reduction overlay proved itself (challenge answered %d)', answer)
         if not self.skip_interestingness_test_check:
             self.test_manager.check_sanity()
 
@@ -245,10 +249,24 @@ class CVise:
 
     @staticmethod
     def _check_prerequisites(pass_group):
+        """A pass whose tools are missing is a pass that will not run.
+
+        Logging that and carrying on produces a reduction that is quietly weaker
+        than the one that was asked for: the result still looks like a result,
+        and nothing in it says that, say, every IndentPass was skipped because
+        clang-format was not installed. The schedule is a contract -- if it
+        cannot be honoured, say so and stop, so that the environment gets fixed
+        instead of the answer getting worse.
+        """
+        missing = []
+        programs = set()
         for category in pass_group:
             for p in pass_group[category]:
                 if not p.check_prerequisites():
-                    logging.error(f'Prereqs not found for pass {p}')
+                    missing.append(str(p))
+                    programs |= p.missing_external_programs
+        if missing:
+            raise PrerequisitesNotFoundError(missing, sorted(programs))
 
     def _run_pass_category(self, passes: list[AbstractPass], category: PassCategory) -> None:
         if category.once:

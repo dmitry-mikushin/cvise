@@ -7,11 +7,20 @@ class CViseError(Exception):
 
 
 class PrerequisitesNotFoundError(CViseError):
-    def __init__(self, missing):
+    def __init__(self, missing, programs=()):
         self.missing = missing
+        self.programs = list(programs)
 
     def __str__(self):
-        return 'Missing prerequisites for passes {}!'.format(', '.join(self.missing))
+        text = 'Missing prerequisites for passes {}!'.format(', '.join(self.missing))
+        if self.programs:
+            text += ' Install: {}.'.format(', '.join(self.programs))
+        text += (
+            ' C-Vise will not run a schedule it cannot honour: a silently skipped pass'
+            ' yields a reduction that is weaker than the one that was asked for, and'
+            ' nothing in the result says so.'
+        )
+        return text
 
 
 class UnknownArgumentError(CViseError):

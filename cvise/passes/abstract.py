@@ -163,6 +163,7 @@ class AbstractPass:
     ):
         self.arg = arg
         self.external_programs = external_programs
+        self.missing_external_programs: set[str] = set()
         self.max_transforms = max_transforms
         self.claim_files = claim_files or []
         self.claimed_by_others_files = claimed_by_others_files or []
@@ -178,13 +179,17 @@ class AbstractPass:
         return name
 
     def check_external_program(self, name) -> bool:
+        """Is the tool this pass needs actually installed?
+
+        The name of what is missing is kept, not just logged: a missing tool
+        aborts the run, and the message that aborts it has to say which program
+        to install, not merely which pass was unhappy.
+        """
         program = self.external_programs[name]
-        if not program:
+        if not program or shutil.which(program) is None:
+            self.missing_external_programs.add(name)
             return False
-        result = shutil.which(program) is not None
-        if not result:
-            logging.error(f'cannot find external program {name}')
-        return result
+        return True
 
     def check_prerequisites(self):
         raise NotImplementedError(f"Class {type(self).__name__} has not implemented 'check_prerequisites'!")
