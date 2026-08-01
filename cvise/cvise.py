@@ -31,8 +31,7 @@ from cvise.passes.special import SpecialPass
 from cvise.passes.ternary import TernaryPass
 from cvise.passes.treesitter import TreeSitterPass
 from cvise.passes.unifdef import UnIfDefPass
-from cvise.utils import sigmonitor
-from cvise.utils import overlay
+from cvise.utils import memory, overlay, sigmonitor
 from cvise.utils.error import CViseError, PassOptionError, PrerequisitesNotFoundError
 
 
@@ -219,6 +218,9 @@ class CVise:
 
     def reduce(self, pass_group, skip_initial):
         self._check_prerequisites(pass_group)
+        if memory.ceiling_required():
+            ceiling = memory.guard_memory_ceiling()
+            logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
         if overlay.overlay_required():
             answer = overlay.prove_overlay()
             logging.info('reduction overlay proved itself (challenge answered %d)', answer)
