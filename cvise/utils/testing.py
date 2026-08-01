@@ -28,6 +28,7 @@ from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
 from cvise.utils import cache, fileutil, mplogging, sigmonitor
 from cvise.utils.error import (
+    UndecidedTestError,
     AbsolutePathTestCaseError,
     InsaneTestCaseError,
     InvalidInterestingnessTestError,
@@ -104,6 +105,18 @@ class AdvanceOnSuccessEnvironment:
             process_event_notifier=ProcessEventNotifier(self.pid_queue),
             dependee_hints=dependee_hints,
         )
+
+
+
+# The exit code a test uses to say "I could not judge this candidate". Borrowed
+# from git bisect, where 125 means exactly that: skip this one, it is not the
+# thing under test that failed. Anything else nonzero still means "not
+# interesting", as it always did.
+UNDECIDED_EXIT_CODE = 125
+
+# How many such answers a run tolerates before concluding that the environment,
+# not the candidate, is what cannot be judged.
+UNDECIDED_BUDGET = 16
 
 
 class TestEnvironment:
@@ -446,6 +459,7 @@ class TestManager:
         self.max_improvement = max_improvement
         self.no_give_up = no_give_up
         self.also_interesting = also_interesting
+        self.undecided_count = 0
         self.start_with_pass = start_with_pass
         self.skip_after_n_transforms = skip_after_n_transforms
         self.stopping_threshold = stopping_threshold
@@ -683,6 +697,33 @@ class TestManager:
     def log_key_event(cls, event):
         logging.info(f'****** {event} ******')
 
+    def _handle_undecided(self, job) -> 'PassCheckingOutcome':
+        """The test said it could not judge this candidate, so do not judge it either.
+
+        A test that dies because the machine ran out of memory, or because its
+        scratch filesystem filled up, exits nonzero -- and a nonzero exit is how
+        a test says "not interesting". The two are indistinguishable, so under
+        memory pressure a reduction quietly throws away candidates that were
+        perfectly good, and the more pressure there is the more it throws away.
+        The result still looks like a result. That is worse than crashing.
+
+        So a test may exit with UNDECIDED_EXIT_CODE to say "ask me again later",
+        and that verdict is not recorded against the candidate. It is also not
+        free: if it keeps happening, the environment cannot run the tests at
+        all, and continuing would only produce a confidently biased answer.
+        """
+        self.undecided_count += 1
+        logging.warning(
+            'the interestingness test could not decide (exit %d); the candidate keeps its '
+            'previous state -- %d of these so far, budget %d',
+            UNDECIDED_EXIT_CODE,
+            self.undecided_count,
+            UNDECIDED_BUDGET,
+        )
+        if self.undecided_count > UNDECIDED_BUDGET:
+            raise UndecidedTestError(self.undecided_count)
+        return PassCheckingOutcome.IGNORE
+
     def release_job(self, job: Job) -> None:
         if job.temporary_folder is not None:
             self.tmp_dir_manager.delete_dir(job.temporary_folder)
@@ -836,6 +877,8 @@ class TestManager:
         match test_env.result:
             case PassResult.OK:
                 assert test_env.exitcode
+                if test_env.exitcode == UNDECIDED_EXIT_CODE:
+                    return self._handle_undecided(job)
                 if self.also_interesting is not None and test_env.exitcode == self.also_interesting:
                     self.save_extra_dir(test_env.test_case_path)
             case PassResult.STOP:

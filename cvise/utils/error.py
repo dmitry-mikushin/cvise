@@ -172,3 +172,17 @@ See 'cvise-cli.py --help' for more information.""".format(
             stderr=self.stderr,
         )
         return message
+
+
+class UndecidedTestError(CViseError):
+    def __init__(self, count):
+        self.count = count
+
+    def __str__(self):
+        return (
+            f'The interestingness test failed to reach a verdict {self.count} times. '
+            'That is not a property of the candidates: the environment cannot run the test. '
+            'Stopping, because every such answer that is counted as "not interesting" throws '
+            'away a reduction that was probably fine, and the more of them there are the more '
+            'confidently wrong the final result becomes.'
+        )
