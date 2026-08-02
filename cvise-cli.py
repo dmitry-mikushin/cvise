@@ -472,12 +472,14 @@ def do_reduce(args):
             # holding two of them, against a 300 s deadline; every candidate
             # from a pass that rewrites whole files timed out, always, and the
             # passes were eventually disabled for it.
-            share = max(1, (os.cpu_count() or 1) // max(1, args.n))
-            args.timeout = max(300, int(baseline_seconds * (os.cpu_count() or 1) / share * 1.5))
+            # The worst case is a candidate that has to rebuild everything
+            # while every other job is doing the same: the pool is shared, so
+            # its share of the machine is what one job in n gets.
+            args.timeout = max(300, int(baseline_seconds * max(1, args.n) * 1.5))
             logging.info(
-                'a candidate has %d s: the project builds from nothing in %.0f s, and a job '
-                'gets %d of the %d cores',
-                args.timeout, baseline_seconds, share, os.cpu_count() or 1,
+                'a candidate has %d s: the project builds from nothing in %.0f s with the '
+                'machine to itself, and up to %d candidates share it',
+                args.timeout, baseline_seconds, args.n,
             )
         if not project_utils.has_test(project, args.test):
             known = project_utils.tests_of(project)
