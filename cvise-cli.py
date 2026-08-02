@@ -466,7 +466,13 @@ def do_reduce(args):
         # it is built and how it is checked, and asking for both again in shell is
         # asking for two descriptions that will disagree.
         args.interestingness_test = str(
-            project_utils.check_script(project, args.test, staging_dir / 'check.sh')
+            project_utils.check_script(
+                project, args.test, staging_dir / 'check.sh',
+                # This job's share of the machine: C-Vise already decided how
+                # many candidates run at once, so the build of one of them gets
+                # what is left over after that division and not the whole thing.
+                jobs=max(1, (os.cpu_count() or 1) // max(1, args.n)),
+            )
         )
         os.chdir(staged.parent)
         test_cases = [Path(staged.name)]

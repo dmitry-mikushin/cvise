@@ -10,6 +10,7 @@ never notice a missing definition.
 import json
 import os
 import shutil
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -491,3 +492,34 @@ class TestTheBaseline:
         baseline_build(project)
         assert not witness.exists(), 'the baseline ran the interestingness test'
 
+
+
+class TestTheBuildsShareOfTheMachine:
+    """Multiplied, not each taken to be the whole thing.
+
+    MEASURED both ways round on ns-projection. With no -j, each of 44 jobs got
+    a ninja willing to use all 88 cores: load average 230 and the reduction's
+    own cgroup OOM-killed cc1plus 88 seconds in. With -j 1 the machine was safe
+    and half idle, and 16 candidates hit the 300 s timeout in eight minutes
+    because each compiled its dozens of files one after another.
+    """
+
+    def test_the_share_is_what_it_was_given(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        script = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=2)
+        assert '-j 2' in script.read_text()
+
+    def test_it_is_never_zero(self, tmp_path):
+        """More jobs than cores divides to nothing, and `-j 0` is unbounded."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        script = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=0)
+        assert '-j 1' in script.read_text()
+
+    def test_the_build_is_always_bounded(self, tmp_path):
+        """A build with no -j at all is what took the machine to a load of 230."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        text = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=4).read_text()
+        assert re.search(r'cmake --build \S+ -j \d+', text), text
