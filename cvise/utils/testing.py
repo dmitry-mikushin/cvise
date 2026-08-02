@@ -131,6 +131,31 @@ def is_undecided(exitcode: int) -> bool:
     """
     return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
 
+
+def unchanged(before: Path, after: Path) -> bool:
+    """Did the pass produce the very thing it was given?
+
+    Worth catching, because a pass that keeps returning its input is a pass that
+    never finishes: its position advances, its output does not, and the
+    reduction spends the rest of the run scheduling the same candidate. It is a
+    bug in the pass, and saying so is how it gets fixed.
+
+    filecmp.cmp answers this for a file and cannot answer it for a directory --
+    it compares stat signatures and then opens both, which for two directories
+    raises. Since a project is reduced as one directory, the guard was not
+    protecting the only kind of test case this program has.
+    """
+    if before.is_dir() or after.is_dir():
+        if not (before.is_dir() and after.is_dir()):
+            return False
+        left = {p.relative_to(before) for p in before.rglob('*') if p.is_file()}
+        right = {p.relative_to(after) for p in after.rglob('*') if p.is_file()}
+        if left != right:
+            return False
+        return all((before / rel).read_bytes() == (after / rel).read_bytes() for rel in left)
+    return filecmp.cmp(before, after)
+
+
 # How many such answers a run tolerates before concluding that the environment,
 # not the candidate, is what cannot be judged.
 UNDECIDED_BUDGET = 16
@@ -157,6 +182,7 @@ class TestEnvironment:
         check_command: dict | None = None,
         precheck_timeout: float | None = None,
         overlay_root: Path | None = None,
+        overlay_build_dir: Path | None = None,
         overlay_files=None,
         launch_dir=None,
     ):
@@ -176,6 +202,7 @@ class TestEnvironment:
         self.check_command = check_command
         self.precheck_timeout = precheck_timeout
         self.overlay_root = overlay_root
+        self.overlay_build_dir = overlay_build_dir
         self.overlay_files = overlay_files
 
     @property
@@ -248,17 +275,34 @@ class TestEnvironment:
         # interestingness test, or because C-Vise abruptly kills our job without a chance for a proper cleanup).
         with tempfile.TemporaryDirectory(dir=self.folder, prefix='overridetmp') as tmp_override:
             env = override_tmpdir_env(os.environ.copy(), Path(tmp_override))
-            if overlay.library_path():
+            changed: list[Path] = []
+            if self.overlay_root is not None:
                 # The candidate lives in this job's copy of the staged tree, but
                 # the build opens the project where the project is. Mapping one
                 # to the other is the whole job of the overlay -- and getting
                 # the mapping wrong does not fail, it silently builds the
                 # pristine sources, finds every candidate interesting, and
                 # reduces the project to nothing.
-                assert self.overlay_root is not None
+                #
+                # The root is what says there is a mapping to make. Keying off
+                # the library asked a different question -- "is an overlay
+                # installed on this machine" -- which is also true for anything
+                # that drives a TestManager without a project behind it.
+                # Whether a project reduction may proceed without the overlay is
+                # settled once, fatally, before the first job.
                 variants = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
-                delta = overlay.prepare_job_delta(self.folder, variants, self.overlay_files or ())
-                env = overlay.job_environment(env, delta, Path(self.overlay_root))
+                delta, changed = overlay.prepare_job_delta(self.folder, variants, self.overlay_files or ())
+                # The build directory is isolated too. It is where the answer
+                # about this candidate is computed, and a shared one hands the
+                # job whatever the previous candidate left there: a file this
+                # candidate did not change is read from the pristine tree, with
+                # a timestamp older than the object the previous job built from
+                # its own copy of it, so ninja calls that object up to date and
+                # links it. The verdict is then about a program nobody wrote.
+                roots = [Path(self.overlay_root)]
+                if self.overlay_build_dir is not None:
+                    roots.append(Path(self.overlay_build_dir))
+                env = overlay.job_environment(env, delta, roots)
 
             # Most candidates are rejected because they do not compile, and
             # that answer costs milliseconds when asked of the changed file
@@ -266,12 +310,22 @@ class TestEnvironment:
             # come from the project's own compilation database, so this is the
             # same compiler with the same options the build would use -- it is
             # not a second opinion, it is the first part of the same one.
-            command = self.check_command.get(str(self.test_case.resolve())) if self.check_command else None
-            if command:
-                if not precheck.syntax_check(command, env, self.precheck_timeout):
-                    return 1, b'', b'rejected by -fsyntax-only on the changed file\n'
-                if not precheck.object_check(command, env, self.precheck_timeout):
-                    return 1, b'', b'rejected while compiling the changed file\n'
+            #
+            # The question is asked of the files this candidate actually
+            # changed. Asking it of the test case was asking it of a directory,
+            # which no compilation database names, so the answer was always "no
+            # command" and every candidate went straight to a full build.
+            for path in changed:
+                command = self.check_command.get(str(path)) if self.check_command else None
+                if not command:
+                    continue
+                try:
+                    if not precheck.syntax_check(command, env, self.precheck_timeout):
+                        return 1, b'', b'rejected by -fsyntax-only on the changed file\n'
+                    if not precheck.object_check(command, env, self.precheck_timeout):
+                        return 1, b'', b'rejected while compiling the changed file\n'
+                except precheck.Undecided as e:
+                    return UNDECIDED_EXIT_CODE, b'', f'{e}\n'.encode()
 
             stdout, stderr, returncode = ProcessEventNotifier(self.pid_queue).run_process(
                 str(self.test_script), shell=True, env=env, cwd=self.folder
@@ -498,6 +552,7 @@ class TestManager:
         check_command=None,
         precheck_timeout=None,
         overlay_root=None,
+        overlay_build_dir=None,
         overlay_files=None,
         launch_dir=None,
     ):
@@ -518,6 +573,7 @@ class TestManager:
         self.check_command = check_command or {}
         self.precheck_timeout = precheck_timeout
         self.overlay_root = overlay_root
+        self.overlay_build_dir = overlay_build_dir
         self.overlay_files = overlay_files
         self.launch_dir = Path(launch_dir) if launch_dir else Path.cwd()
         self.undecided_count = 0
@@ -759,6 +815,7 @@ class TestManager:
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
             overlay_root=self.overlay_root,
+            overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
         )
         logging.debug(f'sanity check tmpdir = {test_env.folder}')
@@ -960,7 +1017,7 @@ class TestManager:
                 logging.debug(f'Too large improvement: {test_env.size_improvement} B')
                 return PassCheckingOutcome.IGNORE
             # Report bug if transform did not change the file
-            if filecmp.cmp(self.current_test_case, test_env.test_case_path):
+            if unchanged(self.current_test_case, test_env.test_case_path):
                 if not self.silent_pass_bug:
                     if not self.report_pass_bug(job, 'pass failed to modify the variant'):
                         return PassCheckingOutcome.STOP
@@ -1437,6 +1494,7 @@ class TestManager:
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
             overlay_root=self.overlay_root,
+            overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
         )
         future = self.worker_pool.schedule(
@@ -1481,6 +1539,7 @@ class TestManager:
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
             overlay_root=self.overlay_root,
+            overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
         )
         future = self.worker_pool.schedule(

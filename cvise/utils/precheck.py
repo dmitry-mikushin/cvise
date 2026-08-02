@@ -58,14 +58,20 @@ def object_check(command: list[str], env: dict, timeout: float | None = None) ->
         return _run(argv, env, timeout)
 
 
+class Undecided(Exception):
+    """The stage could not run, which is not an answer about the candidate."""
+
+
 def _run(argv: list[str], env: dict, timeout: float | None) -> bool:
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Saying "it passed" here is how a machine under load quietly turns
+        # into a reducer that accepts things nobody checked; saying "it failed"
+        # is how it turns into one that discards good candidates. Neither is an
+        # answer, so neither is given.
         logging.debug('a precheck timed out: %s', argv[0])
-        # Not an answer about the candidate, so it must not be read as one; the
-        # caller treats this like any other stage that could not decide.
-        return True
-    except OSError:
-        return True
+        raise Undecided(f'{argv[0]} timed out')
+    except OSError as e:
+        raise Undecided(f'{argv[0]} could not be run: {e}')
     return proc.returncode == 0

@@ -94,6 +94,28 @@ def main():
               f'{p.stdout.strip() or p.stderr.strip()[:80]}')
         ok &= real
 
+        # A directory the candidate deleted must not open: leaving it open
+        # leaves its children readable, and a deletion that "worked" changes
+        # nothing the build can see.
+        doomed = tree / 'doomed_dir'
+        doomed.mkdir()
+        (doomed / 'inside.hpp').write_text('// still here\n')
+        marker = delta / (str(doomed).lstrip('/') + '.cvise-whiteout')
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        p = under_overlay(
+            f'import os\n'
+            f'try:\n'
+            f'    os.listdir({str(doomed)!r})\n'
+            f'    print("listed")\n'
+            f'except OSError:\n'
+            f'    print("hidden")\n',
+            delta, tree)
+        good = p.stdout.strip() == 'hidden'
+        print(f'{"ok  " if good else "FAIL"}  a deleted directory does not open: '
+              f'{p.stdout.strip() or p.stderr.strip()[:60]}')
+        ok &= good
+
         print()
         print('THE OVERLAY ANSWERS THESE CORRECTLY' if ok else 'THE OVERLAY STILL ANSWERS WRONG')
         return 0 if ok else 1

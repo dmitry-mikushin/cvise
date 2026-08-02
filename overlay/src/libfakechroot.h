@@ -267,6 +267,7 @@ int fakechroot_localdir (const char *);
 const char * fakechroot_overlay_path (const char *, char *);
 const char * fakechroot_overlay_path_write (const char *, char *, int);
 int fakechroot_overlay_hide (const char *, char *);
+int fakechroot_overlay_hidden (const char *, char *);
 
 /* Marker file telling that the test case removed this path. */
 #define FAKECHROOT_WHITEOUT_SUFFIX ".cvise-whiteout"

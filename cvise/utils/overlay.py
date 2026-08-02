@@ -124,9 +124,11 @@ def prove_overlay() -> int:
     return answer
 
 
-# Where the library is installed alongside C-Vise's other helpers, filled in at
-# configure time exactly as they are.
+# Where the library is installed alongside C-Vise's other helpers, and where it
+# lands in a build tree, both filled in at configure time exactly as the other
+# helper paths are.
 INSTALLED_LIB = os.path.join('@CMAKE_INSTALL_FULL_LIBEXECDIR@', '@cvise_PACKAGE@', 'libcvise_overlay.so')
+BUILT_LIB = '@cvise_OVERLAY_BUILD_LIB@'
 
 
 def library_path() -> str:
@@ -138,15 +140,18 @@ def library_path() -> str:
     whole tree for every candidate, and one who mistypes it gets no overlay at
     all with no indication that anything is different. The environment variable
     stays only so that a developer can point at a build tree.
+
+    The build tree comes before the installed copy. This copy of C-Vise and this
+    copy of the library were made together and are the only pair known to agree;
+    reaching for an installed one means a change is tested against whatever was
+    installed last, and since a stale overlay does not fail but merely answers
+    differently, that is a whole afternoon of believing a fixed bug is not
+    fixed. It was.
     """
     override = os.environ.get(LIB_ENV, '')
     if override:
         return override
-    for candidate in (
-        INSTALLED_LIB,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     '@cvise_SCRIPT_TO_PACKAGE_PATH@', 'libcvise_overlay.so'),
-    ):
+    for candidate in (BUILT_LIB, INSTALLED_LIB):
         if '@' not in candidate and os.path.exists(candidate):
             return candidate
     return ''
@@ -155,7 +160,7 @@ def library_path() -> str:
 WHITEOUT_SUFFIX = '.cvise-whiteout'
 
 
-def prepare_job_delta(folder, variants, expected=()) -> Path:
+def prepare_job_delta(folder, variants, expected=()) -> tuple[Path, list[Path]]:
     """Put this job's variants where the overlay will serve them from.
 
     The reducer produces a candidate as a file in the job's own scratch
@@ -164,19 +169,27 @@ def prepare_job_delta(folder, variants, expected=()) -> Path:
     placed at <delta>/<original absolute path> is what every process in this job
     sees when it opens the original. Nothing is copied except the files the
     candidate actually changed.
+
+    Those files are also the answer to "what did this candidate change", which
+    is what makes a cheap rejection possible: the compiler can be asked about
+    them alone, with their own flags, before anything as expensive as a build is
+    started. So they are returned rather than discarded.
     """
     delta = Path(folder) / '.cvise-delta'
     present: set[Path] = set()
+    changed: list[Path] = []
     for original, produced in variants:
         if produced.is_dir():
             for path in sorted(produced.rglob('*')):
                 if path.is_file():
                     target = original / path.relative_to(produced)
                     present.add(target)
-                    _place(delta, target, path)
+                    if _place(delta, target, path):
+                        changed.append(target)
         else:
             present.add(original)
-            _place(delta, original, produced)
+            if _place(delta, original, produced):
+                changed.append(original)
 
     # A file the candidate deleted has to be recorded as deleted. Producing no
     # entry for it means the overlay falls through to the shared tree and the
@@ -190,11 +203,11 @@ def prepare_job_delta(folder, variants, expected=()) -> Path:
         marker = delta / (str(original).lstrip('/') + WHITEOUT_SUFFIX)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
-    return delta
+    return delta, changed
 
 
-def _place(delta: Path, original: Path, produced: Path) -> None:
-    """Put a file in the delta only if it actually differs.
+def _place(delta: Path, original: Path, produced: Path) -> bool:
+    """Put a file in the delta only if it actually differs; say whether it did.
 
     The delta is what the build sees instead of the project, and a file placed
     there is a file the build must rebuild -- it has a new timestamp and, as far
@@ -205,16 +218,45 @@ def _place(delta: Path, original: Path, produced: Path) -> None:
     which is the entire point of an overlay.
     """
     try:
-        if original.is_file() and original.read_bytes() == produced.read_bytes():
-            return
+        if (
+            original.is_file()
+            and original.read_bytes() == produced.read_bytes()
+            # Mode counts as much as content: a candidate that only makes a file
+            # non-executable changes what the build does, and dropping it from
+            # the delta because the bytes match means the job is graded on a
+            # file it was never given.
+            and (original.stat().st_mode & 0o7777) == (produced.stat().st_mode & 0o7777)
+        ):
+            return False
     except OSError:
         pass
     target = delta / str(original).lstrip('/')
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(produced, target)
+    shutil.copymode(produced, target)
+    return True
 
 
-def job_environment(env: dict, delta: Path, root: Path) -> dict:
+def roots_value(roots) -> str:
+    """The trees this job may write to, as the overlay expects them.
+
+    Colon-separated, the way a search path is -- so a directory whose name
+    contains a colon cannot be expressed, and the consequence of pretending
+    otherwise is not a syntax error but a tree that is silently left shared.
+    That is the most expensive failure this program has: the reduction keeps
+    running and answers about a build nobody described.
+    """
+    values = [str(Path(r)) for r in roots]
+    bad = [v for v in values if ':' in v]
+    if bad:
+        raise CViseError(
+            'these directories cannot be isolated because their names contain a colon, '
+            f'which separates one from the next: {", ".join(bad)}'
+        )
+    return ':'.join(values)
+
+
+def job_environment(env: dict, delta: Path, roots) -> dict:
     """Point one job's processes at its own delta.
 
     The proof that the overlay is loaded has to happen where the compiling
@@ -228,5 +270,5 @@ def job_environment(env: dict, delta: Path, root: Path) -> dict:
     preload = env.get('LD_PRELOAD', '')
     env['LD_PRELOAD'] = f'{lib}:{preload}' if preload else lib
     env[DELTA_ENV] = str(delta)
-    env[ROOT_ENV] = str(root)
+    env[ROOT_ENV] = roots_value(roots)
     return env

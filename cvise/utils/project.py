@@ -70,9 +70,18 @@ def configure(cmakelists: Path, build_dir: Path) -> Project:
     build_dir = Path(build_dir).resolve()
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info('configuring %s to obtain its compilation database', cmakelists)
+    logging.info('configuring %s', cmakelists)
     proc = subprocess.run(
-        ['cmake', '-S', str(root), '-B', str(build_dir), '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON'],
+        [
+            'cmake',
+            '-S', str(root),
+            '-B', str(build_dir),
+            # Ninja, because this build directory is not configured once and
+            # forgotten: it is rebuilt for every candidate, and what makes that
+            # affordable is a build system that rebuilds exactly what changed.
+            '-G', 'Ninja',
+            '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        ],
         capture_output=True,
         text=True,
     )
@@ -272,9 +281,200 @@ def publish(project: 'Project', staging: Path) -> int:
     for source in project.sources:
         staged = staging / source.relative_to(project.root)
         if not staged.is_file():
+            # The reduction deleted this file. Leaving it in place would undo
+            # that silently: the answer the user gets would contain a file the
+            # reduction proved unnecessary, and it would differ from the thing
+            # that was actually verified.
+            if source.is_file():
+                source.unlink()
+                published += 1
             continue
         if staged.read_bytes() == source.read_bytes():
             continue
         shutil.copyfile(staged, source)
         published += 1
     return published
+
+
+def baseline_build(project: 'Project') -> None:
+    """Build the project once, from the sources as they are.
+
+    Every job gets this directory copy-on-write, so what it finds here is what
+    it does not have to build. Without a baseline each job starts from an empty
+    build tree and compiles the whole project, which for anything larger than a
+    toy is the entire cost of the reduction paid once per candidate. With one, a
+    job compiles what its candidate changed and links.
+
+    It also has to be correct, not merely fast: a job reads an object from here
+    whenever its own sources are older, so these objects must be the ones the
+    pristine sources produce. That is exactly what building here, outside any
+    delta, guarantees.
+
+    What is built is the default target, not the one the user named to check
+    with. The two are usually the same work, but not always: a check target
+    typically runs the program, and running it is neither cheaper here than in a
+    job nor of any use to one. Building the check target meant C-Vise began by
+    executing the user's check -- which, for a check that waits for something,
+    is a reducer that appears to hang before it has printed a line.
+
+    A failure is not fatal. Whether the project as it stands is interesting is
+    the sanity check's question, and the user can waive that; this is only the
+    work that would otherwise be repeated by every job, so not having it costs
+    time and nothing else.
+    """
+    logging.info('building the project once, so that each candidate only rebuilds what it changed')
+    proc = subprocess.run(
+        ['cmake', '--build', str(project.build_dir)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        logging.warning(
+            'the project does not build as it stands, so every candidate will have to build it '
+            'from nothing:\n%s',
+            (proc.stderr or proc.stdout)[-2000:],
+        )
+
+
+def has_target(project: 'Project', target: str) -> bool:
+    """Does the project define this target?
+
+    Asked of ninja, not of `cmake --build --target help`: that lists only the
+    phony "primary targets", so every executable and library -- which is to say
+    the targets a user is most likely to name -- is absent from it. Checking
+    against that list rejected `prog` for a project that plainly builds prog.
+    """
+    proc = subprocess.run(
+        ['ninja', '-C', str(project.build_dir), '-t', 'targets', 'all'],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return True  # cannot tell; let the sanity check speak instead
+    names = set()
+    for line in proc.stdout.splitlines():
+        path, _, _ = line.partition(':')
+        path = path.strip()
+        if not path:
+            continue
+        names.add(path)
+        names.add(Path(path).name)
+    return target in names
+
+
+def links_something(project: 'Project', target: str, depth: int = 3) -> bool:
+    """Does building this target resolve symbols?
+
+    It matters a great deal. A target that is only compiled and archived -- a
+    static or object library -- never looks for a definition, so deleting a
+    function while its callers remain builds perfectly well, looks interesting,
+    and the reduction produces a project that does not build. Only linking an
+    executable, a shared library or a module asks the question the reduction
+    depends on.
+
+    The answer has to be followed through ninja's graph rather than read off a
+    name: a CMake target is a phony node pointing at whatever actually produces
+    it, so `justcompile: phony` says nothing at all by itself.
+    """
+    seen: set[str] = set()
+
+    def rule_of(name: str, left: int) -> bool:
+        if left <= 0 or name in seen:
+            return False
+        seen.add(name)
+        proc = subprocess.run(
+            ['ninja', '-C', str(project.build_dir), '-t', 'query', name],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return True  # cannot tell; do not cry wolf
+        inputs: list[str] = []
+        rule = ''
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('input:'):
+                rule = stripped.split(':', 1)[1].strip()
+            elif line.startswith('    ') and rule and not stripped.startswith(('outputs:', '|')):
+                inputs.append(stripped.lstrip('| '))
+            elif stripped.startswith('outputs:'):
+                break
+        if 'STATIC_LIBRARY' in rule or 'OBJECT_LIBRARY' in rule:
+            return False
+        if 'LINKER' in rule or 'CUSTOM_COMMAND' in rule:
+            return True
+        if rule == 'phony':
+            return any(rule_of(i, left - 1) for i in inputs)
+        return False
+
+    return rule_of(target, depth)
+
+
+def check_script(project: 'Project', target: str, path: Path) -> Path:
+    """The interestingness test, written by C-Vise rather than by the user.
+
+    The project already says how it is built and how it is checked -- that is
+    what a target is. Asking the user for a shell script on top of that asks
+    them to restate it, in another language, with another set of assumptions
+    about where the files are and which compiler to call; and the two
+    descriptions then disagree the moment the project changes.
+
+    So the test is this: build the target the way the project builds it. Ninja
+    rebuilds what the candidate touched and nothing else, and the target's own
+    definition decides what "interesting" means -- a library target says the
+    code still compiles and links, a custom target that runs something says it
+    still behaves.
+    """
+    path.write_text(
+        '#!/bin/sh\n'
+        '# Generated by C-Vise. The project defines both the build and the check.\n'
+        f'exec cmake --build {shlex.quote(str(project.build_dir))} '
+        f'--target {shlex.quote(target)} > /dev/null 2>&1\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+def database_for(project: 'Project', staging: Path) -> Path:
+    """The compilation database clang_delta is given, naming the files it is given.
+
+    clang_delta refuses to work on a file its database does not name, and it is
+    right to: without the project's flags it parses a truncated AST and deletes
+    things on no basis at all. But the file it is handed is never the project's
+    -- a reduction works on a staged copy -- so a database written in the
+    project's paths answers no question anybody asks. It looked correct, it was
+    passed on every command line, and every semantic pass exited 255 on every
+    file of every project, leaving headers and sources alike to the passes that
+    can only delete lines.
+
+    So the database describes the staged tree: one entry per reducible file, at
+    the path the reduction actually works on, carrying the flags the build uses
+    for it. Headers get an entry too -- a header has no compile command of its
+    own, but it has one that exercises it, the unit that includes it, whose
+    flags are exactly the context the header is meant to be read in.
+
+    Written into C-Vise's own build directory rather than over CMake's, because
+    CMake owns that file and rewrites it whenever the project is reconfigured.
+    """
+    entries = []
+    for source in project.sources:
+        command = project.check_command.get(str(source))
+        if not command:
+            continue
+        staged = staging / source.relative_to(project.root)
+        # The command may end with a different file -- for a header it is the
+        # unit that includes it -- and the entry has to be about this file.
+        flags = list(command[:-1]) + [str(staged)]
+        entries.append(
+            {
+                'directory': str(project.build_dir),
+                'file': str(staged),
+                'command': ' '.join(shlex.quote(a) for a in flags),
+            }
+        )
+
+    database = project.build_dir / 'cvise_compile_commands' / 'compile_commands.json'
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database.write_text(json.dumps(entries, indent=1))
+    logging.info('%d staged files described to the semantic passes', len(entries))
+    return database

@@ -23,6 +23,7 @@
 #if !defined(OPENDIR_CALLS___OPEN) && !defined(OPENDIR_CALLS___OPENDIR2)
 
 #include <dirent.h>
+#include <errno.h>
 #include "libfakechroot.h"
 
 
@@ -40,6 +41,19 @@ wrapper(opendir, DIR *, (const char * name))
        created is reachable by name even though it is not listed, and a file it
        deleted is listed but opens as ENOENT. Merging the two listings is the
        full answer and wants a readdir that walks both. */
+    /* A directory the candidate deleted must not open. The listing itself is
+       still the shared one -- merging both is a larger change -- but a
+       whiteouted directory has to answer ENOENT, or its children stay readable
+       and a deletion that "worked" changes nothing the build can see. */
+    {
+        char probe[FAKECHROOT_PATH_MAX];
+        char abs[FAKECHROOT_PATH_MAX];
+        rel2abs(name, abs);
+        if (fakechroot_overlay_hidden(abs, probe)) {
+            errno = ENOENT;
+            return NULL;
+        }
+    }
     expand_chroot_path_nodelta(name);
     return nextcall(opendir)(name);
 }

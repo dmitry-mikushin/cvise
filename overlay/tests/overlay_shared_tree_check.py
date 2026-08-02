@@ -15,6 +15,7 @@ it never touched.
 """
 import os
 import shutil
+import sys
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ from pathlib import Path
 # developer runs it in place, an installed libdir otherwise. Hardcoding one
 # author's path makes the probe pass only on that author's machine.
 # CTest passes the built library; running the script by hand needs the path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 LIB = os.environ.get('CVISE_OVERLAY_LIB', '')
 if not LIB or not Path(LIB).exists():
     raise SystemExit(
@@ -74,6 +77,37 @@ def main():
         for label, good in checks:
             print(f'{"ok  " if good else "FAIL"}  {label}')
             ok &= good
+
+        # A candidate that only changes a file's MODE changes what the build
+        # does, so it has to reach the job. Comparing content alone dropped it
+        # from the delta and graded the job on a file it was never given.
+        exec_file = tree / 'tool.sh'
+        exec_file.write_text('#!/bin/sh\nexit 0\n')
+        exec_file.chmod(0o755)
+        job = work / 'job'
+        (job / 'tree').mkdir(parents=True)
+        shutil.copy2(exec_file, job / 'tree' / 'tool.sh')
+        (job / 'tree' / 'tool.sh').chmod(0o644)
+        from cvise.utils import overlay as overlay_module
+
+        job_delta, changed = overlay_module.prepare_job_delta(job, [(tree, job / 'tree')])
+        placed = job_delta / str(exec_file).lstrip('/')
+        mode_kept = placed.is_file() and (placed.stat().st_mode & 0o777) == 0o644
+        print(f'{"ok  " if mode_kept else "FAIL"}  a mode-only change reaches the job')
+        ok &= mode_kept
+
+        # What the delta received is also the answer to "what did this candidate
+        # change", and that answer is what the cheap prechecks are asked about.
+        # A file that reaches the job unreported is a file nothing can reject
+        # before a whole build has been paid for.
+        reported = exec_file in changed
+        print(f'{"ok  " if reported else "FAIL"}  the changed file is reported to the caller')
+        ok &= reported
+
+        unchanged_reported = [p for p in changed if p != exec_file]
+        print(f'{"ok  " if not unchanged_reported else "FAIL"}  '
+              f'unchanged files are not reported: {unchanged_reported}')
+        ok &= not unchanged_reported
 
         print()
         print('THE SHARED TREE IS SAFE FROM A JOB' if ok else 'A JOB CAN STILL DAMAGE THE SHARED TREE')

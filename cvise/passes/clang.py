@@ -1,4 +1,6 @@
 import logging
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,13 +18,21 @@ class DirState:
 
     A single counter cannot address a directory, so it is decomposed into the
     file to transform and the instance number within that file.
+
+    The number of instances that file has is part of the position, and not for
+    convenience: without it nothing can tell when a unit is finished. The pass
+    used to walk on to the next unit inside the job and start it again at
+    instance 1, which the scheduler never saw -- so it kept raising a counter
+    that addressed nothing while the same first instance of the next unit was
+    produced over and over. A reduction that reached this pass did not end.
     """
 
     file_index: int
     counter: int
+    instances: int
 
     def __repr__(self):
-        return f'DirState(file #{self.file_index}, instance {self.counter})'
+        return f'DirState(file #{self.file_index}, instance {self.counter} of {self.instances})'
 
 
 def sources_of(test_case: Path) -> list[Path]:
@@ -54,17 +64,72 @@ class ClangPass(AbstractPass):
     def supports_dir_test_cases(self) -> bool:
         return True
 
+    def count_instances(self, target: Path) -> int:
+        """How many of this transformation the unit offers, asked of clang_delta.
+
+        Counting happens where the test case is, not in a job's copy of it, so
+        the file is its own key: that is the path the database names.
+        """
+        args = [self.external_programs['clang_delta'], f'--query-instances={self.arg}']
+        if self._user_clang_delta_std and not self._compilation_database:
+            args.append(f'--std={self._user_clang_delta_std}')
+        if self._compilation_database:
+            args.append(f'--compilation-database={self._compilation_database}')
+            args.append(f'--compilation-database-key={target.resolve()}')
+        try:
+            proc = subprocess.run(args + [str(target)], capture_output=True, text=True)
+        except OSError:
+            return 0
+        if proc.returncode != 0:
+            # A unit clang_delta will not parse offers nothing; that is not a
+            # reason to abandon the units after it.
+            logging.debug('cannot count %s instances in %s: %s', self.arg, target, proc.stderr.strip()[:200])
+            return 0
+        m = re.match('Available transformation instances: ([0-9]+)$', proc.stdout.strip())
+        return int(m.group(1)) if m else 0
+
+    def _state_from_file(self, sources, file_index: int):
+        """First unit at or after file_index that has anything to transform."""
+        while file_index < len(sources):
+            instances = self.count_instances(sources[file_index])
+            if instances > 0:
+                return DirState(file_index=file_index, counter=1, instances=instances)
+            file_index += 1
+        return None
+
     def new(self, test_case: Path, *args, **kwargs):
         if test_case.is_dir():
-            return DirState(file_index=0, counter=1) if sources_of(test_case) else None
+            sources = sources_of(test_case)
+            if not sources:
+                return None
+            return self._state_from_file(sources, 0)
         return 1
 
     def advance(self, test_case: Path, state):
         if isinstance(state, DirState):
-            return DirState(file_index=state.file_index, counter=state.counter + 1)
+            if state.counter < state.instances:
+                return DirState(
+                    file_index=state.file_index,
+                    counter=state.counter + 1,
+                    instances=state.instances,
+                )
+            # This unit is done; the pass is not.
+            return self._state_from_file(sources_of(test_case), state.file_index + 1)
         return state + 1
 
     def advance_on_success(self, test_case: Path, state, *args, **kwargs):
+        if isinstance(state, DirState):
+            # A successful transformation changes how many are left, so the
+            # count has to be asked again rather than assumed to be one fewer.
+            sources = sources_of(test_case)
+            if state.file_index >= len(sources):
+                return None
+            instances = self.count_instances(sources[state.file_index])
+            if state.counter <= instances:
+                return DirState(
+                    file_index=state.file_index, counter=state.counter, instances=instances
+                )
+            return self._state_from_file(sources, state.file_index + 1)
         return state
 
     def transform(
@@ -81,24 +146,18 @@ class ClangPass(AbstractPass):
             result, _ = self._transform_file(test_case, state, process_event_notifier, original_test_case)
             return (result, state)
 
-        # Running out of instances in one unit does not end the pass for the
-        # whole directory, so walk on to the next one.
         sources = sources_of(test_case)
-        while state.file_index < len(sources):
-            target = sources[state.file_index]
-            key = None
-            if original_test_case is not None:
-                key = Path(original_test_case) / target.relative_to(test_case)
-            result, _ = self._transform_file(target, state.counter, process_event_notifier, key)
-            if result == PassResult.OK and written_paths is not None:
-                # Everything not declared here is deleted from the test case as
-                # extraneous, so the whole tree has to be declared, not just the
-                # file this transformation rewrote.
-                written_paths.update(test_case.rglob('*'))
-            if result in (PassResult.OK, PassResult.ERROR):
-                return (result, state)
-            state = DirState(file_index=state.file_index + 1, counter=1)
-        return (PassResult.STOP, state)
+        if state.file_index >= len(sources):
+            return (PassResult.STOP, state)
+        target = sources[state.file_index]
+        key = self._lookup_key(test_case, target, original_test_case)
+        result, _ = self._transform_file(target, state.counter, process_event_notifier, key)
+        if result == PassResult.OK and written_paths is not None:
+            # Everything not declared here is deleted from the test case as
+            # extraneous, so the whole tree has to be declared, not just the
+            # file this transformation rewrote.
+            written_paths.update(test_case.rglob('*'))
+        return (result, state)
 
     def _transform_file(self, target: Path, counter: int, process_event_notifier, lookup_key):
         args = [

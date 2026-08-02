@@ -299,10 +299,12 @@ def main():
         'what flags each one is compiled with',
     )
     parser.add_argument(
-        'interestingness_test',
-        metavar='INTERESTINGNESS_TEST',
+        'target',
+        metavar='TARGET',
         nargs='?',
-        help='Executable that decides whether a variant of the project is still interesting',
+        help='CMake target that decides whether a variant of the project is still interesting: '
+        'it is interesting if the target builds. A library or executable target therefore means '
+        '"still compiles and links"; a custom target that runs something means "still behaves"',
     )
     parser.add_argument(
         '--stopping-threshold',
@@ -314,8 +316,8 @@ def main():
     args = parser.parse_args()
 
 
-    if not args.list_passes and (not args.project or not args.interestingness_test):
-        parser.error('the following arguments are required: CMAKELISTS, INTERESTINGNESS_TEST')
+    if not args.list_passes and (not args.project or not args.target):
+        parser.error('the following arguments are required: CMAKELISTS, TARGET')
 
     log_config = {}
 
@@ -408,72 +410,104 @@ def do_reduce(args):
     # nothing but the database, and it is removed when the run ends. Leaving it
     # behind would litter the user's TMPDIR once per invocation.
     cmake_dir = Path(tempfile.mkdtemp(prefix='cvise-cmake-'))
-    project = project_utils.configure(Path(args.project), cmake_dir)
-    logging.info(
-        '%s: %d translation units under %s',
-        project.compilation_database,
-        len(project.sources),
-        project.root,
-    )
-    # One directory, not a list of files: a candidate can then carry edits in
-    # several files at once, which is the only way the changes that matter in
-    # C++ -- a declaration and its uses -- can ever be accepted, since neither
-    # half of such a change compiles on its own.
-    # Anything the user named on the command line is resolved before the
-    # working directory moves, or a relative path silently becomes a different
-    # file -- or, as here, no file at all.
-    args.interestingness_test = str(Path(args.interestingness_test).resolve())
-    # Where the user was standing. Anything saved for them goes here, not into
-    # the staged copy C-Vise is about to work in and then delete.
-    launch_dir = Path.cwd()
     staging_dir = Path(tempfile.mkdtemp(prefix='cvise-staging-'))
-    staged = project_utils.stage(project, staging_dir / project.root.name)
-    os.chdir(staged.parent)
-    test_cases = [Path(staged.name)]
-
-    pass_group = CVise.parse_pass_group_dict(
-        pass_group_dict,
-        pass_options,
-        external_programs,
-        args.remove_pass,
-        args.clang_delta_std,
-        args.clang_delta_preserve_routine,
-        str(project.compilation_database),
-        args.not_c,
-        args.renaming,
-    )
-
-    pass_statistic = statistics.PassStatistic()
-
-    if args.start_with_pass:
-        pass_names = [str(p) for p in chain(*pass_group.values())]
-        if args.start_with_pass not in pass_names:
-            print(
-                f'Cannot find pass called "{args.start_with_pass}". '
-                'Please use --list-passes to get a list of available passes.'
-            )
-            sys.exit(1)
-
-
-    if args.to_utf8:
-        for test_case in test_cases:
-            encoding = chardet.detect(test_case.read_bytes())['encoding']
-            if encoding not in ('ascii', 'utf-8'):
-                logging.info(f'Converting {test_case} file ({encoding} encoding) to UTF-8')
-                with open(test_case, encoding=encoding) as f:
-                    data = f.read()
-                test_case.write_text(data)
-
+    # Both directories exist from this line on, and so does the promise to
+    # remove them. Setting a project up takes real time -- a CMake configure, a
+    # dependency scan, a first build -- and a Control-C during any of it used to
+    # leave two directories behind in the user's TMPDIR, one of them a whole
+    # build tree, with nothing in them to say what they were.
+    project = None
+    staged = None
     script = None
-    assert args.interestingness_test
-
-    # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
-    # Preloading is used as a speedup, so that every worker doesn't need to execute all import statements on startup.
-    multiprocessing.set_start_method('forkserver')
-    multiprocessing.set_forkserver_preload(['__main__'] + list(sys.modules.keys()))
-    multiprocessing.forkserver.ensure_running()
-
     try:
+        project = project_utils.configure(Path(args.project), cmake_dir)
+        logging.info(
+            '%s: %d translation units under %s',
+            project.compilation_database,
+            len(project.sources),
+            project.root,
+        )
+        # One directory, not a list of files: a candidate can then carry edits in
+        # several files at once, which is the only way the changes that matter in
+        # C++ -- a declaration and its uses -- can ever be accepted, since neither
+        # half of such a change compiles on its own.
+        # Where the user was standing. Anything saved for them goes here, not into
+        # the staged copy C-Vise is about to work in and then delete.
+        launch_dir = Path.cwd()
+        staged = project_utils.stage(project, staging_dir / project.root.name)
+
+        if not project_utils.links_something(project, args.target):
+            logging.warning(
+                "target '%s' does not link or run anything, so nothing will ever fail to resolve a "
+                'symbol: deleting a function while its callers remain will look interesting, and the '
+                'reduction can produce a project that does not build. Name a target that links or '
+                'runs.',
+                args.target,
+            )
+        if not project_utils.has_target(project, args.target):
+            sys.exit(
+                f"the project defines no target '{args.target}'; "
+                f'`cmake --build {project.build_dir} --target help` lists the ones it does'
+            )
+        # Built once, here, from the sources as they are. Every job then gets
+        # this tree copy-on-write and only compiles what its own candidate
+        # changed; without it each of them would build the project from nothing.
+        project_utils.baseline_build(project)
+        # The database clang_delta is handed has to name the files clang_delta is
+        # handed. It was given the project's paths while every pass works on the
+        # staged copy, so the lookup found nothing and every semantic pass -- the
+        # ones that delete functions, classes and templates -- exited 255 on every
+        # file of every project.
+        database = project_utils.database_for(project, staged)
+        # The user names a target, not a script: the project already describes how
+        # it is built and how it is checked, and asking for both again in shell is
+        # asking for two descriptions that will disagree.
+        args.interestingness_test = str(
+            project_utils.check_script(project, args.target, staging_dir / 'check.sh')
+        )
+        os.chdir(staged.parent)
+        test_cases = [Path(staged.name)]
+
+        pass_group = CVise.parse_pass_group_dict(
+            pass_group_dict,
+            pass_options,
+            external_programs,
+            args.remove_pass,
+            args.clang_delta_std,
+            args.clang_delta_preserve_routine,
+            str(database),
+            args.not_c,
+            args.renaming,
+        )
+
+        pass_statistic = statistics.PassStatistic()
+
+        if args.start_with_pass:
+            pass_names = [str(p) for p in chain(*pass_group.values())]
+            if args.start_with_pass not in pass_names:
+                print(
+                    f'Cannot find pass called "{args.start_with_pass}". '
+                    'Please use --list-passes to get a list of available passes.'
+                )
+                sys.exit(1)
+
+        if args.to_utf8:
+            for test_case in test_cases:
+                encoding = chardet.detect(test_case.read_bytes())['encoding']
+                if encoding not in ('ascii', 'utf-8'):
+                    logging.info(f'Converting {test_case} file ({encoding} encoding) to UTF-8')
+                    with open(test_case, encoding=encoding) as f:
+                        data = f.read()
+                    test_case.write_text(data)
+
+        assert args.interestingness_test
+
+        # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
+        # Preloading is used as a speedup, so that every worker doesn't need to execute all import statements on startup.
+        multiprocessing.set_start_method('forkserver')
+        multiprocessing.set_forkserver_preload(['__main__'] + list(sys.modules.keys()))
+        multiprocessing.forkserver.ensure_running()
+
         with testing.TestManager(
             pass_statistic,
             Path(args.interestingness_test),
@@ -497,6 +531,10 @@ def do_reduce(args):
             check_command={str(k): v for k, v in project.check_command.items()},
             precheck_timeout=args.timeout,
             overlay_root=project.root,
+            # The build tree is isolated per job as well. It is where the
+            # verdict about a candidate is computed, and sharing it means a job
+            # is answered with whatever the previous one built there.
+            overlay_build_dir=project.build_dir,
             overlay_files=project.sources,
             launch_dir=launch_dir,
         ) as test_manager:
@@ -569,8 +607,13 @@ def do_reduce(args):
         # What the reduction produced belongs in the project the user came with;
         # only the files that actually changed are written, so everything else
         # keeps the timestamp the user's build depends on.
-        published = project_utils.publish(project, staged)
-        logging.info('%d reduced files written back to %s', published, project.root)
+        #
+        # There may be nothing to write back: an interrupt during the CMake
+        # configure or the first build leaves no staged tree, and the two
+        # directories still have to go.
+        if project is not None and staged is not None:
+            published = project_utils.publish(project, staged)
+            logging.info('%d reduced files written back to %s', published, project.root)
         if script:
             os.unlink(script.name)
         shutil.rmtree(cmake_dir, ignore_errors=True)

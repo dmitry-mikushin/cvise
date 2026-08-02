@@ -30,8 +30,14 @@ def subprocess_tmpdir() -> Iterator[Path]:
         yield Path(tmp_dir)
 
 
-def write_project(root: Path, sources: dict[str, str], target: str = 'prog') -> Path:
-    """A real CMake project, because that is the only thing C-Vise accepts."""
+def write_project(root: Path, sources: dict[str, str], check: str = '') -> Path:
+    """A real CMake project, because that is the only thing C-Vise accepts.
+
+    The property lives in the project too: `check` is appended to the
+    CMakeLists, and the reduction is told the name of the target to build. The
+    project therefore describes both how it is built and what makes a variant
+    interesting, which is the whole point of the interface.
+    """
     root.mkdir(parents=True, exist_ok=True)
     for name, text in sources.items():
         (root / name).write_text(text)
@@ -39,15 +45,9 @@ def write_project(root: Path, sources: dict[str, str], target: str = 'prog') -> 
     cmakelists.write_text(
         'cmake_minimum_required(VERSION 3.20)\n'
         'project(demo C)\n'
-        f'add_executable({target} {" ".join(sorted(sources))})\n'
+        f'add_executable(prog {" ".join(sorted(sources))})\n' + check
     )
     return cmakelists
-
-
-def write_test(path: Path, body: str) -> Path:
-    path.write_text('#!/bin/sh\n' + body)
-    path.chmod(0o755)
-    return path
 
 
 def cvise_cli() -> Path:
@@ -96,10 +96,24 @@ def assert_no_leftovers(subprocess_tmpdir: Path) -> None:
 needs_posix = pytest.mark.skipif(os.name != 'posix', reason='requires POSIX command-line tools')
 needs_cmake = pytest.mark.skipif(shutil.which('cmake') is None, reason='requires cmake')
 needs_cc = pytest.mark.skipif(shutil.which('gcc') is None, reason='requires gcc')
+needs_ninja = pytest.mark.skipif(shutil.which('ninja') is None, reason='requires ninja')
+
+# add_dependencies, not DEPENDS: DEPENDS on a custom target takes FILES, so a
+# target written with it does not rebuild the executable and happily tests the
+# one left over from the previous candidate -- which passes whatever the
+# candidate did. The reduction then empties the program and calls it
+# interesting, correctly, because that is what it was asked.
+KEEP_CHECK = (
+    'add_custom_target(keeps\n'
+    '  COMMAND sh -c "$<TARGET_FILE:prog> | grep -q KEEP_ME"\n'
+    '  VERBATIM)\n'
+    'add_dependencies(keeps prog)\n'
+)
 
 
 @needs_posix
 @needs_cmake
+@needs_ninja
 @needs_cc
 def test_reduces_a_project(tmp_path: Path, subprocess_tmpdir: Path):
     project = tmp_path / 'project'
@@ -107,33 +121,30 @@ def test_reduces_a_project(tmp_path: Path, subprocess_tmpdir: Path):
         project,
         {
             'main.c': (
-                'int keep_me() { return 42; }\n'
-                'int drop_me() { return 1; }\n'
-                'int main() { return keep_me(); }\n'
+                '#include <stdio.h>\n'
+                'int keep_me(void) { return 1; }\n'
+                'int drop_me(void) { return 2; }\n'
+                'int main(void) { if (keep_me()) puts("KEEP_ME"); return 0; }\n'
             ),
         },
-    )
-    # The one contract: the test refers to the project where the project is.
-    # The overlay is what makes that correct -- every file this candidate
-    # changed is served there instead of the original, and everything else is
-    # read from the one shared tree.
-    script = write_test(
-        tmp_path / 'interesting.sh',
-        f'cd {project} || exit 125\n'
-        'gcc -c main.c -o /dev/null 2>/dev/null || exit 1\n'
-        'grep -q keep_me main.c\n',
+        check=KEEP_CHECK,
     )
 
-    run_cvise([str(project / 'CMakeLists.txt'), str(script)], project, subprocess_tmpdir)
+    # A fixed job count, because this asserts what the reduction achieved and
+    # the suite runs alongside other tests on the same machine.
+    before = (project / 'main.c').read_text()
+    run_cvise([str(project / 'CMakeLists.txt'), 'keeps', '-n', '4'], project, subprocess_tmpdir)
 
     result = (project / 'main.c').read_text()
-    assert 'keep_me' in result, 'the property was destroyed'
-    assert 'drop_me' not in result, 'nothing irrelevant was removed'
+    assert 'KEEP_ME' in result, 'the property was destroyed'
+    assert len(result) < len(before), 'nothing at all was removed'
+    assert 'drop_me' not in result, 'the code the property does not need survived'
     assert_no_leftovers(subprocess_tmpdir)
 
 
 @needs_posix
 @needs_cmake
+@needs_ninja
 @needs_cc
 def test_reduces_every_file_of_the_project(tmp_path: Path, subprocess_tmpdir: Path):
     """The project is the unit, so a file nobody needs is emptied like any other."""
@@ -141,76 +152,76 @@ def test_reduces_every_file_of_the_project(tmp_path: Path, subprocess_tmpdir: Pa
     write_project(
         project,
         {
-            'main.c': 'int main() { return 0; }\n',
-            'other.c': 'void unused_here() {}\n',
+            'main.c': '#include <stdio.h>\nint main(void) { puts("KEEP_ME"); return 0; }\n',
+            'other.c': 'int unused_here(void) { return 7; }\n',
         },
-    )
-    script = write_test(
-        tmp_path / 'interesting.sh',
-        f'cd {project} || exit 125\n'
-        'gcc -Wall -Werror main.c other.c -o /dev/null 2>/dev/null\n',
+        check=KEEP_CHECK,
     )
 
-    run_cvise([str(project / 'CMakeLists.txt'), str(script)], project, subprocess_tmpdir)
+    run_cvise([str(project / 'CMakeLists.txt'), 'keeps', '-n', '4'], project, subprocess_tmpdir)
 
-    assert (project / 'main.c').read_text() == 'int main() {}\n'
-    assert (project / 'other.c').read_text() == ''
+    assert 'KEEP_ME' in (project / 'main.c').read_text()
+    assert (project / 'other.c').read_text().strip() == '', 'the file nobody needs survived'
     assert_no_leftovers(subprocess_tmpdir)
 
 
 @needs_posix
 @needs_cmake
+@needs_ninja
 @needs_cc
-def test_honours_a_pass_group_file(tmp_path: Path, subprocess_tmpdir: Path):
+def test_an_executable_target_is_accepted(tmp_path: Path, subprocess_tmpdir: Path):
+    """Naming the executable must work; it once did not.
+
+    Targets were looked up in the list `cmake --build --target help` prints,
+    which contains only the phony primary targets -- so every executable and
+    library was missing from it and the tool refused to start on the name a
+    user is most likely to type.
+    """
     project = tmp_path / 'project'
-    write_project(
-        project,
-        {
-            'main.c': (
-                'int bar() {\n  return 42;\n}\n'
-                'int foo() {\n  return bar();\n}\n'
-                'int main() {\n  return foo();\n}\n'
-            )
-        },
-    )
-    config = tmp_path / 'config.json'
-    config.write_text(
-        '{"interleaving": ['
-        '{"pass": "lines", "arg": "0"},'
-        '{"pass": "lines", "arg": "1"},'
-        '{"pass": "lines", "arg": "2"}]}'
-    )
-    script = write_test(
-        tmp_path / 'interesting.sh',
-        f'cd {project} || exit 125\n'
-        'gcc -c main.c -o /dev/null 2>/dev/null && grep -q foo main.c\n',
-    )
+    write_project(project, {'main.c': 'int main(void) { return 0; }\n'})
 
-    run_cvise(
-        [str(project / 'CMakeLists.txt'), str(script), '--pass-group-file', str(config)],
-        project,
-        subprocess_tmpdir,
-    )
-
-    assert 'foo' in (project / 'main.c').read_text()
+    run_cvise([str(project / 'CMakeLists.txt'), 'prog'], project, subprocess_tmpdir)
     assert_no_leftovers(subprocess_tmpdir)
 
 
 @needs_posix
 @needs_cmake
+@needs_ninja
+def test_a_target_that_does_not_exist_is_refused(tmp_path: Path, subprocess_tmpdir: Path):
+    """A typo must not look like "your project is not interesting"."""
+    project = tmp_path / 'project'
+    write_project(project, {'main.c': 'int main(void) { return 0; }\n'})
+
+    proc = start_cvise(
+        [str(project / 'CMakeLists.txt'), 'no_such_target'], project, subprocess_tmpdir
+    )
+    stdout, stderr = proc.communicate(timeout=600)
+    assert proc.returncode != 0
+    assert 'no target' in (stdout + stderr)
+
+
+@needs_posix
+@needs_cmake
+@needs_ninja
+@needs_cc
 @pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM], ids=['sigint', 'sigterm'])
 def test_shuts_down_promptly_when_interrupted(tmp_path: Path, subprocess_tmpdir: Path, signum: int):
     """Control-C must not wait for jobs that are deliberately slow."""
     project = tmp_path / 'project'
-    write_project(project, {'main.c': 'int main() { return 0; }\n'})
     flag = tmp_path / 'started'
-    script = write_test(
-        tmp_path / 'interesting.sh',
-        f'touch {flag}\nsleep {MAX_SHUTDOWN * 2}\n',
+    write_project(
+        project,
+        {'main.c': 'int main(void) { return 0; }\n'},
+        check=(
+            'add_custom_target(slow\n'
+            f'  COMMAND sh -c "touch {flag}; sleep {MAX_SHUTDOWN * 2}"\n'
+            '  VERBATIM)\n'
+            'add_dependencies(slow prog)\n'
+        ),
     )
 
     proc = start_cvise(
-        [str(project / 'CMakeLists.txt'), str(script), '--skip-interestingness-test-check', '-n', '5'],
+        [str(project / 'CMakeLists.txt'), 'slow', '--skip-interestingness-test-check', '-n', '5'],
         project,
         subprocess_tmpdir,
     )
@@ -230,13 +241,21 @@ def test_shuts_down_promptly_when_interrupted(tmp_path: Path, subprocess_tmpdir:
 
 @needs_posix
 @needs_cmake
-def test_rejects_a_test_that_fails_on_the_untouched_project(tmp_path: Path, subprocess_tmpdir: Path):
+@needs_ninja
+def test_rejects_a_target_that_fails_on_the_untouched_project(
+    tmp_path: Path, subprocess_tmpdir: Path
+):
     """If the pristine project is not interesting, every later verdict is meaningless."""
     project = tmp_path / 'project'
-    write_project(project, {'main.c': 'int main() { return 0; }\n'})
-    script = write_test(tmp_path / 'interesting.sh', 'exit 1\n')
+    write_project(
+        project,
+        {'main.c': 'int main(void) { return 0; }\n'},
+        check='add_custom_target(always_fails COMMAND sh -c "exit 1" VERBATIM)\n',
+    )
 
-    proc = start_cvise([str(project / 'CMakeLists.txt'), str(script)], project, subprocess_tmpdir)
+    proc = start_cvise(
+        [str(project / 'CMakeLists.txt'), 'always_fails'], project, subprocess_tmpdir
+    )
     stdout, stderr = proc.communicate(timeout=600)
     assert proc.returncode != 0
     assert 'does not return' in (stdout + stderr), 'the refusal did not explain itself'
@@ -246,9 +265,8 @@ def test_rejects_a_test_that_fails_on_the_untouched_project(tmp_path: Path, subp
 def test_rejects_a_path_that_is_not_a_cmakelists(tmp_path: Path, subprocess_tmpdir: Path):
     not_cmake = tmp_path / 'notes.txt'
     not_cmake.write_text('this is not a build system\n')
-    script = write_test(tmp_path / 'interesting.sh', 'exit 0\n')
 
-    proc = start_cvise([str(not_cmake), str(script)], tmp_path, subprocess_tmpdir)
+    proc = start_cvise([str(not_cmake), 'anything'], tmp_path, subprocess_tmpdir)
     stdout, stderr = proc.communicate(timeout=120)
     assert proc.returncode != 0
     assert 'CMakeLists' in stdout + stderr

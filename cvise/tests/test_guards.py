@@ -212,8 +212,33 @@ class TestOverlayProof:
         monkeypatch.setenv(overlay.LIB_ENV, '/somewhere/libfakechroot.so')
         assert overlay.overlay_configured()
 
-    def test_without_a_library_the_overlay_is_not_expected(self, monkeypatch):
+    def test_the_library_of_this_build_comes_first(self, monkeypatch, tmp_path):
+        """Not the installed one, which is whatever was installed last.
+
+        A stale overlay does not fail; it answers differently. Preferring the
+        installed copy meant a change was tested against the previous version of
+        the very component whose being wrong looks like a plausible result.
+        """
         monkeypatch.delenv(overlay.LIB_ENV, raising=False)
+        built = tmp_path / 'built.so'
+        installed = tmp_path / 'installed.so'
+        built.write_bytes(b'built')
+        installed.write_bytes(b'installed')
+        monkeypatch.setattr(overlay, 'BUILT_LIB', str(built))
+        monkeypatch.setattr(overlay, 'INSTALLED_LIB', str(installed))
+        assert overlay.library_path() == str(built)
+
+    def test_the_installed_library_is_used_when_there_is_no_build_tree(self, monkeypatch, tmp_path):
+        """Which is the case for every user who did not build C-Vise themselves."""
+        monkeypatch.delenv(overlay.LIB_ENV, raising=False)
+        installed = tmp_path / 'installed.so'
+        installed.write_bytes(b'installed')
+        monkeypatch.setattr(overlay, 'BUILT_LIB', str(tmp_path / 'never-built.so'))
+        monkeypatch.setattr(overlay, 'INSTALLED_LIB', str(installed))
+        assert overlay.library_path() == str(installed)
+
+    def test_without_a_library_the_overlay_is_not_expected(self, monkeypatch, tmp_path):
+        no_library_anywhere(monkeypatch, tmp_path)
         assert not overlay.overlay_configured()
 
     def test_a_library_that_is_not_there_is_refused(self, monkeypatch, tmp_path):
@@ -234,7 +259,61 @@ class TestOverlayProof:
         with pytest.raises(OverlayNotProvenError):
             overlay.prove_overlay()
 
-    def test_no_library_named_means_nothing_to_prove(self, monkeypatch):
-        monkeypatch.delenv(overlay.LIB_ENV, raising=False)
+    def test_no_library_named_means_nothing_to_prove(self, monkeypatch, tmp_path):
+        no_library_anywhere(monkeypatch, tmp_path)
         with pytest.raises(OverlayNotProvenError):
             overlay.prove_overlay()
+
+
+def no_library_anywhere(monkeypatch, tmp_path) -> None:
+    """A machine with no overlay at all, whichever machine is running the test.
+
+    Unsetting the environment variable is not enough now that a build tree and
+    an installed copy are searched as well: on a developer's machine both exist,
+    so a test written that way asks about this machine rather than about the
+    policy it means to check.
+    """
+    monkeypatch.delenv(overlay.LIB_ENV, raising=False)
+    monkeypatch.setattr(overlay, 'BUILT_LIB', str(tmp_path / 'no-build-tree.so'))
+    monkeypatch.setattr(overlay, 'INSTALLED_LIB', str(tmp_path / 'not-installed.so'))
+
+
+class TestPrecheckVerdicts:
+    """A cheap stage that could not run has not decided anything.
+
+    Reading a timeout as "it passed" is how a machine under load quietly turns
+    into a reducer that accepts things nobody checked; reading it as "it failed"
+    is how it turns into one that discards good candidates. Both are wrong in
+    the same way: they answer a question that was never asked.
+    """
+
+    def test_a_failing_compile_is_a_verdict(self, tmp_path):
+        from cvise.utils import precheck
+
+        bad = tmp_path / 'bad.c'
+        bad.write_text('this is not C\n')
+        assert not precheck.syntax_check(['cc', str(bad)], dict(os.environ), 60)
+
+    def test_a_compiling_file_is_a_verdict(self, tmp_path):
+        from cvise.utils import precheck
+
+        good = tmp_path / 'good.c'
+        good.write_text('int main(void) { return 0; }\n')
+        assert precheck.syntax_check(['cc', str(good)], dict(os.environ), 60)
+
+    def test_a_timeout_is_not_a_verdict(self, tmp_path):
+        from cvise.utils import precheck
+
+        # A script, not `sh -c`: syntax_check strips -c, which is right for a
+        # compile command and fatal for a shell invocation.
+        slow = tmp_path / 'slow.sh'
+        slow.write_text('#!/bin/sh\nsleep 30\n')
+        slow.chmod(0o755)
+        with pytest.raises(precheck.Undecided):
+            precheck.syntax_check([str(slow)], dict(os.environ), 0.2)
+
+    def test_a_missing_compiler_is_not_a_verdict(self):
+        from cvise.utils import precheck
+
+        with pytest.raises(precheck.Undecided):
+            precheck.syntax_check(['/nonexistent/cc'], dict(os.environ), 60)

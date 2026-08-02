@@ -230,6 +230,13 @@ class CVise:
             raise overlay.OverlayMissingError()
         answer = overlay.prove_overlay()
         logging.info('reduction overlay proved itself (challenge answered %d)', answer)
+        # Proving the library works says nothing about whether this run uses it.
+        # A job goes through the overlay when it has been told which tree to map
+        # onto which project, so that is the thing to insist on here -- an
+        # installed library and a run that never reaches for it look identical
+        # from the outside and differ in every answer.
+        if self.test_manager.overlay_root is None:
+            raise overlay.OverlayNotProvenError('this run was given no project tree to map')
         if not self.skip_interestingness_test_check:
             self.test_manager.check_sanity()
 

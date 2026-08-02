@@ -179,7 +179,7 @@ static int overlay_delta_path (const char * path, char * buf)
     if (delta == NULL || *delta == '\0')
         return 0;
 
-    /* Only the tree under reduction is overlaid.  Redirecting EVERY absolute
+    /* Only the trees under reduction are overlaid.  Redirecting EVERY absolute
        path is not a bigger version of the same idea, it is a different and
        broken one: the job also opens its own sockets, /proc, /dev and the
        runtime scratch of whatever language its tools are written in, and
@@ -187,14 +187,38 @@ static int overlay_delta_path (const char * path, char * buf)
        with the reduction.  Python's forkserver, for one, creates a directory
        and binds a socket in it -- the directory went to the delta, bind() is
        not a path call we intercept, and C-Vise died before it ran a single
-       test. */
+       test.
+
+       There is more than one such tree, and the second one is not optional.
+       The sources are what a candidate changes; the build directory is where
+       the answer about it is computed -- the objects, the link, and ninja's own
+       record of what is up to date.  Left shared, it hands each job whatever
+       the previous one built: a file this candidate did not touch is read from
+       the pristine tree with the pristine timestamp, which is older than the
+       object the previous candidate left behind, so it counts as up to date and
+       is linked as it stands.  The verdict is then about a program no candidate
+       ever described.  The roots are given colon-separated, the way a search
+       path is. */
     root = getenv("CVISE_OVERLAY_ROOT");
     if (root != NULL && *root != '\0') {
-        root_len = strlen(root);
-        while (root_len > 1 && root[root_len - 1] == '/')
-            root_len--;
-        if (strncmp(path, root, root_len) != 0 ||
-            (path[root_len] != '\0' && path[root_len] != '/'))
+        const char *start = root;
+        int covered = 0;
+
+        while (*start != '\0') {
+            const char *end = strchr(start, ':');
+            root_len = end != NULL ? (size_t) (end - start) : strlen(start);
+            while (root_len > 1 && start[root_len - 1] == '/')
+                root_len--;
+            if (root_len > 0 && strncmp(path, start, root_len) == 0 &&
+                (path[root_len] == '\0' || path[root_len] == '/')) {
+                covered = 1;
+                break;
+            }
+            if (end == NULL)
+                break;
+            start = end + 1;
+        }
+        if (!covered)
             return 0;
     }
 
@@ -313,6 +337,23 @@ static int overlay_copy_up (const char * original, const char * target)
     real_close(in);
     real_close(out);
     return 0;
+}
+
+
+/* Was this path deleted by the candidate?
+
+   Distinct from "the delta has something here": after a job writes one file
+   into a directory, the delta contains that directory too, and treating that
+   as a deletion would make every directory the job has written into vanish. */
+LOCAL int fakechroot_overlay_hidden (const char * path, char * buf)
+{
+    size_t len;
+
+    if (!overlay_delta_path(path, buf))
+        return 0;
+    len = strlen(buf);
+    memcpy(buf + len, FAKECHROOT_WHITEOUT_SUFFIX, sizeof(FAKECHROOT_WHITEOUT_SUFFIX));
+    return overlay_exists(buf);
 }
 
 

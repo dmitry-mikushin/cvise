@@ -130,6 +130,12 @@ set(cvise_VERSION                   "2.12.0")
 set(cvise_LLVM_VERSION              "${LLVM_PACKAGE_VERSION}")
 set(cvise_SCRIPT_TO_PACKAGE_PATH    "../..")
 set(cvise_SHARE_DIR_SUFFIX          "cvise")
+# Where the overlay lands in this build tree. A C-Vise run from a build tree has
+# to load the library that build tree just produced: preferring an installed one
+# means a developer testing a change silently tests the version they last
+# installed, and the overlay is exactly the component whose being wrong shows up
+# as a plausible answer rather than as a failure.
+set(cvise_OVERLAY_BUILD_LIB         "${PROJECT_BINARY_DIR}/overlay/libcvise_overlay.so")
 
 configure_file("cmake_config.h.in" "${PROJECT_BINARY_DIR}/config.h")
 add_definitions("-DHAVE_CONFIG_H")
