@@ -235,8 +235,10 @@ def main():
         '--timeout',
         type=int,
         nargs='?',
-        default=300,
-        help='Interestingness test timeout in seconds',
+        default=None,
+        help='Interestingness test timeout in seconds. By default it is measured rather than '
+        'guessed: a candidate can never need more work than building the project from nothing, '
+        'so the deadline is that, scaled for the share of the machine one job gets',
     )
     parser.add_argument('--no-cache', action='store_true', help="Don't cache behavior of passes")
     parser.add_argument(
@@ -447,7 +449,23 @@ def do_reduce(args):
         # Built once, here, from the sources as they are. Every job then gets
         # this tree copy-on-write and only compiles what its own candidate
         # changed; without it each of them would build the project from nothing.
-        project_utils.baseline_build(project)
+        baseline_seconds = project_utils.baseline_build(project)
+        if args.timeout is None:
+            # A fixed deadline is applied to candidates whose cost differs by a
+            # factor of hundreds -- one changed file against every file of the
+            # project -- so the expensive ones are killed for being expensive
+            # rather than judged. MEASURED on ns-projection: the project builds
+            # from nothing in 145 s on 88 cores, which is 53 minutes for a job
+            # holding two of them, against a 300 s deadline; every candidate
+            # from a pass that rewrites whole files timed out, always, and the
+            # passes were eventually disabled for it.
+            share = max(1, (os.cpu_count() or 1) // max(1, args.n))
+            args.timeout = max(300, int(baseline_seconds * (os.cpu_count() or 1) / share * 1.5))
+            logging.info(
+                'a candidate has %d s: the project builds from nothing in %.0f s, and a job '
+                'gets %d of the %d cores',
+                args.timeout, baseline_seconds, share, os.cpu_count() or 1,
+            )
         if not project_utils.has_test(project, args.test):
             known = project_utils.tests_of(project)
             sys.exit(

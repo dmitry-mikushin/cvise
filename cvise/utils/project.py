@@ -21,6 +21,7 @@ import shlex
 import shutil
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -349,7 +350,7 @@ def publish(project: 'Project', staging: Path) -> int:
     return published
 
 
-def baseline_build(project: 'Project') -> None:
+def baseline_build(project: 'Project') -> float:
     """Build the project once, from the sources as they are.
 
     Every job gets this directory copy-on-write, so what it finds here is what
@@ -374,19 +375,27 @@ def baseline_build(project: 'Project') -> None:
     the sanity check's question, and the user can waive that; this is only the
     work that would otherwise be repeated by every job, so not having it costs
     time and nothing else.
+
+    Returns how long it took, because that is the only honest basis for a
+    deadline. A candidate can never need more work than a build from nothing,
+    and how long that is a property of the project, not of C-Vise.
     """
+    started = time.monotonic()
     logging.info('building the project once, so that each candidate only rebuilds what it changed')
     proc = subprocess.run(
         ['cmake', '--build', str(project.build_dir)],
         capture_output=True,
         text=True,
     )
+    took = time.monotonic() - started
     if proc.returncode != 0:
         logging.warning(
             'the project does not build as it stands, so every candidate will have to build it '
             'from nothing:\n%s',
             (proc.stderr or proc.stdout)[-2000:],
         )
+    logging.info('the project builds from nothing in %.0f s on this machine', took)
+    return took
 
 
 def has_test(project: 'Project', name: str) -> bool:

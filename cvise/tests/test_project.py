@@ -523,3 +523,31 @@ class TestTheBuildsShareOfTheMachine:
         project = configure(cmakelists, tmp_path / 'build')
         text = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=4).read_text()
         assert re.search(r'cmake --build \S+ -j \d+', text), text
+
+
+class TestTheBaselineIsTimed:
+    """Because it is the only honest basis for a candidate's deadline.
+
+    A candidate can never need more work than a build from nothing, and how
+    long that is a property of the project rather than of C-Vise. MEASURED on
+    ns-projection: the project builds from nothing in 145 s on 88 cores, which
+    is 53 minutes for a job holding two of them -- against a fixed 300 s
+    deadline, so every candidate from a pass that rewrites whole files timed
+    out, always, and those passes were disabled for it.
+    """
+
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_it_says_how_long_it_took(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build')
+        took = baseline_build(project)
+        assert took > 0
+
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_a_project_that_does_not_build_still_reports_a_time(self, tmp_path):
+        """The warning is not a reason to leave the caller without a number."""
+        root = tmp_path / 'project'
+        write_project(root)
+        (root / 'src' / 'calc.cpp').write_text('this is not C++\n')
+        project = configure(root / 'CMakeLists.txt', tmp_path / 'build')
+        assert baseline_build(project) > 0
