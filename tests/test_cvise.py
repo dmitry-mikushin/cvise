@@ -113,11 +113,13 @@ def test_reduces_a_project(tmp_path: Path, subprocess_tmpdir: Path):
             ),
         },
     )
-    # The job runs in a scratch directory holding this candidate, so the test
-    # looks at the files in front of it. Reaching back to the project would ask
-    # about the pristine sources and answer about the wrong thing.
+    # The one contract: the test refers to the project where the project is.
+    # The overlay is what makes that correct -- every file this candidate
+    # changed is served there instead of the original, and everything else is
+    # read from the one shared tree.
     script = write_test(
         tmp_path / 'interesting.sh',
+        f'cd {project} || exit 125\n'
         'gcc -c main.c -o /dev/null 2>/dev/null || exit 1\n'
         'grep -q keep_me main.c\n',
     )
@@ -145,6 +147,7 @@ def test_reduces_every_file_of_the_project(tmp_path: Path, subprocess_tmpdir: Pa
     )
     script = write_test(
         tmp_path / 'interesting.sh',
+        f'cd {project} || exit 125\n'
         'gcc -Wall -Werror main.c other.c -o /dev/null 2>/dev/null\n',
     )
 
@@ -179,6 +182,7 @@ def test_honours_a_pass_group_file(tmp_path: Path, subprocess_tmpdir: Path):
     )
     script = write_test(
         tmp_path / 'interesting.sh',
+        f'cd {project} || exit 125\n'
         'gcc -c main.c -o /dev/null 2>/dev/null && grep -q foo main.c\n',
     )
 

@@ -152,7 +152,10 @@ def library_path() -> str:
     return ''
 
 
-def prepare_job_delta(folder, variants) -> Path:
+WHITEOUT_SUFFIX = '.cvise-whiteout'
+
+
+def prepare_job_delta(folder, variants, expected=()) -> Path:
     """Put this job's variants where the overlay will serve them from.
 
     The reducer produces a candidate as a file in the job's own scratch
@@ -163,14 +166,52 @@ def prepare_job_delta(folder, variants) -> Path:
     candidate actually changed.
     """
     delta = Path(folder) / '.cvise-delta'
+    present: set[Path] = set()
     for original, produced in variants:
-        target = delta / str(original).lstrip('/')
-        target.parent.mkdir(parents=True, exist_ok=True)
         if produced.is_dir():
-            shutil.copytree(produced, target, dirs_exist_ok=True)
+            for path in sorted(produced.rglob('*')):
+                if path.is_file():
+                    target = original / path.relative_to(produced)
+                    present.add(target)
+                    _place(delta, target, path)
         else:
-            shutil.copyfile(produced, target)
+            present.add(original)
+            _place(delta, original, produced)
+
+    # A file the candidate deleted has to be recorded as deleted. Producing no
+    # entry for it means the overlay falls through to the shared tree and the
+    # build reads the original -- so deleting a file would look interesting
+    # every single time, and the reduction would happily delete the entire
+    # project and call it a success. It does exactly that without this.
+    for original in expected:
+        original = Path(original)
+        if original in present:
+            continue
+        marker = delta / (str(original).lstrip('/') + WHITEOUT_SUFFIX)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
     return delta
+
+
+def _place(delta: Path, original: Path, produced: Path) -> None:
+    """Put a file in the delta only if it actually differs.
+
+    The delta is what the build sees instead of the project, and a file placed
+    there is a file the build must rebuild -- it has a new timestamp and, as far
+    as the build system can tell, new content. Placing every file of the project
+    would therefore cost a full rebuild for every candidate, which for a project
+    of any size is the whole reduction. Only what this candidate changed belongs
+    here; everything else is read from the shared tree, unchanged and untouched,
+    which is the entire point of an overlay.
+    """
+    try:
+        if original.is_file() and original.read_bytes() == produced.read_bytes():
+            return
+    except OSError:
+        pass
+    target = delta / str(original).lstrip('/')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(produced, target)
 
 
 def job_environment(env: dict, delta: Path, root: Path) -> dict:

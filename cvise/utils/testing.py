@@ -26,7 +26,7 @@ import pebble
 from cvise.cvise import CVise
 from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
-from cvise.utils import cache, fileutil, mplogging, overlay, sigmonitor
+from cvise.utils import cache, fileutil, mplogging, overlay, precheck, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
     AbsolutePathTestCaseError,
@@ -155,6 +155,10 @@ class TestEnvironment:
         should_copy_current_test_case: bool,
         transform,
         pid_queue: queue.Queue | None = None,
+        check_command: dict | None = None,
+        precheck_timeout: float | None = None,
+        overlay_root: Path | None = None,
+        overlay_files=None,
     ):
         self.state = state
         self.folder: Path = folder
@@ -169,6 +173,10 @@ class TestEnvironment:
         self.all_test_cases: set[Path] = all_test_cases
         self.original_size: int | None = None
         self.new_size: int | None = None
+        self.check_command = check_command
+        self.precheck_timeout = precheck_timeout
+        self.overlay_root = overlay_root
+        self.overlay_files = overlay_files
 
     @property
     def size_improvement(self) -> int:
@@ -241,15 +249,30 @@ class TestEnvironment:
         with tempfile.TemporaryDirectory(dir=self.folder, prefix='overridetmp') as tmp_override:
             env = override_tmpdir_env(os.environ.copy(), Path(tmp_override))
             if overlay.library_path():
-                # Without this the test builds the project from the pristine
-                # sources and answers a question about code this candidate never
-                # touched -- which looks exactly like a working reduction.
-                variants = [(tc.resolve(), self.folder / tc) for tc in self.all_test_cases]
-                delta = overlay.prepare_job_delta(self.folder, variants)
-                root = os.path.commonpath([str(tc.resolve()) for tc in self.all_test_cases])
-                if not Path(root).is_dir():
-                    root = str(Path(root).parent)
-                env = overlay.job_environment(env, delta, Path(root))
+                # The candidate lives in this job's copy of the staged tree, but
+                # the build opens the project where the project is. Mapping one
+                # to the other is the whole job of the overlay -- and getting
+                # the mapping wrong does not fail, it silently builds the
+                # pristine sources, finds every candidate interesting, and
+                # reduces the project to nothing.
+                assert self.overlay_root is not None
+                variants = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
+                delta = overlay.prepare_job_delta(self.folder, variants, self.overlay_files or ())
+                env = overlay.job_environment(env, delta, Path(self.overlay_root))
+
+            # Most candidates are rejected because they do not compile, and
+            # that answer costs milliseconds when asked of the changed file
+            # alone instead of minutes when asked of a whole build. The flags
+            # come from the project's own compilation database, so this is the
+            # same compiler with the same options the build would use -- it is
+            # not a second opinion, it is the first part of the same one.
+            command = self.check_command.get(str(self.test_case.resolve())) if self.check_command else None
+            if command:
+                if not precheck.syntax_check(command, env, self.precheck_timeout):
+                    return 1, b'', b'rejected by -fsyntax-only on the changed file\n'
+                if not precheck.object_check(command, env, self.precheck_timeout):
+                    return 1, b'', b'rejected while compiling the changed file\n'
+
             stdout, stderr, returncode = ProcessEventNotifier(self.pid_queue).run_process(
                 str(self.test_script), shell=True, env=env, cwd=self.folder
             )
@@ -472,6 +495,10 @@ class TestManager:
         start_with_pass,
         skip_after_n_transforms,
         stopping_threshold,
+        check_command=None,
+        precheck_timeout=None,
+        overlay_root=None,
+        overlay_files=None,
     ):
         self.test_script: Path = test_script.absolute()
         self.timeout = timeout
@@ -487,6 +514,10 @@ class TestManager:
         self.max_improvement = max_improvement
         self.no_give_up = no_give_up
         self.also_interesting = also_interesting
+        self.check_command = check_command or {}
+        self.precheck_timeout = precheck_timeout
+        self.overlay_root = overlay_root
+        self.overlay_files = overlay_files
         self.undecided_count = 0
         self.undecided_in_pass = 0
         self.start_with_pass = start_with_pass
@@ -711,6 +742,10 @@ class TestManager:
             self.test_cases,
             should_copy_current_test_case=True,
             transform=None,
+            check_command=self.check_command,
+            precheck_timeout=self.precheck_timeout,
+            overlay_root=self.overlay_root,
+            overlay_files=self.overlay_files,
         )
         logging.debug(f'sanity check tmpdir = {test_env.folder}')
 
@@ -1385,6 +1420,10 @@ class TestManager:
             should_copy_current_test_case,
             ctx.pass_.transform,
             self.process_monitor.pid_queue,
+            check_command=self.check_command,
+            precheck_timeout=self.precheck_timeout,
+            overlay_root=self.overlay_root,
+            overlay_files=self.overlay_files,
         )
         future = self.worker_pool.schedule(
             _worker_process_job_wrapper, args=[self.order, env.run], timeout=self.timeout
@@ -1425,6 +1464,10 @@ class TestManager:
             should_copy_current_test_case,
             FoldingManager.transform,
             self.process_monitor.pid_queue,
+            check_command=self.check_command,
+            precheck_timeout=self.precheck_timeout,
+            overlay_root=self.overlay_root,
+            overlay_files=self.overlay_files,
         )
         future = self.worker_pool.schedule(
             _worker_process_job_wrapper, args=[self.order, env.run], timeout=self.timeout

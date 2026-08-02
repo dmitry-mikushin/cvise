@@ -141,17 +141,25 @@ def test_copy_dir(tmp_path: Path):
     assert (target_dir / 'test' / 'b' / 'c.txt').read_text() == 'bar'
 
 
-def test_copy_failure_nonexisting_destination(tmp_path: Path):
+def test_copy_creates_the_destination(tmp_path: Path):
+    """The directories on the way are created, because the path is kept.
+
+    A test case keeps the path the project refers to it by -- src/foo.cpp stays
+    src/foo.cpp -- so copying it into a job's scratch directory means creating
+    that directory. Refusing to, as this once did, meant C-Vise could not start
+    on any project whose sources are not all in one flat directory, which is to
+    say on any project.
+    """
     work_dir = tmp_path / 'workdir'
-    work_dir.mkdir()
-    test_case = Path('a.txt')
+    (work_dir / 'src').mkdir(parents=True)
+    test_case = Path('src/a.txt')
     (work_dir / test_case).write_text('foo')
-    target_dir = tmp_path / 'targetdir'
-    # note no mkdir() for target_dir
+    target_dir = tmp_path / 'targetdir'  # deliberately absent
 
     with _chdir(work_dir):
-        with pytest.raises(FileNotFoundError):
-            copy_test_case(test_case, target_dir)
+        copy_test_case(test_case, target_dir)
+
+    assert (target_dir / test_case).read_text() == 'foo'
 
 
 def test_replace(tmp_path: Path):

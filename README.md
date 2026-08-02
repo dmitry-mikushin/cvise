@@ -55,8 +55,11 @@ it needs to know that the build system does not already know -- and every extra
 question would be another way for the answer to disagree with the build.
 
 The interestingness test is an executable that answers one question about a
-variant of the project: is it still interesting? It takes no arguments and is
-hard-coded to refer to the project it is testing. It should exit 0 for
+variant of the project: is it still interesting? It takes no arguments, and it
+refers to the project where the project is -- it builds and examines the real
+paths, exactly as you would by hand. That works because every file a candidate
+changed is served there instead of the original, for that job alone, while
+everything else is read from the one shared tree. It should exit 0 for
 interesting, nonzero for not, and 125 for "I could not decide" -- see below.
 
 That is the whole interface. Reducing a single file, a list of files, a
@@ -129,12 +132,10 @@ a candidate keeps its previous state and is not counted against the pass.
 1. C-Vise creates temporary directories in `$TMPDIR` and so usage
 of a `tmpfs` directory is recommended.
 
-1. By default each invocation of the interestingness test runs in a fresh
-temporary directory holding a copy of the files being reduced, so a test that
-needs anything else must refer to it by absolute path. With `CVISE_OVERLAY_LIB`
-this is no longer so: the test sees the project at its real path, and the only
-thing that differs from an ordinary build is the content of the files this
-candidate changed.
+1. The interestingness test runs in a scratch directory, but it should not look
+there: it refers to the project by its real path. The only thing that differs
+from an ordinary build is the content of the files the candidate changed, and
+files it deleted, which are reported as absent.
 
 1. If you copy the compiler invocation line from your build tool, remove
 -Werror if present. Some C-Vise passes introduce warnings, so -Werror

@@ -142,6 +142,7 @@ set(SOURCE_FILES
   "utils/memory.py"
   "utils/mplogging.py"
   "utils/nestedmatcher.py"
+  "utils/precheck.py"
   "utils/project.py"
   "utils/process.py"
   "utils/readkey_posix.py"

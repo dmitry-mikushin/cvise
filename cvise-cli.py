@@ -417,9 +417,18 @@ def do_reduce(args):
         len(project.sources),
         project.root,
     )
-    test_cases = [
-        p.relative_to(Path.cwd()) if p.is_relative_to(Path.cwd()) else p for p in project.sources
-    ]
+    # One directory, not a list of files: a candidate can then carry edits in
+    # several files at once, which is the only way the changes that matter in
+    # C++ -- a declaration and its uses -- can ever be accepted, since neither
+    # half of such a change compiles on its own.
+    # Anything the user named on the command line is resolved before the
+    # working directory moves, or a relative path silently becomes a different
+    # file -- or, as here, no file at all.
+    args.interestingness_test = str(Path(args.interestingness_test).resolve())
+    staging_dir = Path(tempfile.mkdtemp(prefix='cvise-staging-'))
+    staged = project_utils.stage(project, staging_dir / project.root.name)
+    os.chdir(staged.parent)
+    test_cases = [Path(staged.name)]
 
     pass_group = CVise.parse_pass_group_dict(
         pass_group_dict,
@@ -482,6 +491,12 @@ def do_reduce(args):
             args.start_with_pass,
             args.skip_after_n_transforms,
             args.stopping_threshold,
+            # Reject what the compiler alone can reject, before paying for a
+            # build: the flags come from the project's own database.
+            check_command={str(k): v for k, v in project.check_command.items()},
+            precheck_timeout=args.timeout,
+            overlay_root=project.root,
+            overlay_files=project.sources,
         ) as test_manager:
             reducer = CVise(test_manager, args.skip_interestingness_test_check)
 
@@ -549,9 +564,15 @@ def do_reduce(args):
                     fs.write(path.read_bytes())
                     fs.write(b'\n')
     finally:
+        # What the reduction produced belongs in the project the user came with;
+        # only the files that actually changed are written, so everything else
+        # keeps the timestamp the user's build depends on.
+        published = project_utils.publish(project, staged)
+        logging.info('%d reduced files written back to %s', published, project.root)
         if script:
             os.unlink(script.name)
         shutil.rmtree(cmake_dir, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':

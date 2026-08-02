@@ -163,11 +163,22 @@ def get_dir_count(test_case: Path) -> int:
 
 
 def copy_test_case(source: Path, destination_parent: Path) -> None:
+    """Place one file of the test case into a job's scratch directory.
+
+    The path is kept as it is, directories and all, because that is how the
+    project refers to it and how the interestingness test will find it. That
+    means the directories have to be created: a project whose sources live in
+    src/ -- which is to say nearly every project -- otherwise fails on the very
+    first candidate with FileNotFoundError, because copy2 will not create the
+    parent it is copying into.
+    """
     assert not source.is_absolute()
+    destination = destination_parent / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
-        shutil.copytree(source, destination_parent / source)
+        shutil.copytree(source, destination, dirs_exist_ok=True)
     else:
-        shutil.copy2(source, destination_parent / source)
+        shutil.copy2(source, destination)
 
 
 def replace_test_case_atomically(source: Path, destination: Path, move: bool = True) -> None:

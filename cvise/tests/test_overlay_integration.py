@@ -137,10 +137,18 @@ def test_reduction_through_the_overlay(tmp_path):
         print(f'the property was preserved:        {kept}')
         print(f'builds that saw core.cpp:          {total_builds}')
         print(f'  of those, the pristine version:  {pristine_builds}')
+        print(f'  of those, a variant:             {total_builds - pristine_builds}')
 
         assert total_builds > 0, 'the interestingness test never built anything'
-        assert pristine_builds <= 1, (
-            f'{pristine_builds} builds compiled the PRISTINE core.cpp: the overlay was inert '
+        # Not "no build ever saw the original": a candidate that edits another
+        # file does not change this one, and the delta holds only what changed,
+        # so compiling the original here is right. What must never happen is
+        # that EVERY build saw the original -- that is the inert overlay, which
+        # finds every candidate interesting and reduces nothing while looking
+        # like a triumph.
+        variant_builds = total_builds - pristine_builds
+        assert variant_builds > 0, (
+            f'all {total_builds} builds compiled the PRISTINE core.cpp: the overlay was inert '
             'and the reduction graded candidates against code it never changed'
         )
         assert kept, 'the reduction destroyed the property it was told to preserve'
