@@ -98,7 +98,13 @@ class ClangPass(AbstractPass):
             logging.debug('cannot count %s instances in %s: %s', self.arg, target, proc.stderr.strip()[:200])
             return 0
         m = re.match('Available transformation instances: ([0-9]+)$', proc.stdout.strip())
-        return int(m.group(1)) if m else 0
+        count = int(m.group(1)) if m else 0
+        # The path is worth having in the log. A count of zero is what both
+        # halves of the old defect looked like -- a database naming files no
+        # pass works on, and a key taken from a job's copy instead of the test
+        # case -- and neither said anything else about itself.
+        logging.debug('%s offers %d %s instances', target, count, self.arg)
+        return count
 
     def _state_from_file(self, sources, file_index: int):
         """First unit at or after file_index that has anything to transform."""
