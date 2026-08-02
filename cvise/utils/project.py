@@ -49,6 +49,12 @@ class Project:
     # unit that includes it. This is what lets a candidate be rejected in
     # milliseconds by a syntax check instead of minutes by a full build.
     check_command: dict[str, list[str]]
+    # For a translation unit, the object the build produces from it, as CMake
+    # recorded it. A header has none, and that is exactly the difference that
+    # matters when something asks whether the build would notice a file going
+    # away: a unit is named in the CMakeLists.txt and cannot be removed without
+    # editing it, a header is reached through an #include and can.
+    output: dict[str, str]
 
 
 def configure(cmakelists: Path, build_dir: Path) -> Project:
@@ -101,7 +107,35 @@ def configure(cmakelists: Path, build_dir: Path) -> Project:
         compilation_database=database,
         sources=translation_units + headers,
         check_command=check_command,
+        output=outputs_from(database, root),
     )
+
+
+def outputs_from(database: Path, root: Path) -> dict[str, str]:
+    """What the build produces from each file it compiles.
+
+    CMake records it, and it is the only thing in the database that says a file
+    is a translation unit rather than something a translation unit reads. That
+    distinction decides whether deleting the file is a reduction or a candidate
+    that cannot be built: the build names its units in the CMakeLists.txt, which
+    is not under reduction, so a missing unit is not a smaller project but a
+    manifest ninja refuses to load.
+    """
+    try:
+        entries = json.loads(database.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    outputs: dict[str, str] = {}
+    for entry in entries:
+        try:
+            path = Path(entry['file'])
+            produced = entry['output']
+        except (KeyError, TypeError):
+            continue
+        if not path.is_absolute():
+            path = (Path(entry.get('directory', root)) / path).resolve()
+        outputs[str(path)] = produced
+    return outputs
 
 
 def sources_from(database: Path, root: Path) -> list[Path]:
@@ -465,13 +499,19 @@ def database_for(project: 'Project', staging: Path) -> Path:
         # The command may end with a different file -- for a header it is the
         # unit that includes it -- and the entry has to be about this file.
         flags = list(command[:-1]) + [str(staged)]
-        entries.append(
-            {
-                'directory': str(project.build_dir),
-                'file': str(staged),
-                'command': ' '.join(shlex.quote(a) for a in flags),
-            }
-        )
+        entry = {
+            'directory': str(project.build_dir),
+            'file': str(staged),
+            'command': ' '.join(shlex.quote(a) for a in flags),
+        }
+        # Carried through, not invented: it says the build compiles this file
+        # into that object, and so that the build would miss it if it went
+        # away. A header has none, which is how the two are told apart by
+        # anything reading this database.
+        produced = project.output.get(str(source))
+        if produced:
+            entry['output'] = produced
+        entries.append(entry)
 
     database = project.build_dir / 'cvise_compile_commands' / 'compile_commands.json'
     database.parent.mkdir(parents=True, exist_ok=True)

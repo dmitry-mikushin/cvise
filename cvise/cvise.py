@@ -15,6 +15,7 @@ from cvise.passes.clangmodulemap import ClangModuleMapPass
 from cvise.passes.clex import ClexPass
 from cvise.passes.clexhints import ClexHintsPass
 from cvise.passes.comments import CommentsPass
+from cvise.passes.compilationdatabase import CompilationDatabasePass
 from cvise.passes.gcdabinary import GCDABinaryPass
 from cvise.passes.ifs import IfPass
 from cvise.passes.includeincludes import IncludeIncludesPass
@@ -85,6 +86,7 @@ class CVise:
         'clex': ClexPass,
         'clexhints': ClexHintsPass,
         'comments': CommentsPass,
+        'compilationdatabase': CompilationDatabasePass,
         'gcda-binary': GCDABinaryPass,
         'ifs': IfPass,
         'includeincludes': IncludeIncludesPass,

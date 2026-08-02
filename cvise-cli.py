@@ -49,11 +49,17 @@ script_path = os.path.dirname(os.path.realpath(__file__))
 
 
 def get_share_dir():
-    # Test all known locations for the cvise directory
+    """Where this C-Vise keeps its pass schedules and other data.
+
+    Beside this script first, and only then the installed copy. The other order
+    means a build tree runs its own Python against the pass groups of whatever
+    was installed last -- so a pass added to the schedule is simply not there,
+    with nothing to say why, and the same trap as the overlay library had.
+    """
     share_dirs = [
+        os.path.join(script_path, '@cvise_SHARE_DIR_SUFFIX@'),
         os.path.join('@CMAKE_INSTALL_FULL_DATADIR@', '@cvise_PACKAGE@'),
         destdir + os.path.join('@CMAKE_INSTALL_FULL_DATADIR@', '@cvise_PACKAGE@'),
-        os.path.join(script_path, '@cvise_SHARE_DIR_SUFFIX@'),
     ]
 
     for d in share_dirs:
