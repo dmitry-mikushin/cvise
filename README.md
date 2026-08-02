@@ -44,37 +44,84 @@ See [INSTALL.md](INSTALL.md).
 C-Vise reduces a CMake project. It takes two things, and nothing else:
 
 ```console
-$ cvise path/to/CMakeLists.txt ./interesting.sh
+$ cvise path/to/CMakeLists.txt some-target
 ```
 
-The CMakeLists.txt is the one that drives the project's build. C-Vise runs CMake
-on it once, purely to obtain `compile_commands.json`, and takes everything else
-from that file: which translation units exist, and what flags each one is
-compiled with. There is nothing else to tell it, because there is nothing else
-it needs to know that the build system does not already know -- and every extra
-question would be another way for the answer to disagree with the build.
+The CMakeLists.txt is the one that drives the project's build. The target is
+what makes a variant interesting. Everything else follows from those two,
+because everything else is already written down in the build: C-Vise runs CMake
+once to obtain `compile_commands.json`, and from it takes which translation
+units exist, which headers they include, and what flags each is compiled with.
+There is nothing else to tell it, and every extra question would be another way
+for the answer to disagree with the build.
 
-The interestingness test is an executable that answers one question about a
-variant of the project: is it still interesting? It takes no arguments, and it
-refers to the project where the project is -- it builds and examines the real
-paths, exactly as you would by hand. That works because every file a candidate
-changed is served there instead of the original, for that job alone, while
-everything else is read from the one shared tree. It should exit 0 for
-interesting, nonzero for not, and 125 for "I could not decide" -- see below.
+The target says what "still interesting" means, in the language the project is
+already written in. A library or executable target means the code still
+compiles and links. A custom target that runs something means it still behaves:
 
-That is the whole interface. Reducing a single file, a list of files, a
+```cmake
+add_custom_target(still_crashes
+  COMMAND sh -c "$<TARGET_FILE:prog> --input case.txt 2>&1 | grep -q 'assertion failed'"
+  VERBATIM)
+add_dependencies(still_crashes prog)   # DEPENDS takes files, not targets
+```
+
+A variant is interesting when `cmake --build --target still_crashes` succeeds.
+Asking instead for a shell script would be asking you to restate the build in
+another language, with another set of assumptions about where the files are and
+which compiler to call -- and the two descriptions disagree the moment the
+project changes.
+
+That is the whole interface. Reducing a single file, a list of files, a bare
 directory, a Makefile project, or anything described by a hand-written
 compilation database used to be separate ways in, and they are gone: a tool with
 five entrances has five sets of assumptions to keep straight, and the one that
 matters here is the one the build system can state for itself.
 
-### Why the flags matter
+### What a candidate costs
 
-A file compiled without its project's flags cannot be parsed: it will not find
-its own headers, its language standard is a guess, and the C++ passes -- the
-ones that delete functions, classes and whole templates -- have nothing to work
-on. MEASURED on one project: with the flags from `compile_commands.json`, 32
-transformations found 2900+ instances between them; without, none did.
+A reduction asks one question millions of times, so what the question costs is
+what the reduction costs. It is asked in three stages, cheapest first:
+
+1. `-fsyntax-only` on the file that changed, with the flags its own build uses.
+   Most rejected candidates die here, in the time it takes to parse one unit --
+   on a small project, about six candidates in ten never reach a compiler
+   again.
+2. the same unit compiled to an object, which is where anything the front end
+   accepted but the back end will not appears.
+3. the project built the way the project is built, and then the target.
+
+Only the third knows what "interesting" means, and only the third belongs to
+you. The first two are the compiler's own opinion of the file, and C-Vise
+already has everything needed to ask for it.
+
+### Each job answers about its own candidate
+
+The files under reduction are never copied for a candidate and never edited in
+place. Each parallel job gets its own private view of the project: what its
+candidate changed is served at the project's real path, for that job alone,
+everything else is read from the one shared tree, and everything the job writes
+lands in a directory of its own. Nothing is copied, no timestamp is disturbed,
+and no job can disturb another.
+
+That covers the build directory as well as the sources, and it has to. The
+objects, the link, and the build system's own record of what is up to date are
+what a verdict is actually made of. Shared, they hand each job whatever the
+previous one left there: a file this candidate did not change is read from the
+pristine tree with the pristine timestamp, which is older than the object the
+previous candidate built from its own copy of it, so it counts as up to date and
+is linked as it stands. The verdict then describes a program that no candidate
+ever was -- a good one discarded because it was graded on someone else's code,
+and a broken one kept for the same reason.
+
+The project is built once before the reduction starts, so that a job compiles
+what its candidate changed and links, rather than compiling the project.
+
+This is not a mode and there is no flag for it. C-Vise refuses to start unless
+the overlay proves itself -- in a child process built exactly like a job's,
+because that is where redirection has to work -- since an overlay that is loaded
+but inert lets every build read the pristine sources, which looks exactly like a
+reduction that is going well.
 
 ### Reduce with the compiler the project builds with
 
@@ -85,37 +132,21 @@ container -- then `clang_delta` parses something the build never sees, and its
 transformations are guesses. Run the reduction in the same environment as the
 build.
 
-### Reducing in place, without copying the tree
+### Memory
 
-By default each candidate is prepared in a scratch directory. For a project of
-any size that is the wrong shape: the build system decides what to rebuild from
-timestamps, and a copied tree has none of the original ones, so every candidate
-costs a full rebuild.
-
-Set `CVISE_OVERLAY_LIB` to an overlay library and C-Vise gives each parallel job
-its own private view of the project instead. The job's candidate is served at
-the project's real path, everything it did not change is read from the one
-shared tree, and everything it writes lands in its own directory -- so nothing
-is copied, no timestamp is disturbed, and no job can disturb another.
-
-```console
-$ CVISE_OVERLAY_LIB=/path/to/libfakechroot.so \
-      cvise path/to/CMakeLists.txt ./interesting.sh
-```
-
-C-Vise refuses to start this way unless two things hold. The overlay must prove
-itself -- in a child process built exactly like a job's, because that is where
-redirection has to work -- since an overlay that is loaded but inert lets every
-build read the pristine sources, which looks exactly like a reduction that is
-going well. And the run must be under a cgroup memory limit below the machine's
-RAM, because the scratch space of a parallel reduction is not reclaimable
-memory: when it fills, the OOM killer can free none of it, and the machine dies
-rather than the reduction failing.
+The scratch space of a parallel reduction is not reclaimable memory. When
+`$TMPDIR` is a tmpfs and it fills, the OOM killer can free none of it, because
+the pages belong to no process it can kill, and the machine dies rather than the
+reduction failing. C-Vise therefore places itself under a cgroup memory limit at
+startup and says what it chose. If it cannot -- no systemd user session with the
+memory controller delegated -- it says so, and only warns when the scratch is
+actually held in memory, since a reduction whose scratch is on a disk cannot
+take a machine down however large it grows. Either point `TMPDIR` at a disk, or
+run under something that bounds memory:
 
 ```console
 $ systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
-      env CVISE_OVERLAY_LIB=/path/to/libfakechroot.so \
-      cvise path/to/CMakeLists.txt ./interesting.sh
+      cvise path/to/CMakeLists.txt some-target
 ```
 
 ### When the test cannot answer
@@ -129,23 +160,21 @@ a candidate keeps its previous state and is not counted against the pass.
 
 ## Notes
 
-1. C-Vise creates temporary directories in `$TMPDIR` and so usage
-of a `tmpfs` directory is recommended.
+1. C-Vise creates its temporary directories in `$TMPDIR`, and a `tmpfs` is
+about a hundred times faster than a disk for what it does there, so it is worth
+having -- under a memory limit, which C-Vise gives itself. See
+[Memory](#memory).
 
-1. The interestingness test runs in a scratch directory, but it should not look
-there: it refers to the project by its real path. The only thing that differs
-from an ordinary build is the content of the files the candidate changed, and
-files it deleted, which are reported as absent.
+1. The build a candidate is judged by runs where the project is, not in a
+scratch directory. The only things that differ from an ordinary build are the
+contents of the files the candidate changed, and the files it deleted, which
+are reported as absent.
 
-1. If you copy the compiler invocation line from your build tool, remove
--Werror if present. Some C-Vise passes introduce warnings, so -Werror
-will make those passes ineffective.
+1. If the project is built with `-Werror`, consider removing it for the
+reduction. Some C-Vise passes introduce warnings, and with `-Werror` those
+passes can never succeed. The reduction will typically be faster without it, at
+the cost of a result full of warnings.
 
-   Doing that, a reduction will typically end up faster, however,
-   one may end up with a code snippet full of warnings that needs
-   to be addresses after the reduction.
-
-1. Adding `-Wfatal-errors` to the interestingness test can speed up
-   large reductions by causing the compiler to bail out quickly on errors,
-   rather than trying to soldier on producing a result that is eventually
-   discarded.
+1. Adding `-Wfatal-errors` can speed up large reductions by causing the compiler
+   to bail out quickly on errors, rather than trying to soldier on producing a
+   result that is eventually discarded.
