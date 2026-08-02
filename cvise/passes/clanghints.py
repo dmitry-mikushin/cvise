@@ -9,16 +9,12 @@ from pathlib import Path
 import msgspec
 
 from cvise.passes.abstract import BinaryState, SubsegmentState
+from cvise.passes.clang import SOURCE_SUFFIXES
 from cvise.passes.hint_based import HintBasedPass, HintState
 from cvise.utils.hint import Hint, HintBundle
 from cvise.utils.process import ProcessEventNotifier
 
 CLANG_STD_CHOICES = ('c++98', 'c++11', 'c++14', 'c++17', 'c++20', 'c++2b')
-
-# clang_delta parses a translation unit, so only the sources a compiler is
-# given directly are worth handing to it; a header is reduced through the units
-# that include it.
-SOURCE_SUFFIXES = ('.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cl', '.cu', '.hip')
 
 
 @dataclass(frozen=True, slots=True)

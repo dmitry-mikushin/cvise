@@ -6,10 +6,22 @@ from pathlib import Path
 
 from cvise.passes.abstract import AbstractPass, PassResult
 
-# clang_delta transforms one translation unit, so a directory is reduced by
-# walking the units it contains; a header is reached through the units that
-# include it.
-SOURCE_SUFFIXES = ('.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cl', '.cu', '.hip')
+# What clang_delta can be handed. A translation unit, plainly -- but a header
+# too, and leaving headers out was throwing away most of the reduction of a C++
+# project. Templates, inline functions and whole class definitions live in
+# headers; a unit that includes one and defines nothing itself offers nothing to
+# remove, which is the common case in modern C++.
+#
+# "A header is reduced through the units that include it" was the reason given,
+# and it is not true of clang_delta: it rewrites the file it is given and no
+# other, so a function defined in a header was never offered for deletion by any
+# semantic pass. What a header does need is the flags of a unit that includes
+# it, and the database C-Vise writes records exactly that -- on the same example
+# clang_delta finds two removable functions in the header and none in the source.
+SOURCE_SUFFIXES = (
+    '.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cl', '.cu', '.hip',
+    '.h', '.hh', '.hp', '.hpp', '.hxx', '.h++', '.H', '.inc', '.ipp', '.tcc', '.tpp',
+)
 
 
 @dataclass(frozen=True)
@@ -150,7 +162,12 @@ class ClangPass(AbstractPass):
         if state.file_index >= len(sources):
             return (PassResult.STOP, state)
         target = sources[state.file_index]
-        key = self._lookup_key(test_case, target, original_test_case)
+        # Here, and only here, the file is the job's own copy of the test case
+        # rather than the test case itself, so the flags have to be looked up
+        # under the staged path the database names.
+        key = target
+        if original_test_case is not None:
+            key = Path(original_test_case) / target.relative_to(test_case)
         result, _ = self._transform_file(target, state.counter, process_event_notifier, key)
         if result == PassResult.OK and written_paths is not None:
             # Everything not declared here is deleted from the test case as

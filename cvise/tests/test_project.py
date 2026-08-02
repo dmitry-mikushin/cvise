@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -317,6 +318,53 @@ class TestTheBuildDirectory:
 
         after = {p: p.stat().st_mtime_ns for p in project.build_dir.rglob('*') if p.is_file()}
         assert after == before, 'a job wrote into the build directory every other job reads'
+
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_a_deleted_source_is_not_linked_from_the_baseline(self, tmp_path):
+        """The case worth being sure about, because the baseline still has its object.
+
+        A reducer's most effective move is to remove a file, and the overlay
+        records that as a whiteout: the file reads as absent for that job alone.
+        But the baseline built an object from it and left it in the directory
+        the job reads through. If ninja were to link that object, the verdict
+        would be about code the candidate had deleted -- which is exactly the
+        class of wrong answer the isolated build directory exists to prevent,
+        reappearing through the very thing that makes it affordable.
+
+        It does not: ninja refuses to build an edge whose input is gone. The
+        candidate is rejected, which is the honest answer, since deleting a
+        source from a CMake project also requires editing the CMakeLists.txt
+        and that is not under reduction.
+        """
+        from cvise.utils import overlay
+
+        if not overlay.library_path():
+            pytest.skip('the overlay library is not built')
+
+        cmakelists = write_checked_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build')
+        baseline_build(project)
+        assert list(project.build_dir.rglob('other.c.o')), 'the baseline never built the object'
+
+        delta = tmp_path / 'delta'
+        marker = delta / (str(project.root / 'other.c').lstrip('/') + overlay.WHITEOUT_SUFFIX)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        env = overlay.job_environment(dict(os.environ), delta, [project.root, project.build_dir])
+
+        gone = subprocess.run(
+            [sys.executable, '-c',
+             f'import os; print(os.path.exists({str(project.root / "other.c")!r}))'],
+            capture_output=True, text=True, env=env,
+        ).stdout.strip()
+        assert gone == 'False', 'the whiteout never reached the job'
+
+        proc = subprocess.run(
+            ['cmake', '--build', str(project.build_dir), '--target', 'check'],
+            capture_output=True, env=env,
+        )
+        assert proc.returncode != 0, 'a file the candidate deleted was still linked in'
+        assert (project.root / 'other.c').is_file(), 'the job deleted the shared source'
 
 
 def place(delta: Path, original: Path, text: str) -> None:

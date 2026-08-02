@@ -245,6 +245,12 @@ def roots_value(roots) -> str:
     otherwise is not a syntax error but a tree that is silently left shared.
     That is the most expensive failure this program has: the reduction keeps
     running and answers about a build nobody described.
+
+    The filesystem root is refused for the opposite reason. It is a legal value
+    and it means "redirect everything" -- and everything includes the job's own
+    sockets, /proc, /dev and the scratch of whatever its tools are written in.
+    No reduction wants that, so a run arriving here with it has computed a root
+    wrongly, and the useful thing to do is say so rather than to obey.
     """
     values = [str(Path(r)) for r in roots]
     bad = [v for v in values if ':' in v]
@@ -252,6 +258,11 @@ def roots_value(roots) -> str:
         raise CViseError(
             'these directories cannot be isolated because their names contain a colon, '
             f'which separates one from the next: {", ".join(bad)}'
+        )
+    if '/' in values:
+        raise CViseError(
+            'the filesystem root was given as a tree to isolate, which would redirect every '
+            'path a job touches, including the ones with nothing to do with the reduction'
         )
     return ':'.join(values)
 

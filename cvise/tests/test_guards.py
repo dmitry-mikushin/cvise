@@ -19,7 +19,7 @@ import pytest
 
 from cvise.passes.hint_based import HintState
 from cvise.utils import memory, overlay
-from cvise.utils.error import UndecidedTestError
+from cvise.utils.error import CViseError, UndecidedTestError
 from cvise.utils.folding import FoldingManager, FoldingStateIn, FoldingStateOut
 from cvise.utils.memory import NoMemoryCeilingError
 from cvise.utils.overlay import OverlayNotProvenError
@@ -276,6 +276,41 @@ def no_library_anywhere(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv(overlay.LIB_ENV, raising=False)
     monkeypatch.setattr(overlay, 'BUILT_LIB', str(tmp_path / 'no-build-tree.so'))
     monkeypatch.setattr(overlay, 'INSTALLED_LIB', str(tmp_path / 'not-installed.so'))
+
+
+class TestWhichTreesAreIsolated:
+    """More than one, and the second one decides most of the answers.
+
+    The sources are what a candidate changes; the build directory is where the
+    answer about it is computed. Sharing the second gave each job whatever the
+    previous one built, so the list has to survive being written down and read
+    back exactly.
+    """
+
+    def test_several_trees_are_passed_on(self):
+        assert overlay.roots_value(['/a/sources', '/b/build']) == '/a/sources:/b/build'
+
+    def test_one_tree_still_works(self):
+        assert overlay.roots_value(['/a/sources']) == '/a/sources'
+
+    def test_a_name_that_cannot_be_written_down_is_refused(self):
+        """Silence here means a tree left shared, which is a wrong answer."""
+        with pytest.raises(CViseError, match='colon'):
+            overlay.roots_value(['/a/odd:name', '/b/build'])
+
+    def test_the_filesystem_root_is_refused(self):
+        """It means "redirect everything", and everything is not the reduction."""
+        with pytest.raises(CViseError, match='filesystem root'):
+            overlay.roots_value(['/', '/b/build'])
+
+    def test_the_environment_carries_every_tree(self, monkeypatch, tmp_path):
+        library = tmp_path / 'lib.so'
+        library.write_bytes(b'not really, but named')
+        monkeypatch.setenv(overlay.LIB_ENV, str(library))
+        env = overlay.job_environment({}, tmp_path / 'delta', ['/a/sources', '/b/build'])
+        assert env[overlay.ROOT_ENV] == '/a/sources:/b/build'
+        assert env[overlay.DELTA_ENV] == str(tmp_path / 'delta')
+        assert env['LD_PRELOAD'] == str(library)
 
 
 class TestPrecheckVerdicts:
