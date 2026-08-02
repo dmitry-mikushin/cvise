@@ -109,7 +109,7 @@ class TestTheCheckScript:
         spends most of its care avoiding."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'says_v', tmp_path / 'check.sh')
+        script = check_script(project, 'says_v', tmp_path / 'check.sh', tmp_path / 'build.lock')
         assert subprocess.run([str(script)], capture_output=True).returncode == 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
@@ -119,7 +119,7 @@ class TestTheCheckScript:
         criterion by deleting the test. --no-tests=error is what makes it 8."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh', tmp_path / 'build.lock')
         assert subprocess.run([str(script)], capture_output=True).returncode != 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
@@ -127,7 +127,7 @@ class TestTheCheckScript:
         """A refusal that prints nothing is the worst thing this program can say."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh', tmp_path / 'build.lock')
         proc = subprocess.run([str(script)], capture_output=True, text=True)
         assert proc.stdout.strip(), 'the check script said nothing about why it failed'
 
@@ -494,35 +494,69 @@ class TestTheBaseline:
 
 
 
-class TestTheBuildsShareOfTheMachine:
-    """Multiplied, not each taken to be the whole thing.
+class TestTheBuildQueue:
+    """One build at a time, each with the whole machine.
 
-    MEASURED both ways round on ns-projection. With no -j, each of 44 jobs got
-    a ninja willing to use all 88 cores: load average 230 and the reduction's
-    own cgroup OOM-killed cc1plus 88 seconds in. With -j 1 the machine was safe
-    and half idle, and 16 candidates hit the 300 s timeout in eight minutes
-    because each compiled its dozens of files one after another.
+    Never a smaller -j. When N simultaneous builds do not fit, what does not fit
+    is N simultaneous builds: MEASURED, with no -j the load reached 230 and the
+    reduction's cgroup OOM-killed cc1plus; with -j 1 the machine sat half idle
+    and candidates touching many files timed out one after another. Queueing
+    gives up no CPU -- the same work in the same total time, just in an order --
+    and removes the multiplication of compilers and of memory.
     """
 
-    def test_the_share_is_what_it_was_given(self, tmp_path):
+    def test_the_build_is_never_given_a_job_count(self, tmp_path):
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=2)
-        assert '-j 2' in script.read_text()
+        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
+        assert not re.search(r'cmake --build \S+ .*-j', text), text
 
-    def test_it_is_never_zero(self, tmp_path):
-        """More jobs than cores divides to nothing, and `-j 0` is unbounded."""
+    def test_the_build_is_inside_the_lock(self, tmp_path):
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=0)
-        assert '-j 1' in script.read_text()
+        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
+        assert text.index('flock 9') < text.index('cmake --build')
+        assert text.index('cmake --build') < text.index('flock -u 9')
 
-    def test_the_build_is_always_bounded(self, tmp_path):
-        """A build with no -j at all is what took the machine to a load of 230."""
+    def test_the_test_is_outside_it(self, tmp_path):
+        """It runs against this job's own binary, which nobody else can touch."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        text = check_script(project, 'says_v', tmp_path / 'check.sh', jobs=4).read_text()
-        assert re.search(r'cmake --build \S+ -j \d+', text), text
+        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
+        assert text.index('flock -u 9') < text.index('ctest')
+
+    def test_the_lock_actually_serialises(self, tmp_path):
+        """A queue that does not queue is the failure this is most likely to have.
+
+        Two scripts sharing one lock must not overlap. Written with the same
+        shell construct the generated script uses, so that a change to it which
+        stops serialising fails here.
+        """
+        lock = tmp_path / 'build.lock'
+        witness = tmp_path / 'overlap'
+        script = tmp_path / 'queued.sh'
+        script.write_text(
+            '#!/bin/sh\n'
+            f'exec 9>{lock}\n'
+            'flock 9\n'
+            f'[ -e {witness} ] && echo OVERLAP >> {tmp_path / "seen"}\n'
+            f'touch {witness}\n'
+            'sleep 0.3\n'
+            f'rm -f {witness}\n'
+            'flock -u 9\n'
+        )
+        script.chmod(0o755)
+        procs = [subprocess.Popen([str(script)]) for _ in range(6)]
+        for proc in procs:
+            proc.wait(timeout=60)
+        assert not (tmp_path / 'seen').exists(), 'two builds ran at once'
+
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_a_queued_check_still_works(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        script = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'build.lock')
+        assert subprocess.run([str(script)], capture_output=True).returncode == 0
 
 
 class TestTheBaselineIsTimed:

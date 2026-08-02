@@ -486,10 +486,11 @@ def do_reduce(args):
         args.interestingness_test = str(
             project_utils.check_script(
                 project, args.test, staging_dir / 'check.sh',
-                # This job's share of the machine: C-Vise already decided how
-                # many candidates run at once, so the build of one of them gets
-                # what is left over after that division and not the whole thing.
-                jobs=max(1, (os.cpu_count() or 1) // max(1, args.n)),
+                # Every job queues behind this one lock, so one build at a time
+                # has the whole machine. It lives outside every tree the overlay
+                # covers -- inside one, each job would take its own private copy
+                # and the queue would be a queue of one.
+                lock=staging_dir / 'build.lock',
             )
         )
         os.chdir(staged.parent)
