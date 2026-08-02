@@ -22,7 +22,7 @@ from cvise.utils.project import (
     configure,
     database_for,
     has_test,
-    tests_of,
+    tests_of as registered_tests,
     publish,
     sources_from,
     check_script,
@@ -92,12 +92,12 @@ class TestWhichTestDecides:
         cmakelists = write_project(tmp_path / 'project')
         project = configure(cmakelists, tmp_path / 'build')
         assert not has_test(project, 'anything')
-        assert tests_of(project) == []
+        assert registered_tests(project) == []
 
     def test_the_known_names_are_reported(self, tmp_path):
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        assert tests_of(project) == ['says_v']
+        assert registered_tests(project) == ['says_v']
 
 
 class TestTheCheckScript:

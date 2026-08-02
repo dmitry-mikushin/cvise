@@ -941,6 +941,23 @@ class TestManager:
                 if type(exc) in (TimeoutError, concurrent.futures.TimeoutError):
                     self.handle_timed_out_job(job)
                     continue
+                if isinstance(exc, pebble.common.ProcessExpired):
+                    # The worker was killed rather than finishing -- by the OOM
+                    # killer, most often, since a reduction is the workload most
+                    # likely to meet its own memory ceiling. MEASURED on
+                    # ns-projection: the run ended 88 seconds in with
+                    # "ProcessExpired: Abnormal termination", and dmesg showed
+                    # the cgroup killing cc1plus.
+                    #
+                    # That is the environment failing to answer, which is what
+                    # the undecided budget is for; it is not a verdict about
+                    # the candidate and it is not a reason to throw away hours
+                    # of work behind it. It is not free either: when it keeps
+                    # happening, the budget stops a machine that can no longer
+                    # run anything from producing a confident answer.
+                    logging.warning('a worker was killed (%s); this candidate is not judged', exc)
+                    self._handle_undecided(job)
+                    continue
                 raise exc
             match job.type:
                 case JobType.INIT:
