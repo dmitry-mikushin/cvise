@@ -29,7 +29,6 @@ from cvise.passes.hint_based import HintBasedPass, HintState
 from cvise.utils import cache, fileutil, mplogging, overlay, precheck, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
-    AbsolutePathTestCaseError,
     InsaneTestCaseError,
     InvalidInterestingnessTestError,
     InvalidTestCaseError,
@@ -159,6 +158,7 @@ class TestEnvironment:
         precheck_timeout: float | None = None,
         overlay_root: Path | None = None,
         overlay_files=None,
+        launch_dir=None,
     ):
         self.state = state
         self.folder: Path = folder
@@ -499,6 +499,7 @@ class TestManager:
         precheck_timeout=None,
         overlay_root=None,
         overlay_files=None,
+        launch_dir=None,
     ):
         self.test_script: Path = test_script.absolute()
         self.timeout = timeout
@@ -518,6 +519,7 @@ class TestManager:
         self.precheck_timeout = precheck_timeout
         self.overlay_root = overlay_root
         self.overlay_files = overlay_files
+        self.launch_dir = Path(launch_dir) if launch_dir else Path.cwd()
         self.undecided_count = 0
         self.undecided_in_pass = 0
         self.start_with_pass = start_with_pass
@@ -529,8 +531,11 @@ class TestManager:
             test_case = Path(test_case)
             self.test_cases_modes[test_case] = test_case.stat().st_mode
             self.check_file_permissions(test_case, [os.F_OK, os.R_OK, os.W_OK], InvalidTestCaseError)
-            if test_case.parent.is_absolute():
-                raise AbsolutePathTestCaseError(test_case)
+            # No ban on absolute paths. It existed because a test case used to
+            # be whatever the user typed, and a job's scratch directory could
+            # not hold /home/someone/thing.c. C-Vise now stages the project
+            # itself and the paths are its own, so the check only ever fired on
+            # a project that happened not to be under the current directory.
             if test_case.resolve() in self.test_script.resolve().parents:
                 raise ScriptInsideTestCaseError(test_case, self.test_script)
             self.test_cases.add(test_case)
@@ -667,11 +672,20 @@ class TestManager:
         return True
 
     @staticmethod
-    def get_extra_dir(prefix, max_number) -> Path | None:
+    def get_extra_dir(prefix, max_number, parent: Path | None = None) -> Path | None:
+        """Where a saved variant goes.
+
+        Not the current directory: C-Vise reduces a staged copy of the project
+        and works from there, so a relative path would put the variant in a
+        temporary directory that is deleted at the end -- the user asked for it
+        to be saved and it would silently disappear. It goes where the user was
+        standing when they started the run.
+        """
         extra_dir = None
+        parent = parent or Path.cwd()
         for i in range(0, max_number + 1):
             digits = int(round(math.log10(max_number), 0))
-            extra_dir = Path(('{0}{1:0' + str(digits) + 'd}').format(prefix, i))
+            extra_dir = parent / ('{0}{1:0' + str(digits) + 'd}').format(prefix, i)
 
             if not extra_dir.exists():
                 break
@@ -689,7 +703,7 @@ class TestManager:
         if not self.die_on_pass_bug:
             logging.warning(f'{job.pass_} has encountered a non fatal bug: {problem}')
 
-        crash_dir = self.get_extra_dir(self.BUG_DIR_PREFIX, self.MAX_CRASH_DIRS)
+        crash_dir = self.get_extra_dir(self.BUG_DIR_PREFIX, self.MAX_CRASH_DIRS, self.launch_dir)
 
         if crash_dir is None:
             return False
@@ -805,7 +819,7 @@ class TestManager:
             self.release_job(self.jobs[0])
 
     def save_extra_dir(self, test_case_path: Path):
-        extra_dir = self.get_extra_dir(self.EXTRA_DIR_PREFIX, self.MAX_EXTRA_DIRS)
+        extra_dir = self.get_extra_dir(self.EXTRA_DIR_PREFIX, self.MAX_EXTRA_DIRS, self.launch_dir)
         if extra_dir is not None:
             try:
                 os.mkdir(extra_dir)

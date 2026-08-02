@@ -133,14 +133,18 @@ def main():
         write_script(script, mutate_script())
         write_script(copyup, copyup_script())
 
-        # ---- 1. the negative control: the overlay alone cannot stop a
-        # descriptor mutation, so the shared inode IS changed. This is the
-        # proof that the leak is real and that the probe exercises it.
+        # ---- 1. the overlay's own answer, without any help from the
+        # filesystem: a mutation through a descriptor the job did not open for
+        # writing is refused, because such a descriptor cannot be pointing at a
+        # file the job owns. This used to be the leak this probe documented;
+        # the wrappers in fd_guard.c close it, and the read-only foundation
+        # checked below is what remains as a second line for anything they
+        # cannot see.
         os.utime(payload, (SAFE_STAMP, SAFE_STAMP))
         baseline = payload.stat().st_mtime_ns
         p = bwrap_run(tree, delta, script, shared_ro=False)
-        leaked = payload.stat().st_mtime_ns != baseline
-        print(f'{"ok  " if leaked else "FAIL"}  without the foundation, fd-utime '
+        leaked = payload.stat().st_mtime_ns == baseline
+        print(f'{"ok  " if leaked else "FAIL"}  the overlay alone refuses fd-utime '
               f'reaches the shared inode: {p.stdout.strip()}')
         if not leaked:
             print(p.stderr[-800:])

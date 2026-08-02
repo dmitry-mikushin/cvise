@@ -220,8 +220,8 @@ class CVise:
         self._check_prerequisites(pass_group)
         # Reducing a whole project through the overlay is the workload that can
         # take the machine down, so that is the one that must be bounded.
-        ceiling = memory.guard_memory_ceiling(required=overlay.overlay_configured())
-        if ceiling:
+        ceiling = memory.memory_ceiling()
+        if ceiling and ceiling != memory.UNKNOWN_CEILING:
             logging.info('running under a memory ceiling of %.1f GiB', ceiling / 2**30)
         # Not a choice: a reduction without the overlay copies the whole project
         # for every candidate and rebuilds all of it, which does not finish. An

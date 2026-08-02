@@ -57,14 +57,6 @@ class InvalidTestCaseError(InvalidFileError):
         return f"The specified test case '{self.path}' cannot be {self._get_error_name()}!"
 
 
-class AbsolutePathTestCaseError(CViseError):
-    def __init__(self, path: Path):
-        self.path = path
-
-    def __str__(self):
-        return f"Test case path cannot be absolute: '{self.path}'!"
-
-
 class InvalidInterestingnessTestError(InvalidFileError):
     def __init__(self, path: Path):
         super().__init__(path, None)

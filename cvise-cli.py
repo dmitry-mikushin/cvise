@@ -313,13 +313,6 @@ def main():
 
     args = parser.parse_args()
 
-    # A reduction that outgrows RAM takes the machine down rather than failing,
-    # so it runs under a memory limit -- one C-Vise arranges for itself. Making
-    # the user prefix every invocation with systemd-run would put an
-    # implementation detail in the interface, and it would be forgotten exactly
-    # once. Nothing below runs in this process if the relaunch happens.
-    if not args.list_passes:
-        memory.relaunch_under_ceiling([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
     if not args.list_passes and (not args.project or not args.interestingness_test):
         parser.error('the following arguments are required: CMAKELISTS, INTERESTINGNESS_TEST')
@@ -350,6 +343,11 @@ def main():
         syslog = logging.StreamHandler()
         syslog.setFormatter(formatter)
         root_logger.addHandler(syslog)
+
+    # After logging is configured, not before: the first logging call installs a
+    # handler of its own, and every message would then be printed twice.
+    if not args.list_passes:
+        memory.bound_or_warn()
 
     # One action, because there is one thing to do: reduce the project the
     # CMakeLists.txt describes.
@@ -425,6 +423,9 @@ def do_reduce(args):
     # working directory moves, or a relative path silently becomes a different
     # file -- or, as here, no file at all.
     args.interestingness_test = str(Path(args.interestingness_test).resolve())
+    # Where the user was standing. Anything saved for them goes here, not into
+    # the staged copy C-Vise is about to work in and then delete.
+    launch_dir = Path.cwd()
     staging_dir = Path(tempfile.mkdtemp(prefix='cvise-staging-'))
     staged = project_utils.stage(project, staging_dir / project.root.name)
     os.chdir(staged.parent)
@@ -497,6 +498,7 @@ def do_reduce(args):
             precheck_timeout=args.timeout,
             overlay_root=project.root,
             overlay_files=project.sources,
+            launch_dir=launch_dir,
         ) as test_manager:
             reducer = CVise(test_manager, args.skip_interestingness_test_check)
 

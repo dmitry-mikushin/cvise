@@ -8,9 +8,11 @@
 #cmakedefine HAVE_EACCESS 1
 #cmakedefine HAVE_EUIDACCESS 1
 #cmakedefine HAVE_FCHDIR 1
+#cmakedefine HAVE_FACCESSAT 1
 #cmakedefine HAVE_FCHMODAT 1
 #cmakedefine HAVE_FOPEN64 1
 #cmakedefine HAVE_FREOPEN64 1
+#cmakedefine HAVE_FUTIMENS 1
 #cmakedefine HAVE_FUTIMESAT 1
 #cmakedefine HAVE_GLOB64 1
 #cmakedefine HAVE_LINKAT 1

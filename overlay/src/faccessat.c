@@ -20,7 +20,13 @@
 
 #include <config.h>
 
-#ifdef HAVE_FCHMODAT
+/* Guarded by its own name, not by a neighbour's. This read HAVE_FCHMODAT,
+   which happens to be defined on this libc, so the wrapper was built by
+   accident; on a libc that has fchmodat and not faccessat it would have failed
+   to compile, and on one with the reverse it would have silently gone missing
+   -- and a missing wrapper here means a job asking "does this file exist" gets
+   the answer for the pristine tree. */
+#ifdef HAVE_FACCESSAT
 
 #define _ATFILE_SOURCE
 #include <unistd.h>
