@@ -29,9 +29,9 @@ care how many jobs run underneath it.
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 
-from cvise.utils.error import CViseError
 
 CGROUP_ROOT = Path('/sys/fs/cgroup')
 
@@ -43,22 +43,6 @@ UNKNOWN_CEILING = -1
 # How much of what the machine has free a reduction may claim. The rest is for
 # everything else on the machine, including the page cache the compilers need.
 CEILING_FRACTION = 0.75
-
-
-class NoMemoryCeilingError(CViseError):
-    def __init__(self, cgroup):
-        self.cgroup = cgroup
-
-    def __str__(self):
-        return (
-            f'This reduction is running in cgroup {self.cgroup}, which has no memory ceiling, '
-            'and C-Vise could not give itself one. Refusing to start: the scratch space is a '
-            'tmpfs, tmpfs pages are not reclaimable, and the OOM killer cannot free them -- so '
-            'a reduction that outgrows RAM takes the machine with it instead of failing. '
-            'Normally C-Vise places itself under a limit automatically; that needs a systemd '
-            'user session with the memory controller delegated. Without one, run it inside '
-            'anything that bounds memory -- a container with --memory, or a cgroup of your own.'
-        )
 
 
 def bound_this_process(limit_bytes: int) -> int | None:
@@ -120,13 +104,76 @@ def bound_this_process(limit_bytes: int) -> int | None:
     return limit_bytes
 
 
-def bound_or_warn() -> int | None:
-    """Acquire a ceiling if there is none, and say so plainly if it cannot be."""
+def filesystem_of(path) -> str:
+    """The kind of filesystem a path is on, according to the kernel.
+
+    Read from /proc/self/mountinfo rather than guessed from the name: /tmp is a
+    tmpfs on most modern systems and a disk on plenty of others, and a warning
+    that assumes either is wrong for half its audience.
+    """
+    try:
+        target = Path(path).resolve()
+    except OSError:
+        return ''
+    best = ''
+    kind = ''
+    try:
+        with open('/proc/self/mountinfo') as f:
+            for line in f:
+                fields = line.split()
+                try:
+                    separator = fields.index('-')
+                except ValueError:
+                    continue
+                mount_point = fields[4]
+                fs_type = fields[separator + 1]
+                if (target == Path(mount_point) or Path(mount_point) in target.parents) and len(
+                    mount_point
+                ) >= len(best):
+                    best = mount_point
+                    kind = fs_type
+    except OSError:
+        return ''
+    return kind
+
+
+RAM_FILESYSTEMS = ('tmpfs', 'ramfs')
+
+
+def scratch_is_ram(path) -> bool:
+    """Is the scratch space this run will use held in memory?
+
+    This is the question the ceiling exists for. A reduction whose scratch is on
+    a disk cannot take the machine down by filling it, however large it grows;
+    one whose scratch is a tmpfs can, and will, because those pages are charged
+    to nobody the OOM killer can kill.
+    """
+    return filesystem_of(path) in RAM_FILESYSTEMS
+
+
+def bound_or_warn(scratch=None) -> int | None:
+    """Acquire a ceiling if there is none, and say so plainly if it cannot be.
+
+    The warning is about a combination, not about a missing feature. Scratch in
+    memory with no ceiling is the arrangement that takes a machine down; either
+    one alone is fine, and warning about either alone teaches the user to ignore
+    the warning by the time the dangerous one arrives.
+    """
     existing = memory_ceiling()
-    if existing is not None and existing != UNKNOWN_CEILING:
-        return existing
     if existing == UNKNOWN_CEILING:
         return None
+    ram = total_ram()
+    if existing is not None:
+        if not ram or existing < ram:
+            return existing
+        # A limit at or above physical memory is a number, not a ceiling: the
+        # machine dies of its own scratch space long before the cgroup notices.
+        logging.info(
+            'the memory limit on this cgroup is %.1f GiB, at or above the %.1f GiB this machine '
+            'has, so it bounds nothing; looking for a real one',
+            existing / 2**30,
+            ram / 2**30,
+        )
 
     budget = int(available_ram() * CEILING_FRACTION)
     if budget > 0:
@@ -135,11 +182,49 @@ def bound_or_warn() -> int | None:
             logging.info('this reduction is bounded to %.1f GiB of memory', acquired / 2**30)
             return acquired
 
+    scratch = tempfile.gettempdir() if scratch is None else scratch
+    if not scratch_is_ram(scratch):
+        logging.info(
+            'no memory ceiling could be acquired, but the scratch space in %s is on %s rather '
+            'than in memory, so a reduction that outgrows it will fail rather than take the '
+            'machine with it',
+            scratch,
+            filesystem_of(scratch) or 'a filesystem of unknown kind',
+        )
+        return None
+
     logging.warning(
-        'no memory ceiling could be acquired: a reduction that outgrows RAM will take the '
-        'machine down rather than fail, because tmpfs pages are not reclaimable and the OOM '
-        'killer cannot free them. Run inside something that bounds memory -- a container with '
-        '--memory, or systemd-run --user --scope -p MemoryMax=...'
+        'no memory ceiling could be acquired and the scratch space in %s is held in memory '
+        '(%s). Every job materialises the part of the build its candidate changed there, '
+        'including the linked binary, and those pages are not reclaimable and cannot be freed '
+        'by the OOM killer -- so a reduction that outgrows RAM will take the machine down '
+        'rather than fail. Either point TMPDIR at a disk, or run inside something that bounds '
+        'memory: a container with --memory, or systemd-run --user --scope -p MemoryMax=...',
+        scratch,
+        filesystem_of(scratch),
+    )
+    return None
+
+    scratch = tempfile.gettempdir() if scratch is None else scratch
+    if not scratch_is_ram(scratch):
+        logging.info(
+            'no memory ceiling could be acquired, but the scratch space in %s is on %s rather '
+            'than in memory, so a reduction that outgrows it will fail rather than take the '
+            'machine with it',
+            scratch,
+            filesystem_of(scratch) or 'a filesystem of unknown kind',
+        )
+        return None
+
+    logging.warning(
+        'no memory ceiling could be acquired and the scratch space in %s is held in memory '
+        '(%s). Every job materialises the part of the build its candidate changed there, '
+        'including the linked binary, and those pages are not reclaimable and cannot be freed '
+        'by the OOM killer -- so a reduction that outgrows RAM will take the machine down '
+        'rather than fail. Either point TMPDIR at a disk, or run inside something that bounds '
+        'memory: a container with --memory, or systemd-run --user --scope -p MemoryMax=...',
+        scratch,
+        filesystem_of(scratch),
     )
     return None
 
@@ -212,41 +297,5 @@ def total_ram() -> int:
     except OSError:
         pass
     return 0
-
-
-def guard_memory_ceiling(required: bool) -> int | None:
-    """Check for a ceiling; refuse only when this run demands one.
-
-    Demanding one unconditionally would make an ordinary reduction of a single
-    file refuse to start on a normal desktop, which trades one failure mode for
-    a worse one. The ceiling matters for the workload that actually threatens
-    the machine -- a whole project, many jobs, a RAM-backed scratch -- so that
-    is where it is required, and everywhere else it is said out loud and left
-    to the operator.
-    """
-    ceiling = memory_ceiling()
-    if ceiling == UNKNOWN_CEILING:
-        logging.info('cannot inspect the cgroup hierarchy from here; assuming the '
-                     'workload is bounded by a limit set outside this namespace')
-        return None
-    if ceiling is None:
-        if not required:
-            logging.warning(
-                'no memory ceiling on this cgroup: a reduction that outgrows RAM will take '
-                'the machine down rather than fail, because tmpfs pages are not reclaimable '
-                'and the OOM killer cannot free them. Consider: '
-                'systemd-run --user --scope -p MemoryMax=... -p MemorySwapMax=0 cvise ...'
-            )
-            return None
-        raise NoMemoryCeilingError(current_cgroup() or '<unknown>')
-    ram = total_ram()
-    if ceiling is not None and ram and ceiling >= ram:
-        # A limit at or above physical memory is a number, not a ceiling: the
-        # machine dies of its own scratch space long before the cgroup notices.
-        raise NoMemoryCeilingError(
-            f'{current_cgroup() or "<unknown>"} (memory.max is {ceiling >> 30} GiB, '
-            f'at or above the {ram >> 30} GiB this machine has)'
-        )
-    return ceiling
 
 

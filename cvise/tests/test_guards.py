@@ -21,7 +21,6 @@ from cvise.passes.hint_based import HintState
 from cvise.utils import memory, overlay
 from cvise.utils.error import CViseError, UndecidedTestError
 from cvise.utils.folding import FoldingManager, FoldingStateIn, FoldingStateOut
-from cvise.utils.memory import NoMemoryCeilingError
 from cvise.utils.overlay import OverlayNotProvenError
 from cvise.utils.testing import (
     UNDECIDED_BUDGET,
@@ -158,36 +157,45 @@ class TestUndecidedFoldIsRetryable:
 
 
 class TestMemoryCeiling:
-    def test_no_ceiling_is_refused_when_the_run_demands_one(self):
-        with patch.object(memory, 'memory_ceiling', return_value=None):
-            with pytest.raises(NoMemoryCeilingError):
-                memory.guard_memory_ceiling(required=True)
+    """One policy, and the same one for every run.
 
-    def test_no_ceiling_is_only_a_warning_otherwise(self):
-        """An ordinary reduction on a desktop must still run.
-
-        Demanding a cgroup limit from everyone trades one failure mode for a
-        worse one: a tool that refuses to start is not protecting anything.
-        """
-        with patch.object(memory, 'memory_ceiling', return_value=None):
-            assert memory.guard_memory_ceiling(required=False) is None
-
-    def test_a_ceiling_above_physical_memory_is_not_a_ceiling(self):
-        """The machine dies of its own scratch long before the cgroup notices."""
-        ram = memory.total_ram()
-        with patch.object(memory, 'memory_ceiling', return_value=ram * 2):
-            with pytest.raises(NoMemoryCeilingError):
-                memory.guard_memory_ceiling(required=True)
+    There used to be two: bound_or_warn, which every run went through, and
+    guard_memory_ceiling(required=...), which nothing called. The second was a
+    switch with no user, kept alive by these tests -- so the checks worth having
+    are folded into the first and the second is gone.
+    """
 
     def test_a_real_ceiling_is_accepted(self):
         ram = memory.total_ram()
         with patch.object(memory, 'memory_ceiling', return_value=ram // 4):
-            assert memory.guard_memory_ceiling(required=True) == ram // 4
+            assert memory.bound_or_warn() == ram // 4
+
+    def test_a_ceiling_above_physical_memory_is_not_a_ceiling(self):
+        """The machine dies of its own scratch long before the cgroup notices.
+
+        So it is not accepted as one: the run goes on to look for a real limit,
+        and says why it did.
+        """
+        ram = memory.total_ram()
+        with patch.object(memory, 'memory_ceiling', return_value=ram * 2), \
+             patch.object(memory, 'available_ram', return_value=0), \
+             patch.object(memory, 'scratch_is_ram', return_value=False):
+            assert memory.bound_or_warn() != ram * 2
 
     def test_an_uninspectable_hierarchy_is_not_the_same_as_no_ceiling(self):
-        """A bounded container reports exactly this, and must not be refused."""
+        """A bounded container reports exactly this, and must not be second-guessed."""
         with patch.object(memory, 'memory_ceiling', return_value=memory.UNKNOWN_CEILING):
-            assert memory.guard_memory_ceiling(required=True) is None
+            assert memory.bound_or_warn() is None
+
+    def test_a_run_without_a_ceiling_still_runs(self):
+        """An ordinary reduction on a desktop must not be refused.
+
+        Demanding a cgroup limit from everyone trades one failure mode for a
+        worse one: a tool that refuses to start is not protecting anything.
+        """
+        with patch.object(memory, 'memory_ceiling', return_value=None), \
+             patch.object(memory, 'available_ram', return_value=0):
+            assert memory.bound_or_warn() is None
 
     def test_the_root_cgroup_is_a_cgroup(self):
         """An empty path means the root, not "no cgroup at all"."""
@@ -199,6 +207,59 @@ def _fake_cgroup_file():
     import io
 
     return io.StringIO('0::/\n')
+
+
+class TestWhereTheScratchLives:
+    """The ceiling is about a combination, and this is the other half of it.
+
+    A reduction whose scratch is on a disk cannot take the machine down by
+    filling it, however large it grows. One whose scratch is a tmpfs can, and
+    will, because those pages are charged to nobody the OOM killer can kill --
+    and every job now materialises the part of the build its candidate changed
+    there, the linked binary included. Warning about a missing ceiling
+    regardless of which case it is teaches the user to ignore the warning by
+    the time the dangerous one arrives.
+    """
+
+    def test_a_disk_is_not_memory(self, tmp_path):
+        """tmp_path is under the machine's real temporary directory."""
+        assert memory.filesystem_of('/proc') == 'proc'
+
+    @pytest.mark.skipif(
+        memory.filesystem_of('/dev/shm') != 'tmpfs', reason='/dev/shm is not a tmpfs here'
+    )
+    def test_shared_memory_is_memory(self):
+        assert memory.scratch_is_ram('/dev/shm')
+
+    def test_a_path_that_does_not_exist_answers_about_its_nearest_parent(self, tmp_path):
+        deep = tmp_path / 'not' / 'created'
+        assert memory.filesystem_of(deep) == memory.filesystem_of(tmp_path)
+
+    def test_the_longest_mount_point_wins(self, tmp_path):
+        """A nested mount is the one a path is actually on, not the one above it."""
+        mountinfo = (
+            '1 0 0:1 / / rw - ext4 /dev/sda1 rw\n'
+            '2 1 0:2 / /nested rw - tmpfs tmpfs rw\n'
+        )
+        with patch('builtins.open', side_effect=lambda *a, **k: __import__('io').StringIO(mountinfo)):
+            assert memory.filesystem_of('/nested/deep/file') == 'tmpfs'
+            assert memory.filesystem_of('/elsewhere/file') == 'ext4'
+
+    def test_scratch_on_a_disk_without_a_ceiling_is_not_alarming(self, tmp_path, caplog):
+        with patch.object(memory, 'memory_ceiling', return_value=None), \
+             patch.object(memory, 'available_ram', return_value=0), \
+             patch.object(memory, 'scratch_is_ram', return_value=False):
+            memory.bound_or_warn(scratch=str(tmp_path))
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+
+    def test_scratch_in_memory_without_a_ceiling_is_alarming(self, tmp_path, caplog):
+        with patch.object(memory, 'memory_ceiling', return_value=None), \
+             patch.object(memory, 'available_ram', return_value=0), \
+             patch.object(memory, 'scratch_is_ram', return_value=True):
+            memory.bound_or_warn(scratch=str(tmp_path))
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings, 'the dangerous combination was not reported'
+        assert 'TMPDIR' in warnings[0], 'the warning does not say what to do about it'
 
 
 class TestOverlayProof:
