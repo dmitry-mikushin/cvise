@@ -449,7 +449,20 @@ def do_reduce(args):
         # Built once, here, from the sources as they are. Every job then gets
         # this tree copy-on-write and only compiles what its own candidate
         # changed; without it each of them would build the project from nothing.
+        # It runs before the token pool exists, because it is alone on the
+        # machine and should have all of it.
         baseline_seconds = project_utils.baseline_build(project)
+
+        # One pool of build tokens shared by every candidate from here on. ninja
+        # is a client of it and is never given a -j, so a build that can only
+        # compile one file takes one token and the machine fills with other
+        # candidates rather than idling behind it. Sized cores minus jobs
+        # because each ninja gets one implicit token of its own on top of the
+        # pool -- MEASURED: eight builds with a pool of 16 ran 24 compilers.
+        jobserver_fd = project_utils.open_jobserver(
+            staging_dir / 'jobserver', (os.cpu_count() or 1) - max(1, args.n)
+        )
+        os.environ['MAKEFLAGS'] = f'--jobserver-auth=fifo:{staging_dir / "jobserver"}'
         if args.timeout is None:
             # A fixed deadline is applied to candidates whose cost differs by a
             # factor of hundreds -- one changed file against every file of the
@@ -484,14 +497,7 @@ def do_reduce(args):
         # it is built and how it is checked, and asking for both again in shell is
         # asking for two descriptions that will disagree.
         args.interestingness_test = str(
-            project_utils.check_script(
-                project, args.test, staging_dir / 'check.sh',
-                # Every job queues behind this one lock, so one build at a time
-                # has the whole machine. It lives outside every tree the overlay
-                # covers -- inside one, each job would take its own private copy
-                # and the queue would be a queue of one.
-                lock=staging_dir / 'build.lock',
-            )
+            project_utils.check_script(project, args.test, staging_dir / 'check.sh')
         )
         os.chdir(staged.parent)
         test_cases = [Path(staged.name)]

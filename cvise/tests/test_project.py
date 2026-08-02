@@ -23,6 +23,7 @@ from cvise.utils.project import (
     configure,
     database_for,
     has_test,
+    open_jobserver,
     tests_of as registered_tests,
     publish,
     sources_from,
@@ -109,7 +110,7 @@ class TestTheCheckScript:
         spends most of its care avoiding."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'says_v', tmp_path / 'check.sh', tmp_path / 'build.lock')
+        script = check_script(project, 'says_v', tmp_path / 'check.sh')
         assert subprocess.run([str(script)], capture_output=True).returncode == 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
@@ -119,7 +120,7 @@ class TestTheCheckScript:
         criterion by deleting the test. --no-tests=error is what makes it 8."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'gone_missing', tmp_path / 'check.sh', tmp_path / 'build.lock')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
         assert subprocess.run([str(script)], capture_output=True).returncode != 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
@@ -127,7 +128,7 @@ class TestTheCheckScript:
         """A refusal that prints nothing is the worst thing this program can say."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'gone_missing', tmp_path / 'check.sh', tmp_path / 'build.lock')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
         proc = subprocess.run([str(script)], capture_output=True, text=True)
         assert proc.stdout.strip(), 'the check script said nothing about why it failed'
 
@@ -494,69 +495,82 @@ class TestTheBaseline:
 
 
 
-class TestTheBuildQueue:
-    """One build at a time, each with the whole machine.
+class TestTheTokenPool:
+    """What bounds the machine is the number of compilers, not the -j of any one build.
 
-    Never a smaller -j. When N simultaneous builds do not fit, what does not fit
-    is N simultaneous builds: MEASURED, with no -j the load reached 230 and the
-    reduction's cgroup OOM-killed cc1plus; with -j 1 the machine sat half idle
-    and candidates touching many files timed out one after another. Queueing
-    gives up no CPU -- the same work in the same total time, just in an order --
-    and removes the multiplication of compilers and of memory.
+    ninja is never given a -j. Both extremes were tried and both were wrong:
+    with no bound at all the load reached 230 and the reduction's cgroup
+    OOM-killed cc1plus; with -j 1 the machine sat half idle and candidates that
+    touched many files timed out. Serialising the builds is wrong in the same
+    way as -j 1 -- a candidate that changed one file compiles one object and
+    holds the whole machine while everything waits for a build that cannot use
+    it.
+
+    A shared pool is adaptive where those are not: every build takes what it can
+    use and leaves the rest.
     """
 
     def test_the_build_is_never_given_a_job_count(self, tmp_path):
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
+        text = check_script(project, 'says_v', tmp_path / 'check.sh').read_text()
         assert not re.search(r'cmake --build \S+ .*-j', text), text
 
-    def test_the_build_is_inside_the_lock(self, tmp_path):
+    def test_the_builds_are_not_serialised(self, tmp_path):
+        """One at a time is the other wrong answer, so nothing may lock here."""
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
-        assert text.index('flock 9') < text.index('cmake --build')
-        assert text.index('cmake --build') < text.index('flock -u 9')
+        text = check_script(project, 'says_v', tmp_path / 'check.sh').read_text()
+        assert 'flock' not in text, text
 
-    def test_the_test_is_outside_it(self, tmp_path):
-        """It runs against this job's own binary, which nobody else can touch."""
-        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
-        project = configure(cmakelists, tmp_path / 'build')
-        text = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'l').read_text()
-        assert text.index('flock -u 9') < text.index('ctest')
+    def test_the_pool_holds_the_tokens_it_was_asked_for(self, tmp_path):
+        fd = open_jobserver(tmp_path / 'jobserver', 5)
+        try:
+            assert os.read(fd, 64) == b'x' * 5
+        finally:
+            os.close(fd)
 
-    def test_the_lock_actually_serialises(self, tmp_path):
-        """A queue that does not queue is the failure this is most likely to have.
+    def test_a_pool_is_never_empty(self, tmp_path):
+        """More jobs than cores subtracts to nothing, and no tokens is a deadlock."""
+        fd = open_jobserver(tmp_path / 'jobserver', 0)
+        try:
+            assert os.read(fd, 64) == b'x'
+        finally:
+            os.close(fd)
 
-        Two scripts sharing one lock must not overlap. Written with the same
-        shell construct the generated script uses, so that a change to it which
-        stops serialising fails here.
-        """
-        lock = tmp_path / 'build.lock'
-        witness = tmp_path / 'overlap'
-        script = tmp_path / 'queued.sh'
-        script.write_text(
-            '#!/bin/sh\n'
-            f'exec 9>{lock}\n'
-            'flock 9\n'
-            f'[ -e {witness} ] && echo OVERLAP >> {tmp_path / "seen"}\n'
-            f'touch {witness}\n'
-            'sleep 0.3\n'
-            f'rm -f {witness}\n'
-            'flock -u 9\n'
-        )
-        script.chmod(0o755)
-        procs = [subprocess.Popen([str(script)]) for _ in range(6)]
-        for proc in procs:
-            proc.wait(timeout=60)
-        assert not (tmp_path / 'seen').exists(), 'two builds ran at once'
+    def test_the_pool_survives_having_no_readers(self, tmp_path):
+        """Opened read-write on purpose: a write-only fifo would see EOF and the
+        tokens would be gone the first time no build held it."""
+        fd = open_jobserver(tmp_path / 'jobserver', 3)
+        try:
+            taken = os.read(fd, 1)
+            os.write(fd, taken)
+            assert os.read(fd, 64) == b'xxx'
+        finally:
+            os.close(fd)
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
-    def test_a_queued_check_still_works(self, tmp_path):
+    def test_several_builds_share_one_pool(self, tmp_path, monkeypatch):
+        """The property the whole thing exists for, checked against ninja itself.
+
+        MEASURED on this machine: eight builds at once ran 192 compilers with no
+        pool, 12 with a pool of 4 and 24 with a pool of 16 -- each ninja gets an
+        implicit token of its own, so the total is builds plus tokens.
+        """
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        script = check_script(project, 'says_v', tmp_path / 'c.sh', tmp_path / 'build.lock')
-        assert subprocess.run([str(script)], capture_output=True).returncode == 0
+        fd = open_jobserver(tmp_path / 'jobserver', 2)
+        try:
+            env = {**os.environ,
+                   'MAKEFLAGS': f'--jobserver-auth=fifo:{tmp_path / "jobserver"}'}
+            proc = subprocess.run(['cmake', '--build', str(project.build_dir)],
+                                  env=env, capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stderr[:400]
+            assert 'Jobserver mode detected' in proc.stdout + proc.stderr, (
+                'ninja ignored the pool: ' + (proc.stdout + proc.stderr)[:400]
+            )
+        finally:
+            os.close(fd)
 
 
 class TestTheBaselineIsTimed:
