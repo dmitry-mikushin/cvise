@@ -132,6 +132,39 @@ def is_undecided(exitcode: int) -> bool:
     return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
 
 
+def cheap_rejection(changed, check_command, env, timeout):
+    """Ask the compiler about the changed file, while that is still the cheap question.
+
+    Returns what run_test should return, or None to go on to the build.
+
+    Only when the candidate changed exactly one file. The premise is that
+    asking about one file costs less than the build it avoids, and that premise
+    inverts as soon as there is a second: this check is serial, the build is
+    ninja and is parallel, and every file asked about here is a file the build
+    is about to compile again.
+
+    MEASURED on ns-projection (C++23, 376 units, 44 jobs sharing the machine):
+    2.3 s to parse one unit, 16 s to build and link a one-file candidate, and
+    about 3.2 s per file plus a 9 s link for the build of an n-file one -- the
+    two costs cross between one file and two. Passes are folded into a single
+    candidate wherever they can be, so candidates touching 40 to 64 files were
+    ordinary, and each spent some 430 s here, more than the whole 300 s timeout,
+    before the build it was meant to save had started. Seventeen were lost that
+    way in eight minutes and the reduction made no progress at all.
+    """
+    if len(changed) != 1:
+        return None
+    command = check_command.get(str(changed[0])) if check_command else None
+    if not command:
+        return None
+    try:
+        if not precheck.syntax_check(command, env, timeout):
+            return 1, b'', b'rejected by -fsyntax-only on the changed file\n'
+    except precheck.Undecided as e:
+        return UNDECIDED_EXIT_CODE, b'', f'{e}\n'.encode()
+    return None
+
+
 def unchanged(before: Path, after: Path) -> bool:
     """Did the pass produce the very thing it was given?
 
@@ -305,27 +338,11 @@ class TestEnvironment:
                 env = overlay.job_environment(env, delta, roots)
 
             # Most candidates are rejected because they do not compile, and
-            # that answer costs milliseconds when asked of the changed file
-            # alone instead of minutes when asked of a whole build. The flags
-            # come from the project's own compilation database, so this is the
-            # same compiler with the same options the build would use -- it is
-            # not a second opinion, it is the first part of the same one.
-            #
-            # The question is asked of the files this candidate actually
-            # changed. Asking it of the test case was asking it of a directory,
-            # which no compilation database names, so the answer was always "no
-            # command" and every candidate went straight to a full build.
-            for path in changed:
-                command = self.check_command.get(str(path)) if self.check_command else None
-                if not command:
-                    continue
-                try:
-                    if not precheck.syntax_check(command, env, self.precheck_timeout):
-                        return 1, b'', b'rejected by -fsyntax-only on the changed file\n'
-                    if not precheck.object_check(command, env, self.precheck_timeout):
-                        return 1, b'', b'rejected while compiling the changed file\n'
-                except precheck.Undecided as e:
-                    return UNDECIDED_EXIT_CODE, b'', f'{e}\n'.encode()
+            # that answer is far cheaper asked of the changed file than of a
+            # whole build. See cheap_rejection for when it is asked at all.
+            verdict = cheap_rejection(changed, self.check_command, env, self.precheck_timeout)
+            if verdict is not None:
+                return verdict
 
             stdout, stderr, returncode = ProcessEventNotifier(self.pid_queue).run_process(
                 str(self.test_script), shell=True, env=env, cwd=self.folder

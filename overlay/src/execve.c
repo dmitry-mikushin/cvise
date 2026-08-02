@@ -34,7 +34,7 @@
  * exists to prevent, and it would happen at every exec.
  */
 
-static char ** overlay_exec_env (char * const envp[])
+char ** fakechroot_exec_env (char * const envp[])
 {
     static const char * const keep[] = { "LD_PRELOAD=", "CVISE_OVERLAY_DELTA=", "CVISE_OVERLAY_ROOT=" };
     size_t n = 0, i, k, extra = 0;
@@ -101,7 +101,7 @@ wrapper(execve, int, (const char * filename, char * const argv[], char * const e
     debug("execve(\"%s\", ...)", filename);
     expand_chroot_path(filename);
 
-    env = overlay_exec_env(envp);
+    env = fakechroot_exec_env(envp);
     rc = nextcall(execve)(filename, argv, env != NULL ? env : envp);
     free(env);
     return rc;

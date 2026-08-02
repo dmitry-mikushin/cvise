@@ -21,10 +21,11 @@ from cvise.utils.project import (
     baseline_build,
     configure,
     database_for,
-    has_target,
-    links_something,
+    has_test,
+    tests_of,
     publish,
     sources_from,
+    check_script,
     stage,
 )
 
@@ -54,41 +55,80 @@ def write_project(root, extra_targets=''):
     return root / 'CMakeLists.txt'
 
 
-class TestTargets:
-    def test_an_executable_target_is_found(self, tmp_path):
-        """The common case, and the one that used to be rejected.
+TESTED_PROJECT = """
+enable_testing()
+add_test(NAME says_v COMMAND prog)
+set_tests_properties(says_v PROPERTIES PASS_REGULAR_EXPRESSION "V=42")
+"""
 
-        Targets were looked up in `cmake --build --target help`, which lists
-        only the phony primary targets -- so every executable and library was
-        absent from it and the tool refused to start on `prog`.
-        """
+
+class TestWhichTestDecides:
+    """A registered ctest test, not a build target.
+
+    A target says only that something exited zero, and a test runner exits zero
+    when the case it was asked for no longer exists -- so a criterion built on
+    one is satisfied best by deleting the test. ctest can tell the difference,
+    which is the whole reason it is what C-Vise asks for.
+    """
+
+    def test_a_registered_test_is_found(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        assert has_test(project, 'says_v')
+
+    def test_a_test_that_does_not_exist_is_not_found(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        assert not has_test(project, 'no_such_test')
+
+    def test_a_name_that_merely_contains_the_right_one_is_not_it(self, tmp_path):
+        """The match is anchored, so `says` must not select `says_v`."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        assert not has_test(project, 'says')
+
+    def test_a_project_with_no_tests_registers_none(self, tmp_path):
+        """And the user is told so, rather than left to wonder about the name."""
         cmakelists = write_project(tmp_path / 'project')
         project = configure(cmakelists, tmp_path / 'build')
-        assert has_target(project, 'prog')
+        assert not has_test(project, 'anything')
+        assert tests_of(project) == []
 
-    def test_a_target_that_does_not_exist_is_not_found(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+    def test_the_known_names_are_reported(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        assert not has_target(project, 'no_such_target')
+        assert tests_of(project) == ['says_v']
 
-    def test_an_executable_links(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+
+class TestTheCheckScript:
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_it_builds_before_it_tests(self, tmp_path):
+        """ctest does not build, so without this a candidate is judged by the
+        binary the previous one left -- the exact wrong answer this program
+        spends most of its care avoiding."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        assert links_something(project, 'prog')
+        script = check_script(project, 'says_v', tmp_path / 'check.sh')
+        assert subprocess.run([str(script)], capture_output=True).returncode == 0
 
-    def test_a_static_library_links_nothing(self, tmp_path):
-        """Which is why naming one is worth a warning.
-
-        A target that only compiles never resolves a symbol, so deleting a
-        function while its callers remain looks interesting and the reduction
-        can produce a project that does not build.
-        """
-        cmakelists = write_project(
-            tmp_path / 'project', extra_targets='add_library(justcompile STATIC src/calc.cpp)\n'
-        )
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_a_test_that_is_not_there_is_a_failure(self, tmp_path):
+        """`ctest -R nomatch` exits 0 on its own. MEASURED: it prints "No tests
+        were found!!!" and succeeds, which would let a reduction satisfy the
+        criterion by deleting the test. --no-tests=error is what makes it 8."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
-        assert has_target(project, 'justcompile')
-        assert not links_something(project, 'justcompile')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
+        assert subprocess.run([str(script)], capture_output=True).returncode != 0
+
+    @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
+    def test_the_output_is_kept(self, tmp_path):
+        """A refusal that prints nothing is the worst thing this program can say."""
+        cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
+        proc = subprocess.run([str(script)], capture_output=True, text=True)
+        assert proc.stdout.strip(), 'the check script said nothing about why it failed'
 
 
 class TestDatabase:

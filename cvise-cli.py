@@ -305,12 +305,14 @@ def main():
         'what flags each one is compiled with',
     )
     parser.add_argument(
-        'target',
-        metavar='TARGET',
+        'test',
+        metavar='TEST',
         nargs='?',
-        help='CMake target that decides whether a variant of the project is still interesting: '
-        'it is interesting if the target builds. A library or executable target therefore means '
-        '"still compiles and links"; a custom target that runs something means "still behaves"',
+        help='name of the ctest test that decides whether a variant of the project is still '
+        'interesting: it is interesting if the project builds and that one test passes. A test, '
+        'not a build target, because a target says only that something exited zero -- and a test '
+        'runner exits zero when the case it was asked for no longer exists, so the cheapest way '
+        'to satisfy such a criterion is to delete the test',
     )
     parser.add_argument(
         '--stopping-threshold',
@@ -322,8 +324,8 @@ def main():
     args = parser.parse_args()
 
 
-    if not args.list_passes and (not args.project or not args.target):
-        parser.error('the following arguments are required: CMAKELISTS, TARGET')
+    if not args.list_passes and (not args.project or not args.test):
+        parser.error('the following arguments are required: CMAKELISTS, TEST')
 
     log_config = {}
 
@@ -442,23 +444,18 @@ def do_reduce(args):
         launch_dir = Path.cwd()
         staged = project_utils.stage(project, staging_dir / project.root.name)
 
-        if not project_utils.links_something(project, args.target):
-            logging.warning(
-                "target '%s' does not link or run anything, so nothing will ever fail to resolve a "
-                'symbol: deleting a function while its callers remain will look interesting, and the '
-                'reduction can produce a project that does not build. Name a target that links or '
-                'runs.',
-                args.target,
-            )
-        if not project_utils.has_target(project, args.target):
-            sys.exit(
-                f"the project defines no target '{args.target}'; "
-                f'`cmake --build {project.build_dir} --target help` lists the ones it does'
-            )
         # Built once, here, from the sources as they are. Every job then gets
         # this tree copy-on-write and only compiles what its own candidate
         # changed; without it each of them would build the project from nothing.
         project_utils.baseline_build(project)
+        if not project_utils.has_test(project, args.test):
+            known = project_utils.tests_of(project)
+            sys.exit(
+                f"the project registers no ctest test called '{args.test}'"
+                + (f'; it registers: {", ".join(known)}' if known else
+                   '; it registers none at all, so add enable_testing() and add_test() -- or '
+                   'gtest_discover_tests() -- to the project')
+            )
         # The database clang_delta is handed has to name the files clang_delta is
         # handed. It was given the project's paths while every pass works on the
         # staged copy, so the lookup found nothing and every semantic pass -- the
@@ -469,7 +466,7 @@ def do_reduce(args):
         # it is built and how it is checked, and asking for both again in shell is
         # asking for two descriptions that will disagree.
         args.interestingness_test = str(
-            project_utils.check_script(project, args.target, staging_dir / 'check.sh')
+            project_utils.check_script(project, args.test, staging_dir / 'check.sh')
         )
         os.chdir(staged.parent)
         test_cases = [Path(staged.name)]

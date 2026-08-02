@@ -44,33 +44,38 @@ See [INSTALL.md](INSTALL.md).
 C-Vise reduces a CMake project. It takes two things, and nothing else:
 
 ```console
-$ cvise path/to/CMakeLists.txt some-target
+$ cvise path/to/CMakeLists.txt some_test
 ```
 
-The CMakeLists.txt is the one that drives the project's build. The target is
-what makes a variant interesting. Everything else follows from those two,
+The CMakeLists.txt is the one that drives the project's build. The name is that
+of a ctest test, and it is what makes a variant interesting. Everything else follows from those two,
 because everything else is already written down in the build: C-Vise runs CMake
 once to obtain `compile_commands.json`, and from it takes which translation
 units exist, which headers they include, and what flags each is compiled with.
 There is nothing else to tell it, and every extra question would be another way
 for the answer to disagree with the build.
 
-The target says what "still interesting" means, in the language the project is
-already written in. A library or executable target means the code still
-compiles and links. A custom target that runs something means it still behaves:
+A variant is interesting when the project builds and that one test passes. A
+test, not a build target, and the difference is not bookkeeping: a target says
+only that something exited zero, and a test runner exits zero when the case it
+was asked for no longer exists. MEASURED with GoogleTest: a filter matching
+nothing prints "[  PASSED  ] 0 tests." and exits 0 -- so the cheapest way to
+satisfy such a criterion is to delete the test, and a reduction will find that
+before it finds anything else.
+
+ctest can tell a test that passed from a test that was not there, which is the
+whole reason it is what C-Vise asks for. Say what must have happened rather
+than what must not:
 
 ```cmake
-add_custom_target(still_crashes
-  COMMAND sh -c "$<TARGET_FILE:prog> --input case.txt 2>&1 | grep -q 'assertion failed'"
-  VERBATIM)
-add_dependencies(still_crashes prog)   # DEPENDS takes files, not targets
+enable_testing()
+add_test(NAME still_crashes COMMAND prog --input case.txt)
+set_tests_properties(still_crashes PROPERTIES
+                     PASS_REGULAR_EXPRESSION "assertion failed")
 ```
 
-A variant is interesting when `cmake --build --target still_crashes` succeeds.
-Asking instead for a shell script would be asking you to restate the build in
-another language, with another set of assumptions about where the files are and
-which compiler to call -- and the two descriptions disagree the moment the
-project changes.
+The test is registered in the CMakeLists.txt, which is not under reduction, so
+the reduction cannot make the criterion easier by rewriting it.
 
 That is the whole interface. Reducing a single file, a list of files, a bare
 directory, a Makefile project, or anything described by a hand-written
@@ -81,19 +86,26 @@ matters here is the one the build system can state for itself.
 ### What a candidate costs
 
 A reduction asks one question millions of times, so what the question costs is
-what the reduction costs. It is asked in three stages, cheapest first:
+what the reduction costs. It is asked in two stages:
 
 1. `-fsyntax-only` on the file that changed, with the flags its own build uses.
    Most rejected candidates die here, in the time it takes to parse one unit --
    on a small project, about six candidates in ten never reach a compiler
    again.
-2. the same unit compiled to an object, which is where anything the front end
-   accepted but the back end will not appears.
-3. the project built the way the project is built, and then the target.
+2. the project built the way the project is built, and then the target.
 
-Only the third knows what "interesting" means, and only the third belongs to
-you. The first two are the compiler's own opinion of the file, and C-Vise
-already has everything needed to ask for it.
+Only the second knows what "interesting" means, and only it belongs to you. The
+first is the compiler's own opinion of the file, and C-Vise already has
+everything needed to ask for it.
+
+The first stage runs only when the candidate changed exactly one file, because
+that is the only case in which it is cheaper than the build it avoids. Several
+passes are folded into one candidate wherever they can be, so a candidate
+touching dozens of files is ordinary -- and asking about each of them in turn
+is serial work that ninja would have done in parallel and is about to do again.
+MEASURED on a C++23 project of 376 units: 2.3 s to parse one unit, 16 s to
+build and link a one-file candidate, and the two costs cross between one file
+and two.
 
 ### Each job answers about its own candidate
 

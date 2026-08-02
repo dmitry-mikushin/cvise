@@ -19,6 +19,7 @@ import logging
 import os
 import shlex
 import shutil
+import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -388,105 +389,68 @@ def baseline_build(project: 'Project') -> None:
         )
 
 
-def has_target(project: 'Project', target: str) -> bool:
-    """Does the project define this target?
+def has_test(project: 'Project', name: str) -> bool:
+    """Does the project register a ctest test by exactly this name?
 
-    Asked of ninja, not of `cmake --build --target help`: that lists only the
-    phony "primary targets", so every executable and library -- which is to say
-    the targets a user is most likely to name -- is absent from it. Checking
-    against that list rejected `prog` for a project that plainly builds prog.
+    Asked of ctest itself rather than reconstructed from the CMakeLists, since
+    a test can be registered by gtest_discover_tests at build time and never
+    appear in any file a human wrote.
     """
     proc = subprocess.run(
-        ['ninja', '-C', str(project.build_dir), '-t', 'targets', 'all'],
+        ['ctest', '--test-dir', str(project.build_dir), '-N', '-R', f'^{re.escape(name)}$'],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        return True  # cannot tell; let the sanity check speak instead
-    names = set()
-    for line in proc.stdout.splitlines():
-        path, _, _ = line.partition(':')
-        path = path.strip()
-        if not path:
-            continue
-        names.add(path)
-        names.add(Path(path).name)
-    return target in names
-
-
-def links_something(project: 'Project', target: str, depth: int = 3) -> bool:
-    """Does building this target resolve symbols?
-
-    It matters a great deal. A target that is only compiled and archived -- a
-    static or object library -- never looks for a definition, so deleting a
-    function while its callers remain builds perfectly well, looks interesting,
-    and the reduction produces a project that does not build. Only linking an
-    executable, a shared library or a module asks the question the reduction
-    depends on.
-
-    The answer has to be followed through ninja's graph rather than read off a
-    name: a CMake target is a phony node pointing at whatever actually produces
-    it, so `justcompile: phony` says nothing at all by itself.
-    """
-    seen: set[str] = set()
-
-    def rule_of(name: str, left: int) -> bool:
-        if left <= 0 or name in seen:
-            return False
-        seen.add(name)
-        proc = subprocess.run(
-            ['ninja', '-C', str(project.build_dir), '-t', 'query', name],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            return True  # cannot tell; do not cry wolf
-        inputs: list[str] = []
-        rule = ''
-        for line in proc.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith('input:'):
-                rule = stripped.split(':', 1)[1].strip()
-            elif line.startswith('    ') and rule and not stripped.startswith(('outputs:', '|')):
-                inputs.append(stripped.lstrip('| '))
-            elif stripped.startswith('outputs:'):
-                break
-        if 'STATIC_LIBRARY' in rule or 'OBJECT_LIBRARY' in rule:
-            return False
-        if 'LINKER' in rule or 'CUSTOM_COMMAND' in rule:
-            return True
-        if rule == 'phony':
-            return any(rule_of(i, left - 1) for i in inputs)
         return False
+    match = re.search(r'Total Tests:\s*(\d+)', proc.stdout)
+    return bool(match) and int(match.group(1)) > 0
 
-    return rule_of(target, depth)
+
+def tests_of(project: 'Project') -> list[str]:
+    """Every test the project registers, for telling the user what they could have named."""
+    proc = subprocess.run(
+        ['ctest', '--test-dir', str(project.build_dir), '-N'],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return re.findall(r'^\s*Test\s+#\d+:\s*(\S+)\s*$', proc.stdout, re.M)
 
 
-def check_script(project: 'Project', target: str, path: Path) -> Path:
-    """The interestingness test, written by C-Vise rather than by the user.
+def check_script(project: 'Project', name: str, path: Path) -> Path:
+    """Build the project, then run the one test -- and insist that it ran.
 
-    The project already says how it is built and how it is checked -- that is
-    what a target is. Asking the user for a shell script on top of that asks
-    them to restate it, in another language, with another set of assumptions
-    about where the files are and which compiler to call; and the two
-    descriptions then disagree the moment the project changes.
+    A ctest test, not a build target. A target only says the code still
+    compiles and links, and a target that runs something says only that the
+    something exited zero -- which a test runner does when the case it was
+    asked for no longer exists. MEASURED with GoogleTest: a filter matching
+    nothing prints "[  PASSED  ] 0 tests." and exits 0, so the cheapest way to
+    satisfy such a criterion is to delete the test, and a reduction finds it.
 
-    So the test is this: build the target the way the project builds it. Ninja
-    rebuilds what the candidate touched and nothing else, and the target's own
-    definition decides what "interesting" means -- a library target says the
-    code still compiles and links, a custom target that runs something says it
-    still behaves.
+    ctest knows the difference between a test that passed and a test that was
+    not there -- but only when told to. MEASURED: `ctest -R nomatch` exits 0
+    and prints "No tests were found!!!"; with --no-tests=error it exits 8. So
+    the flag is not a nicety here, it is the whole reason for using ctest.
+
+    The build comes first because ctest does not build. Without it a candidate
+    would be judged by the binary the previous one left, which is the class of
+    wrong answer this program spends most of its care avoiding.
+
+    The output is not discarded. C-Vise captures it and shows it when the
+    project turns out not to be interesting to begin with -- and a message that
+    says the test failed and then prints nothing is the worst thing this
+    program can say, because the one run that has to be diagnosed is the one
+    that never started.
     """
+    build = shlex.quote(str(project.build_dir))
     path.write_text(
         '#!/bin/sh\n'
         '# Generated by C-Vise. The project defines both the build and the check.\n'
-        '# The output is not discarded. C-Vise captures it and shows it when the\n'
-        '# project turns out not to be interesting to begin with -- and a message\n'
-        '# that says the test failed and then prints nothing at all is the worst\n'
-        '# thing this program can say, because the one run that has to be\n'
-        '# diagnosed is the one that never started.\n'
-        f'exec cmake --build {shlex.quote(str(project.build_dir))} '
-        f'--target {shlex.quote(target)} 2>&1\n'
+        f'cmake --build {build} 2>&1 || exit $?\n'
+        f'exec ctest --test-dir {build} -R {shlex.quote("^" + re.escape(name) + "$")} '
+        '--no-tests=error --output-on-failure 2>&1\n'
     )
     path.chmod(0o755)
     return path

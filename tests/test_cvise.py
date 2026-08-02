@@ -98,16 +98,15 @@ needs_cmake = pytest.mark.skipif(shutil.which('cmake') is None, reason='requires
 needs_cc = pytest.mark.skipif(shutil.which('gcc') is None, reason='requires gcc')
 needs_ninja = pytest.mark.skipif(shutil.which('ninja') is None, reason='requires ninja')
 
-# add_dependencies, not DEPENDS: DEPENDS on a custom target takes FILES, so a
-# target written with it does not rebuild the executable and happily tests the
-# one left over from the previous candidate -- which passes whatever the
-# candidate did. The reduction then empties the program and calls it
-# interesting, correctly, because that is what it was asked.
+# A registered ctest test, because that is what C-Vise asks for. A build target
+# says only that something exited zero, and a test runner exits zero when the
+# case it was asked for no longer exists -- so a criterion built on one is
+# satisfied best by deleting the test. PASS_REGULAR_EXPRESSION says what must
+# have happened, not merely what did not.
 KEEP_CHECK = (
-    'add_custom_target(keeps\n'
-    '  COMMAND sh -c "$<TARGET_FILE:prog> | grep -q KEEP_ME"\n'
-    '  VERBATIM)\n'
-    'add_dependencies(keeps prog)\n'
+    'enable_testing()\n'
+    'add_test(NAME keeps COMMAND prog)\n'
+    'set_tests_properties(keeps PROPERTIES PASS_REGULAR_EXPRESSION "KEEP_ME")\n'
 )
 
 
@@ -168,36 +167,17 @@ def test_reduces_every_file_of_the_project(tmp_path: Path, subprocess_tmpdir: Pa
 @needs_posix
 @needs_cmake
 @needs_ninja
-@needs_cc
-def test_an_executable_target_is_accepted(tmp_path: Path, subprocess_tmpdir: Path):
-    """Naming the executable must work; it once did not.
-
-    Targets were looked up in the list `cmake --build --target help` prints,
-    which contains only the phony primary targets -- so every executable and
-    library was missing from it and the tool refused to start on the name a
-    user is most likely to type.
-    """
-    project = tmp_path / 'project'
-    write_project(project, {'main.c': 'int main(void) { return 0; }\n'})
-
-    run_cvise([str(project / 'CMakeLists.txt'), 'prog'], project, subprocess_tmpdir)
-    assert_no_leftovers(subprocess_tmpdir)
-
-
-@needs_posix
-@needs_cmake
-@needs_ninja
-def test_a_target_that_does_not_exist_is_refused(tmp_path: Path, subprocess_tmpdir: Path):
+def test_a_test_that_does_not_exist_is_refused(tmp_path: Path, subprocess_tmpdir: Path):
     """A typo must not look like "your project is not interesting"."""
     project = tmp_path / 'project'
     write_project(project, {'main.c': 'int main(void) { return 0; }\n'})
 
     proc = start_cvise(
-        [str(project / 'CMakeLists.txt'), 'no_such_target'], project, subprocess_tmpdir
+        [str(project / 'CMakeLists.txt'), 'no_such_test'], project, subprocess_tmpdir
     )
     stdout, stderr = proc.communicate(timeout=600)
     assert proc.returncode != 0
-    assert 'no target' in (stdout + stderr)
+    assert 'no ctest test' in (stdout + stderr)
 
 
 @needs_posix
@@ -213,10 +193,8 @@ def test_shuts_down_promptly_when_interrupted(tmp_path: Path, subprocess_tmpdir:
         project,
         {'main.c': 'int main(void) { return 0; }\n'},
         check=(
-            'add_custom_target(slow\n'
-            f'  COMMAND sh -c "touch {flag}; sleep {MAX_SHUTDOWN * 2}"\n'
-            '  VERBATIM)\n'
-            'add_dependencies(slow prog)\n'
+            'enable_testing()\n'
+            f'add_test(NAME slow COMMAND sh -c "touch {flag}; sleep {MAX_SHUTDOWN * 2}")\n'
         ),
     )
 
@@ -242,7 +220,7 @@ def test_shuts_down_promptly_when_interrupted(tmp_path: Path, subprocess_tmpdir:
 @needs_posix
 @needs_cmake
 @needs_ninja
-def test_rejects_a_target_that_fails_on_the_untouched_project(
+def test_rejects_a_check_that_fails_on_the_untouched_project(
     tmp_path: Path, subprocess_tmpdir: Path
 ):
     """If the pristine project is not interesting, every later verdict is meaningless."""
@@ -250,7 +228,7 @@ def test_rejects_a_target_that_fails_on_the_untouched_project(
     write_project(
         project,
         {'main.c': 'int main(void) { return 0; }\n'},
-        check='add_custom_target(always_fails COMMAND sh -c "exit 1" VERBATIM)\n',
+        check='enable_testing()\nadd_test(NAME always_fails COMMAND sh -c "exit 1")\n',
     )
 
     proc = start_cvise(

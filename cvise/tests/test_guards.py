@@ -374,6 +374,74 @@ class TestWhichTreesAreIsolated:
         assert env['LD_PRELOAD'] == str(library)
 
 
+class TestTheCheapStageStaysCheap:
+    """It runs for one changed file and for no more than one.
+
+    The premise is that asking the compiler about one file is cheaper than the
+    build it avoids, and the premise inverts the moment there is a second: the
+    check is serial while the build is ninja, which is parallel, and every file
+    asked about is a file the build is about to compile again.
+
+    Passes are folded into a single candidate wherever they can be, so a
+    candidate touching dozens of files is ordinary rather than exotic. MEASURED
+    on ns-projection: such candidates spent some 430 s in this check, more than
+    the whole 300 s timeout, before the build it was meant to save had started
+    -- seventeen lost in eight minutes, and no progress at all.
+    """
+
+    def _asked_about(self, monkeypatch, changed):
+        from cvise.utils import precheck
+        from cvise.utils.testing import cheap_rejection
+
+        asked = []
+        monkeypatch.setattr(precheck, 'syntax_check', lambda c, e, t: asked.append(c) or True)
+        command = {str(p): ['cc', str(p)] for p in changed}
+        assert cheap_rejection(changed, command, {}, 60) is None
+        return asked
+
+    def test_one_changed_file_is_asked_about(self, tmp_path, monkeypatch):
+        assert len(self._asked_about(monkeypatch, [tmp_path / 'a.c'])) == 1
+
+    def test_two_changed_files_are_not_asked_about_at_all(self, tmp_path, monkeypatch):
+        """Not "the first of them": none. The build is cheaper than asking twice."""
+        assert self._asked_about(monkeypatch, [tmp_path / 'a.c', tmp_path / 'b.c']) == []
+
+    def test_nothing_changed_is_not_asked_about(self, monkeypatch):
+        assert self._asked_about(monkeypatch, []) == []
+
+    def test_a_file_with_no_compile_command_is_skipped(self, tmp_path):
+        from cvise.utils.testing import cheap_rejection
+
+        assert cheap_rejection([tmp_path / 'a.c'], {}, {}, 60) is None
+
+    def test_a_file_that_does_not_parse_is_rejected(self, tmp_path):
+        from cvise.utils.testing import cheap_rejection
+
+        bad = tmp_path / 'bad.c'
+        bad.write_text('this is not C\n')
+        verdict = cheap_rejection([bad], {str(bad): ['cc', str(bad)]}, dict(os.environ), 60)
+        assert verdict is not None and verdict[0] == 1
+
+    def test_a_stage_that_could_not_run_decides_nothing(self, tmp_path, monkeypatch):
+        """A timeout is not a verdict; it is the absence of one."""
+        from cvise.utils import precheck
+        from cvise.utils.testing import UNDECIDED_EXIT_CODE, cheap_rejection
+
+        def refuse(command, env, timeout):
+            raise precheck.Undecided('the machine was too busy to answer')
+
+        monkeypatch.setattr(precheck, 'syntax_check', refuse)
+        a = tmp_path / 'a.c'
+        verdict = cheap_rejection([a], {str(a): ['cc', str(a)]}, {}, 60)
+        assert verdict is not None and verdict[0] == UNDECIDED_EXIT_CODE
+
+    def test_the_object_stage_is_gone(self):
+        """It duplicated the build's own compile; the build is the authority."""
+        from cvise.utils import precheck
+
+        assert not hasattr(precheck, 'object_check')
+
+
 class TestPrecheckVerdicts:
     """A cheap stage that could not run has not decided anything.
 
