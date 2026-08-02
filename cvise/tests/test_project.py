@@ -198,6 +198,49 @@ class TestStagingAndPublish:
 
 
 class TestSources:
+    def test_a_header_reached_through_a_dotdot_include_path_is_named_once(self, tmp_path):
+        """One file, one spelling -- or the reduction refuses to start.
+
+        The compiler echoes a dependency the way the include path spelled it,
+        so a fixture reached through -Isrc/../fixtures comes back as
+        ".../src/../fixtures/x.inc": absolute, and a different string from the
+        ".../fixtures/x.inc" that the staged tree is built with.
+
+        Two spellings of one file is not untidiness. The staged tree holds the
+        normalised name, so the job's copy has nothing under the other one, and
+        the overlay records that difference as a deletion -- whiting out a
+        fixture nothing touched. MEASURED on ns-projection: C-Vise refused to
+        start, saying the project was not interesting, on a project that builds.
+        """
+        root = tmp_path / 'project'
+        (root / 'src').mkdir(parents=True)
+        (root / 'fixtures').mkdir(parents=True)
+        (root / 'fixtures' / 'table.inc').write_text('static const int kTable[] = {1, 2, 3};\n')
+        (root / 'src' / 'main.cpp').write_text(
+            '#include <cstdio>\n#include "table.inc"\nint main() { std::printf("%d\\n", kTable[0]); }\n'
+        )
+        (root / 'CMakeLists.txt').write_text(
+            'cmake_minimum_required(VERSION 3.20)\n'
+            'project(demo CXX)\n'
+            'add_executable(prog src/main.cpp)\n'
+            # The spelling that produced the defect: reached by going up and
+            # back down, which is what a real project's layout tends to give.
+            'target_include_directories(prog PRIVATE src/../fixtures)\n'
+        )
+        project = configure(root / 'CMakeLists.txt', tmp_path / 'build')
+
+        included = [s for s in project.sources if s.name == 'table.inc']
+        assert included, 'the include was not found at all'
+        for path in included:
+            assert '..' not in path.parts, f'{path} is not normalised'
+            assert path == path.resolve()
+
+        # And the staged tree must hold it under that same name, since that is
+        # what the delta compares against.
+        staged = stage(project, tmp_path / 'staged')
+        for path in included:
+            assert (staged / path.relative_to(project.root)).is_file()
+
     def test_generated_and_foreign_files_are_not_reduced(self, tmp_path):
         root = tmp_path / 'project'
         write_project(root)
