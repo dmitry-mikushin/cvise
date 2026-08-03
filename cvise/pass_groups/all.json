@@ -1,6 +1,7 @@
 {"interleaving_first": [
     {"pass": "clangincludegraph"},
     {"pass": "compilationdatabase"},
+    {"pass": "reachability", "c": true },
     {"pass": "clangmodulemap", "claim_files": ["**/*.cppmap", "**/*.modulemap"]},
     {"pass": "makefile", "claim_files": ["**/Makefile", "**/makefile", "**/GNUmakefile"]},
     {"pass": "comments", "c": true },
@@ -89,6 +90,7 @@
  "interleaving": [
     {"pass": "clangincludegraph"},
     {"pass": "compilationdatabase"},
+    {"pass": "reachability", "c": true },
     {"pass": "clangmodulemap", "claim_files": ["**/*.cppmap", "**/*.modulemap"]},
     {"pass": "makefile", "claim_files": ["**/Makefile", "**/makefile", "**/GNUmakefile"]},
     {"pass": "comments", "c": true },

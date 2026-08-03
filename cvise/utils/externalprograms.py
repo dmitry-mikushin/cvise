@@ -15,6 +15,11 @@ def find_external_programs() -> dict[str, str | None]:
         'treesitter_delta': 'treesitter_delta',
         'unifdef': None,
         'gcov-dump': None,
+        # binutils, for reading the call graph out of the object files the
+        # build already produced -- which is where it is, rather than in the
+        # sources.
+        'nm': None,
+        'readelf': None,
     }
 
     for prog, local_folder in programs.items():

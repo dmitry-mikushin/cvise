@@ -27,6 +27,7 @@ from cvise.passes.line_markers import LineMarkersPass
 from cvise.passes.lines import LinesPass
 from cvise.passes.makefile import MakefilePass
 from cvise.passes.peep import PeepPass
+from cvise.passes.reachability import ReachabilityPass
 from cvise.passes.rmunusedfiles import RmUnusedFilesPass
 from cvise.passes.special import SpecialPass
 from cvise.passes.ternary import TernaryPass
@@ -98,6 +99,7 @@ class CVise:
         'lines': LinesPass,
         'makefile': MakefilePass,
         'peep': PeepPass,
+        'reachability': ReachabilityPass,
         'rmunusedfiles': RmUnusedFilesPass,
         'special': SpecialPass,
         'ternary': TernaryPass,
