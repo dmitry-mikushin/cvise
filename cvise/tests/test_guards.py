@@ -481,3 +481,35 @@ class TestPrecheckVerdicts:
 
         with pytest.raises(precheck.Undecided):
             precheck.syntax_check(['/nonexistent/cc'], dict(os.environ), 60)
+
+
+class TestStaleCgroups:
+    """Every run leaves one behind, because it cannot remove the one it sits in.
+
+    MEASURED after a day of work on this machine: 424 empty cvise-* cgroups.
+    Each costs almost nothing, which is exactly why nobody notices them piling
+    up.
+    """
+
+    def test_an_empty_one_is_removed(self, tmp_path):
+        (tmp_path / 'cvise-1234').mkdir()
+        assert memory.sweep_stale_cgroups(tmp_path) == 1
+        assert not (tmp_path / 'cvise-1234').exists()
+
+    def test_something_else_is_left_alone(self, tmp_path):
+        """Only what this program names, so a sibling's cgroup is not ours."""
+        (tmp_path / 'cvise-1').mkdir()
+        (tmp_path / 'someone-elses.scope').mkdir()
+        memory.sweep_stale_cgroups(tmp_path)
+        assert (tmp_path / 'someone-elses.scope').is_dir()
+
+    def test_one_still_in_use_survives(self, tmp_path):
+        """rmdir on a non-empty directory fails, which is the whole safety here."""
+        busy = tmp_path / 'cvise-999'
+        busy.mkdir()
+        (busy / 'cgroup.procs').write_text('999\n')
+        assert memory.sweep_stale_cgroups(tmp_path) == 0
+        assert busy.is_dir()
+
+    def test_a_missing_parent_is_not_an_error(self, tmp_path):
+        assert memory.sweep_stale_cgroups(tmp_path / 'nowhere') == 0

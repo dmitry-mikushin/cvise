@@ -45,6 +45,32 @@ UNKNOWN_CEILING = -1
 CEILING_FRACTION = 0.75
 
 
+def sweep_stale_cgroups(parent: Path, prefix: str = 'cvise-') -> int:
+    """Remove the empty cgroups earlier runs could not remove themselves.
+
+    A process cannot rmdir the cgroup it lives in, and once it has exited there
+    is nobody left to try, so each run leaves one behind. Removing one that is
+    not empty is impossible rather than merely discouraged -- the kernel refuses
+    -- so this cannot disturb a run that is still going.
+    """
+    removed = 0
+    try:
+        candidates = sorted(parent.glob(prefix + '*'))
+    except OSError:
+        return 0
+    for node in candidates:
+        if not node.is_dir():
+            continue
+        try:
+            node.rmdir()
+            removed += 1
+        except OSError:
+            pass  # still in use, or not ours to remove
+    if removed:
+        logging.debug('removed %d cgroups left by earlier runs', removed)
+    return removed
+
+
 def bound_this_process(limit_bytes: int) -> int | None:
     """Put THIS process under a memory limit, without spawning anything.
 
@@ -73,6 +99,14 @@ def bound_this_process(limit_bytes: int) -> int | None:
     parent = node.parent
     if not parent.is_dir():
         return None
+
+    # Every run leaves its cgroup behind: a process cannot remove the cgroup it
+    # is sitting in, and by the time it has left there is nobody to do it. They
+    # are empty and cost almost nothing each, but MEASURED after a day of work:
+    # 424 of them. Sweeping the empty ones here is safe by construction -- rmdir
+    # on a cgroup with anything in it fails -- and it means the litter cannot
+    # outlive the next run rather than accumulating forever.
+    sweep_stale_cgroups(parent)
 
     # The memory controller has to be delegated to the parent before a child of
     # it can have a memory.max at all.
