@@ -26,7 +26,7 @@ import pebble
 from cvise.cvise import CVise
 from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
-from cvise.utils import cache, fileutil, mplogging, overlay, precheck, sigmonitor
+from cvise.utils import cache, fileutil, mplogging, noreduce, overlay, precheck, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
     InsaneTestCaseError,
@@ -130,6 +130,37 @@ def is_undecided(exitcode: int) -> bool:
     mechanism that only honours the cooperative code protects almost nothing.
     """
     return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
+
+
+def protected_rejection(changed, delta):
+    """Refuse a candidate that edited what it was told not to.
+
+    Returns what run_test should return, or None to go on.
+
+    Asked of every candidate, before the syntax check and long before the
+    build, because it costs two reads of files that were just written -- and
+    because a candidate that broke the criterion is not merely uninteresting.
+    Its verdict would be a lie. Left to the build, it would come back
+    interesting, be accepted, and every reduction after it would be measured
+    against a test that no longer tests anything.
+
+    It is placed here, where everything a candidate produced is visible at
+    once, rather than inside the passes that produced it. A pass that forgets a
+    rule fails silently and looks like progress; a comparison made afterwards
+    cannot be forgotten, and it holds equally for the passes that emit patches
+    and for clang_delta, which rewrites whole files and never goes through the
+    patch machinery at all.
+    """
+    for original in changed:
+        produced = Path(delta) / str(original).lstrip('/')
+        try:
+            before = Path(original).read_text()
+            after = produced.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue  # nothing carrying a marker is unreadable or binary
+        if noreduce.disturbed(before, after):
+            return 1, b'', f'rejected: {original} has a region marked not to be reduced\n'.encode()
+    return None
 
 
 def cheap_rejection(changed, check_command, env, timeout):
@@ -325,6 +356,11 @@ class TestEnvironment:
                 # settled once, fatally, before the first job.
                 variants = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
                 delta, changed = overlay.prepare_job_delta(self.folder, variants, self.overlay_files or ())
+                # Before anything is spent on this candidate, whether it stayed
+                # out of what it was told to stay out of.
+                verdict = protected_rejection(changed, delta)
+                if verdict is not None:
+                    return verdict
                 # The build directory is isolated too. It is where the answer
                 # about this candidate is computed, and a shared one hands the
                 # job whatever the previous candidate left there: a file this
