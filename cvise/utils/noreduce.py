@@ -152,3 +152,52 @@ def disturbed(before: Path, after: Path) -> bool:
     if not original:
         return False
     return protected_regions(after) != original
+
+
+def _uses_marker(path: Path) -> bool:
+    try:
+        return has_protection(path.read_text())
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def marked_files(root: str) -> tuple[str, ...]:
+    """Which files under a test case carry a marker, found once and remembered.
+
+    Remembering is sound even though the tree shrinks underneath: a file cannot
+    become marked, and one that stops being marked has had its marker removed,
+    which is the thing being refused. Scanning the candidate instead would miss
+    exactly that case -- a candidate that deleted the marker has nothing left to
+    find.
+
+    Worth remembering because the alternative is reading every file of the tree
+    for every candidate, and all but one of them has nothing to say.
+    """
+    path = Path(root)
+    if path.is_file():
+        return (root,) if _uses_marker(path) else ()
+    if not path.is_dir():
+        return ()
+    return tuple(str(p) for p in sorted(path.rglob('*')) if p.is_file() and _uses_marker(p))
+
+
+def violation(original_root: Path, candidate_root: Path) -> Path | None:
+    """The first marked file this candidate disturbed, or None if it left them alone.
+
+    Takes roots rather than a list of changed files, so that it holds for a
+    candidate produced any way at all: by patches, by clang_delta rewriting a
+    whole file, or by a pass that simply deleted one.
+    """
+    original_root = Path(original_root)
+    directory = original_root.is_dir()
+    for marked in marked_files(str(original_root)):
+        marked = Path(marked)
+        candidate = (
+            Path(candidate_root) / marked.relative_to(original_root)
+            if directory
+            else Path(candidate_root)
+        )
+        if disturbed(marked, candidate):
+            return marked
+    return None

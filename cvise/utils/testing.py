@@ -132,29 +132,32 @@ def is_undecided(exitcode: int) -> bool:
     return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
 
 
-def protected_rejection(changed, delta):
+def protected_rejection(pairs):
     """Refuse a candidate that edited what it was told not to.
 
     Returns what run_test should return, or None to go on.
 
-    Asked of every candidate, before the syntax check and long before the
-    build, because it costs two reads of files that were just written -- and
-    because a candidate that broke the criterion is not merely uninteresting.
-    Its verdict would be a lie. Left to the build, it would come back
-    interesting, be accepted, and every reduction after it would be measured
+    Asked of every candidate in every mode, before the syntax check and long
+    before the build, because a candidate that broke the criterion is not merely
+    uninteresting -- its verdict would be a lie. Left to the build, it would come
+    back interesting, be accepted, and every reduction after it would be measured
     against a test that no longer tests anything.
 
-    It is placed here, where everything a candidate produced is visible at
-    once, rather than inside the passes that produced it. A pass that forgets a
-    rule fails silently and looks like progress; a comparison made afterwards
-    cannot be forgotten, and it holds equally for the passes that emit patches
-    and for clang_delta, which rewrites whole files and never goes through the
-    patch machinery at all.
+    It takes the roots rather than a list of changed files, so that it holds for
+    a candidate produced any way at all. A pass that forgets a rule fails
+    silently and looks like progress; a comparison made afterwards cannot be
+    forgotten, and it covers the passes that emit patches, clang_delta which
+    rewrites whole files and never goes through the patch machinery, and a pass
+    that deletes the file outright.
     """
-    for original in changed:
-        produced = Path(delta) / str(original).lstrip('/')
-        if noreduce.disturbed(Path(original), produced):
-            return 1, b'', f'rejected: {original} has a definition marked not to be reduced\n'.encode()
+    for original, candidate in pairs:
+        offender = noreduce.violation(original, candidate)
+        if offender is not None:
+            return (
+                1,
+                b'',
+                f'rejected: {offender} has a definition marked not to be reduced\n'.encode(),
+            )
     return None
 
 
@@ -335,6 +338,21 @@ class TestEnvironment:
         with tempfile.TemporaryDirectory(dir=self.folder, prefix='overridetmp') as tmp_override:
             env = override_tmpdir_env(os.environ.copy(), Path(tmp_override))
             changed: list[Path] = []
+            # Before anything is spent on this candidate, whether it stayed out
+            # of what it was told to stay out of. Asked here, above the two
+            # ways a candidate can be presented to the build, because the
+            # question is the same for both and asking it twice is how one of
+            # them ends up not asking it: with the overlay the candidate is a
+            # copy of the staged tree, without it the candidate is a copy of
+            # the test case, and in both the copy lives in this job's folder.
+            if self.overlay_root is not None:
+                pairs = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
+            else:
+                pairs = [(tc, self.folder / tc) for tc in self.all_test_cases]
+            verdict = protected_rejection(pairs)
+            if verdict is not None:
+                return verdict
+
             if self.overlay_root is not None:
                 # The candidate lives in this job's copy of the staged tree, but
                 # the build opens the project where the project is. Mapping one
@@ -351,11 +369,6 @@ class TestEnvironment:
                 # settled once, fatally, before the first job.
                 variants = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
                 delta, changed = overlay.prepare_job_delta(self.folder, variants, self.overlay_files or ())
-                # Before anything is spent on this candidate, whether it stayed
-                # out of what it was told to stay out of.
-                verdict = protected_rejection(changed, delta)
-                if verdict is not None:
-                    return verdict
                 # The build directory is isolated too. It is where the answer
                 # about this candidate is computed, and a shared one hands the
                 # job whatever the previous candidate left there: a file this
