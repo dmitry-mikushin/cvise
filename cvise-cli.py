@@ -432,7 +432,11 @@ def do_reduce(args):
     try:
         project = project_utils.configure(Path(args.project), cmake_dir)
         logging.info(
-            '%s: %d translation units under %s',
+            # Not "translation units", which is what this said while counting
+            # units and headers together -- so a run of 376 units and 513
+            # headers announced 889 units, and the number moved between runs
+            # for a reason that had nothing to do with the units.
+            '%s: %d reducible files under %s',
             project.compilation_database,
             len(project.sources),
             project.root,
