@@ -350,6 +350,57 @@ def publish(project: 'Project', staging: Path) -> int:
     return published
 
 
+def build_failure_report(output: str, build_dir: Path) -> str:
+    """Say what actually failed, rather than the last two thousand characters.
+
+    A build failure was reported here by tailing the output, and tailing is the
+    one thing that cannot be done to a ninja failure: ninja prints each failed
+    edge as `FAILED:`, the command, and then the diagnostics, and a single
+    command for a static library of nine hundred objects is tens of kilobytes.
+    The tail therefore showed the end of one command and hid every failure
+    before it -- so a report that said `ar: some.o: No such file or directory`
+    could not be distinguished from one where a compile had failed first and
+    that was merely the wreckage. Four occurrences were read that way, and the
+    reading was worth nothing.
+
+    So the blocks are found and counted, the command is summarised rather than
+    quoted (it is the bulk and the least informative part), the diagnostics are
+    kept in full, and the whole untouched output is written next to the build
+    so nothing is lost by summarising.
+    """
+    lines = output.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith('FAILED:')]
+
+    full = build_dir / 'cvise-last-build-failure.log'
+    try:
+        full.write_text(output)
+        where = f'the whole output is in {full}'
+    except OSError as e:
+        where = f'(the whole output could not be written to {full}: {e.strerror})'
+
+    if not starts:
+        # No edge failed, so the failure is ninja's own -- a missing input with
+        # no rule, a manifest that would not load. That is short, and all of it
+        # matters.
+        return f'{output.strip()}\n{where}'
+
+    report = [f'{len(starts)} build step(s) failed; {where}']
+    for n, start in enumerate(starts[:3]):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        block = lines[start:end]
+        report.append(f'  {block[0]}')
+        if len(block) > 1:
+            command = block[1]
+            program = command.split()[0] if command.split() else '?'
+            report.append(f'    command: {program} ... ({len(command)} characters, elided)')
+        for line in block[2:]:
+            if line.strip():
+                report.append(f'    {line}')
+    if len(starts) > 3:
+        report.append(f'  ... and {len(starts) - 3} more, in the file named above')
+    return '\n'.join(report)
+
+
 def baseline_build(project: 'Project') -> float:
     """Build the project once, from the sources as they are.
 
@@ -392,7 +443,7 @@ def baseline_build(project: 'Project') -> float:
         logging.warning(
             'the project does not build as it stands, so every candidate will have to build it '
             'from nothing:\n%s',
-            (proc.stderr or proc.stdout)[-2000:],
+            build_failure_report(proc.stdout + proc.stderr, project.build_dir),
         )
     logging.info('the project builds from nothing in %.0f s on this machine', took)
     return took

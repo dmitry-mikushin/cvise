@@ -20,6 +20,7 @@ import pytest
 from cvise.utils.project import (
     ProjectError,
     baseline_build,
+    build_failure_report,
     configure,
     database_for,
     has_test,
@@ -662,3 +663,72 @@ class TestTheSharedTreeMovesWithTheReduction:
             job3, [(project.root, job3 / staged.name)], project.sources
         )
         assert [p.name for p in changed_after] == ['calc.cpp']
+
+
+class TestReadingABuildFailure:
+    """A report that hid the first failure was read four times and believed.
+
+    Every rebuild after a publish failed with `ar: <object>.o: No such file or
+    directory`, and because the report was the last 2000 characters of ninja's
+    output -- and one `ar` command for nine hundred objects is 25000 of them --
+    that line was all there was to see. It was taken to mean the objects had
+    vanished. Whether a compile had failed first could not be told from it at
+    all, because any such block was thousands of characters earlier.
+    """
+
+    LONG_AR = '/usr/sbin/ar qc lib.a ' + ' '.join(f'CMakeFiles/x.dir/f{i}.cpp.o' for i in range(900))
+
+    def two_failures(self):
+        return (
+            '[1/7] Building CXX object CMakeFiles/x.dir/a.cpp.o\n'
+            'FAILED: [code=1] CMakeFiles/x.dir/a.cpp.o\n'
+            '/usr/sbin/c++ -DFOO -c a.cpp -o a.cpp.o\n'
+            'a.cpp:12:5: error: something went wrong here\n'
+            'FAILED: [code=1] lib.a\n' + self.LONG_AR + '\n'
+            '/usr/sbin/ar: CMakeFiles/x.dir/f5.cpp.o: No such file or directory\n'
+            'ninja: build stopped: subcommand failed.\n'
+        )
+
+    def test_an_earlier_failure_is_not_hidden_by_a_later_one(self, tmp_path):
+        """The regression itself: the tail showed only the last block."""
+        report = build_failure_report(self.two_failures(), tmp_path)
+        assert '2 build step(s) failed' in report
+        assert 'a.cpp:12:5: error: something went wrong here' in report
+        assert 'No such file or directory' in report
+
+    def test_the_command_is_summarised_but_the_diagnostics_are_not(self, tmp_path):
+        report = build_failure_report(self.two_failures(), tmp_path)
+        assert self.LONG_AR not in report, 'the command body is the bulk and the least informative'
+        assert '/usr/sbin/ar ...' in report, 'but which program ran still matters'
+        assert f'({len(self.LONG_AR)} characters, elided)' in report
+        assert len(report) < 2000, f'still {len(report)} characters, which nobody reads'
+
+    def test_nothing_is_lost_by_summarising(self, tmp_path):
+        build_failure_report(self.two_failures(), tmp_path)
+        full = (tmp_path / 'cvise-last-build-failure.log').read_text()
+        assert self.LONG_AR in full
+        assert full == self.two_failures()
+
+    def test_a_failure_that_is_not_an_edge_is_reported_whole(self, tmp_path):
+        """ninja refusing to start says it in one line, and that line is all of it."""
+        output = (
+            "ninja: error: 'cpp/src/gone.cpp', needed by 'gone.cpp.o', "
+            'missing and no known rule to make it\n'
+        )
+        report = build_failure_report(output, tmp_path)
+        assert 'missing and no known rule to make it' in report
+
+    def test_it_says_how_many_it_did_not_show(self, tmp_path):
+        output = ''.join(
+            f'FAILED: [code=1] out{i}.o\n/usr/bin/cc -c in{i}.c\nin{i}.c:1:1: error: no\n'
+            for i in range(6)
+        )
+        report = build_failure_report(output, tmp_path)
+        assert '6 build step(s) failed' in report
+        assert 'and 3 more' in report
+
+    def test_an_unwritable_build_directory_does_not_lose_the_report(self, tmp_path):
+        """The diagnostic must survive the case where the diagnostic cannot be saved."""
+        report = build_failure_report(self.two_failures(), tmp_path / 'does' / 'not' / 'exist')
+        assert 'could not be written' in report
+        assert 'a.cpp:12:5: error: something went wrong here' in report
