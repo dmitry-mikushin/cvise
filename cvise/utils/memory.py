@@ -29,6 +29,7 @@ care how many jobs run underneath it.
 
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -239,29 +240,6 @@ def bound_or_warn(scratch=None) -> int | None:
     )
     return None
 
-    scratch = tempfile.gettempdir() if scratch is None else scratch
-    if not scratch_is_ram(scratch):
-        logging.info(
-            'no memory ceiling could be acquired, but the scratch space in %s is on %s rather '
-            'than in memory, so a reduction that outgrows it will fail rather than take the '
-            'machine with it',
-            scratch,
-            filesystem_of(scratch) or 'a filesystem of unknown kind',
-        )
-        return None
-
-    logging.warning(
-        'no memory ceiling could be acquired and the scratch space in %s is held in memory '
-        '(%s). Every job materialises the part of the build its candidate changed there, '
-        'including the linked binary, and those pages are not reclaimable and cannot be freed '
-        'by the OOM killer -- so a reduction that outgrows RAM will take the machine down '
-        'rather than fail. Either point TMPDIR at a disk, or run inside something that bounds '
-        'memory: a container with --memory, or systemd-run --user --scope -p MemoryMax=...',
-        scratch,
-        filesystem_of(scratch),
-    )
-    return None
-
 
 def current_cgroup() -> str:
     """The v2 path for this process, or '/' when it is in the root cgroup.
@@ -331,5 +309,66 @@ def total_ram() -> int:
     except OSError:
         pass
     return 0
+
+
+def main(argv=None) -> int:
+    """Run a command under the ceiling a reduction gives itself.
+
+        python3 -m cvise.utils.memory -- cmake --build /path/to/build
+
+    A reduction bounds itself and its children, so nothing it starts can take
+    the machine down. Everything started *beside* it -- a script written to
+    reproduce a defect, a build run by hand to check something -- has exactly
+    the same destructive power and none of that protection, and it is the
+    unprotected one that has actually killed this machine: nine concurrent
+    unbounded builds, each defaulting to one compiler per core, is two hundred
+    gigabytes of resident memory asked for at once.
+
+    On a machine with no swap and vm.overcommit_memory=1 that does not even
+    produce a diagnosable failure. Every allocation succeeds, reclaim has
+    nothing to reclaim because the pages are anonymous, and the machine
+    livelocks before anything can write down why. So this refuses to run
+    unbounded rather than warning about it: a warning does not stop a compiler
+    that has already been forked.
+
+    It bounds this process and then execs, so the command replaces it. There is
+    no wrapper left in the middle to swallow signals or to translate exit
+    statuses.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == '--':
+        argv = argv[1:]
+    if not argv:
+        print(main.__doc__.strip().splitlines()[0], file=sys.stderr)
+        print('usage: python3 -m cvise.utils.memory -- COMMAND [ARGS...]', file=sys.stderr)
+        return 2
+
+    logging.basicConfig(format='%(message)s', level=logging.INFO)
+
+    ram = total_ram()
+    existing = memory_ceiling()
+    if existing == UNKNOWN_CEILING or (existing is not None and (not ram or existing < ram)):
+        logging.info('already bounded; running %s', argv[0])
+        os.execvp(argv[0], argv)
+
+    budget = int(available_ram() * CEILING_FRACTION)
+    acquired = bound_this_process(budget) if budget > 0 else None
+    if not acquired:
+        logging.error(
+            'refusing to run %s: no memory ceiling could be acquired for it. Unbounded, a '
+            'parallel build on this machine can ask for more memory than it has, and with no '
+            'swap that is a machine that stops rather than a command that fails. Run it inside '
+            'something that bounds memory -- systemd-run --user --scope -p MemoryMax=..., or a '
+            'container with --memory.',
+            argv[0],
+        )
+        return 1
+
+    logging.info('bounded to %.1f GiB of memory; running %s', acquired / 2**30, argv[0])
+    os.execvp(argv[0], argv)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
 
 

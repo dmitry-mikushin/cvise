@@ -513,3 +513,72 @@ class TestStaleCgroups:
 
     def test_a_missing_parent_is_not_an_error(self, tmp_path):
         assert memory.sweep_stale_cgroups(tmp_path / 'nowhere') == 0
+
+
+class TestRunningSomethingElseUnderTheCeiling:
+    """The reduction bounds itself; everything run beside it did not.
+
+    This machine has been taken down by a throwaway script that started nine
+    parallel builds, each defaulting to one compiler per core -- around two
+    hundred gigabytes asked for at once, outside any cgroup. The reduction was
+    not even running at the time. So the ceiling has to be reachable by
+    anything that builds, not only by the reducer.
+    """
+
+    def run(self, *args):
+        return subprocess.run(
+            [sys.executable, '-m', 'cvise.utils.memory', *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_it_says_how_to_use_it_and_fails(self):
+        proc = self.run()
+        assert proc.returncode == 2
+        assert 'COMMAND' in proc.stderr
+
+    def test_the_command_replaces_it(self):
+        """Exec, not spawn: no wrapper left to swallow a signal or an exit code."""
+        proc = self.run('--', sys.executable, '-c', 'import sys; sys.exit(7)')
+        assert proc.returncode == 7
+
+    def test_the_command_really_is_bounded(self):
+        """The proof has to come from the command, not from the announcement."""
+        proc = self.run(
+            '--',
+            sys.executable,
+            '-c',
+            'from cvise.utils import memory; print(memory.memory_ceiling())',
+        )
+        assert proc.returncode == 0
+        ceiling = int(proc.stdout.strip())
+        assert ceiling != memory.UNKNOWN_CEILING
+        # A "ceiling" at or above what the machine has bounds nothing at all.
+        total = memory.total_ram()
+        if total:
+            assert ceiling < total
+
+    def test_a_ceiling_that_is_already_there_is_not_replaced(self):
+        """Nesting must not lower the bound, or a nested build gets less than it was given."""
+        proc = self.run(
+            '--',
+            sys.executable,
+            '-m',
+            'cvise.utils.memory',
+            '--',
+            sys.executable,
+            '-c',
+            'print("ran")',
+        )
+        assert proc.returncode == 0
+        assert 'ran' in proc.stdout
+        assert 'already bounded' in proc.stderr
+
+    def test_it_refuses_rather_than_warns_when_it_cannot_bound(self):
+        """A warning does not stop a compiler that has already been forked."""
+        with (
+            patch.object(memory, 'memory_ceiling', return_value=None),
+            patch.object(memory, 'total_ram', return_value=1 << 40),
+            patch.object(memory, 'bound_this_process', return_value=None),
+        ):
+            assert memory.main(['--', 'true']) == 1
