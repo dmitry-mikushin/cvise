@@ -57,11 +57,15 @@ WHAT MAKES A CANDIDATE INTERESTING
     tests." and exits ZERO -- and the test's own definition is marked
     CVISE_NOREDUCE so a candidate that empties it is refused before it is built.
 
-    The older harness used a different oracle: the canonical sha256 that
-    canonical_parity_test.cpp prints for a fixture, which is the same oracle the
-    corpus ledger uses. That one answers "which code produces this output"; this
-    one answers "which code this test needs". Both are legitimate; they are not
-    the same question, and mixing them would give an answer to neither.
+    The question underneath is which code produces the output. This asks it
+    through a test, so what survives is what the test pins -- an approximation,
+    and the assumption it rests on is worth stating: the test must assert enough
+    that code which changes the output makes it fail. Where it asserts less,
+    code producing the unasserted part is free to go and the surviving set comes
+    out smaller than the truth. The older harness asked the same question
+    directly, through the canonical sha256 that canonical_parity_test.cpp prints
+    and the corpus ledger uses. A named test is the cheaper vehicle for it, and
+    that assumption is what it costs.
 """
 
 import argparse
