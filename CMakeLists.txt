@@ -244,6 +244,15 @@ configure_file(
   @ONLY
 )
 
+# The ns-projection reduction. It takes no options about how to build or where
+# to work, because for that project each of those has one right answer and
+# every wrong one still produces a run that finishes and prints a percentage.
+configure_file(
+  "${PROJECT_SOURCE_DIR}/cvise-ns-projection.py"
+  "${PROJECT_BINARY_DIR}/cvise-ns-projection.py"
+  @ONLY
+)
+
 configure_file(
   "${PROJECT_SOURCE_DIR}/cvise/utils/externalprograms.py"
   "${PROJECT_BINARY_DIR}/cvise/utils/externalprograms.py"
@@ -283,6 +292,11 @@ configure_file(
 install(PROGRAMS "${PROJECT_BINARY_DIR}/cvise-cli.py"
   DESTINATION "${CMAKE_INSTALL_BINDIR}"
   RENAME "cvise"
+)
+
+install(PROGRAMS "${PROJECT_BINARY_DIR}/cvise-ns-projection.py"
+  DESTINATION "${CMAKE_INSTALL_BINDIR}"
+  RENAME "cvise-ns-projection"
 )
 
 
