@@ -4,6 +4,7 @@
 #include <string>
 
 #include "EraseNamespace.h"
+#include "ListDefinitions.h"
 #include "RemoveFunction.h"
 #include "ReplaceFunctionDefWithDecl.h"
 #include "Transformation.h"
@@ -15,5 +16,7 @@ std::unique_ptr<Transformation> createTransformation(const std::string &Name) {
     return std::make_unique<NamespaceEraser>();
   if (Name == "remove-function")
     return std::make_unique<FunctionRemover>();
+  if (Name == "list-definitions")
+    return std::make_unique<DefinitionLister>();
   return nullptr;
 }

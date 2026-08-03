@@ -3,91 +3,152 @@
 A reduction is graded by one question -- does the interestingness test still
 pass -- and that makes the test itself the one thing it must not be free to
 edit. Deleting the test outright is caught by the test command: an exact ctest
-filter that matches nothing is an error. Hollowing it out is not caught by
-anything, because a test whose assertions have been removed still passes, so a
-reducer that empties it has found a candidate that satisfies every check and
-means nothing. Everything after that point reduces against a criterion that is
-no longer there, and the run does not fail -- it succeeds, spectacularly, at
+filter that matches nothing is an error. Hollowing it out is caught by nothing,
+because a test whose assertions have been removed still compiles, still
+registers and still passes. MEASURED on ns-projection, each with a real build:
+
+    intact      ctest: PASSED
+    hollowed    ctest: PASSED      <- and it never could tell
+    deleted     ctest: refused (exit 8)
+
+Everything reduced after such a candidate is measured against a criterion that
+is no longer there, and the run does not fail. It succeeds, spectacularly, at
 producing an answer about nothing.
 
-So the protection has to be expressed somewhere, and there is only one place it
-can honestly live. Not in a command-line flag naming files to skip: the whole
-of this program's interface is that CMake already knows which files there are,
-and any second list is a second answer that can disagree with the build. Not in
-per-pass cooperation either: that is only as strong as the pass that forgets,
-and a pass that forgets does not fail loudly, it quietly produces a candidate
-that looks like progress.
+So the protection has to be written down somewhere, and there is only one place
+it can honestly live. Not in a flag naming files to skip: the whole interface
+of this program is that CMake already knows which files there are, and a second
+list is a second answer that can disagree with the build. Not in per-pass
+cooperation either -- that is only as strong as the pass that forgets, and a
+pass that forgets does not fail loudly, it produces a candidate that looks like
+progress.
 
-It lives in the source, next to what it protects, and it is enforced by
-comparison rather than by cooperation. A marked region is read out of the file
-the candidate was made from and out of the file the candidate is, and if the
-two do not match, the candidate never gets built. No pass is asked for
-anything, so no pass can forget; and because the regions are read afresh from
-each text, there are no stored offsets to go stale as the file around them
+It lives in the source, on the definition it protects:
+
+    CVISE_NOREDUCE
+    void IngestTest_ParsesRepresentativeRequestJson_Test::TestBody() { ... }
+
+which the project defines as [[clang::annotate("cvise::noreduce")]], or as
+nothing under compilers that have no such attribute. Either spelling is fine
+here, because what is read is the source and not the preprocessed translation
+unit.
+
+It has to go on a definition written out rather than on TEST(suite, name),
+which has nowhere to put it. MEASURED, both compilers, both placements:
+
+    after TEST(a,b)   g++   attributes are not allowed on a function-definition
+                      clang 'clang::annotate' cannot be applied to types
+    before TEST(a,b)  g++   expected unqualified-id before 'static_assert'
+                      clang an attribute list cannot appear here
+
+The macro expands to a class, a registration and an out-of-line TestBody(), and
+begins with a static_assert, so there is no attributable declaration at either
+end. Written out, the last of the three is an ordinary function definition and
+takes an attribute like any other.
+
+How far the definition reaches is asked of the parser, not counted in braces:
+braces inside strings, character literals, raw strings and comments are not
+braces, and the input here is by construction half-destroyed source. The marker
+falls inside the node the parser reports, so removing the marker is itself a
+change to the protected text and is refused like any other.
+
+Nothing is remembered between generations. The regions are read afresh out of
+each text, so there are no stored offsets to go stale as the file around them
 shrinks.
-
-The markers are comments, and paired:
-
-    // cvise noreduce begin
-    TEST(IngestTest, ParsesRepresentativeRequestJson) { ... }
-    // cvise noreduce end
-
-Not a C++ attribute, for a reason that is specific rather than stylistic: the
-thing most worth protecting is a GoogleTest TEST(), which expands to a member
-function definition with no syntactic room to attach an attribute to. And not
-a single marker covering "the next declaration" either, because finding where
-that declaration ends requires parsing, and the input here is by construction
-half-destroyed source that a parser may no longer accept. Two comments need no
-parser and are exact on any text at all.
-
-The markers are inside the region they open and close, so deleting one is
-itself a change to the protected text, and is refused like any other.
 """
 
-OPEN = 'cvise noreduce begin'
-CLOSE = 'cvise noreduce end'
+import functools
+import json
+import logging
+import subprocess
+from pathlib import Path
+
+from cvise.utils.externalprograms import find_external_programs
+
+
+MARKER = 'CVISE_NOREDUCE'
+
+
+@functools.cache
+def _lister() -> str | None:
+    return find_external_programs().get('treesitter_delta')
+
+
+def _marks(line: str) -> bool:
+    """Is this line the marker, rather than prose or a definition of it?
+
+    A use starts the line. Prose that merely names the marker -- a comment
+    explaining why it is there, this docstring, the header that defines it --
+    does not, and must not count: a mention inside a definition would otherwise
+    protect something nobody meant to protect, and a mention in the defining
+    header would refuse every candidate touching it forever.
+    """
+    return line.lstrip().startswith(MARKER)
 
 
 def has_protection(text: str) -> bool:
-    """Cheap enough to ask about every file of every candidate."""
-    return OPEN in text
+    """Is the marker used here, as opposed to mentioned or defined here?"""
+    return any(_marks(line) for line in text.splitlines())
 
 
-def protected_regions(text: str) -> list[str]:
-    """The protected passages themselves, in order, markers included.
+def protected_regions(path: Path) -> list[str] | None:
+    """The text of each marked definition, or None if that cannot be determined.
 
-    Their content is returned rather than their offsets because offsets are not
-    comparable between two different versions of a file: a pass that deletes a
-    function above a protected region moves it, and moving it is allowed. What
-    must not change is what it says.
+    None is not "nothing is protected". It is "this file says something is
+    protected and I could not work out what", which has to be refused rather
+    than waved through -- the whole point is that a silent failure here looks
+    like a very good reduction.
     """
-    regions: list[str] = []
-    lines = text.splitlines(keepends=True)
-    start = None
-    position = 0
-    offsets = []
-    for line in lines:
-        offsets.append(position)
-        position += len(line)
-    offsets.append(position)
+    try:
+        text = Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    if not has_protection(text):
+        return []
 
-    for index, line in enumerate(lines):
-        if start is None:
-            if OPEN in line:
-                start = index
-        elif CLOSE in line:
-            regions.append(text[offsets[start] : offsets[index + 1]])
-            start = None
-    if start is not None:
-        # An unterminated marker protects the rest of the file. The alternative
-        # is to protect nothing, which turns a typo into a silently unguarded
-        # criterion -- the exact failure this exists to prevent.
-        regions.append(text[offsets[start] :])
+    lister = _lister()
+    if lister is None:
+        logging.warning('%s marks a definition not to be reduced, but treesitter_delta '
+                        'is not available to find how far it reaches', path)
+        return None
+    try:
+        proc = subprocess.run(
+            [lister, 'list-definitions', str(path)], capture_output=True, text=True
+        )
+    except OSError as e:
+        # Refused rather than raised: this runs in a worker judging a candidate,
+        # and an exception here would be reported as the candidate being
+        # undecided rather than as the guard being unable to do its job.
+        logging.warning('cannot run %s to find the protected definition in %s: %s',
+                        lister, path, e)
+        return None
+    if proc.returncode != 0:
+        return None
+
+    regions = []
+    for line in proc.stdout.splitlines():
+        if not line.startswith('{'):
+            continue  # the vocabulary line, which this transformation does not use
+        try:
+            span = json.loads(line)
+        except ValueError:
+            return None
+        chunk = text[span['l'] : span['r']]
+        if has_protection(chunk):
+            regions.append(chunk)
+    if not regions:
+        # Marked, but the marker is not inside any definition: either it was put
+        # somewhere that is not one, or the file no longer parses far enough to
+        # say. Both are reasons to stop, not to continue unguarded.
+        return None
     return regions
 
 
-def disturbed(before: str, after: str) -> bool:
-    """Did the candidate change anything it was not allowed to change?"""
-    if not has_protection(before):
+def disturbed(before: Path, after: Path) -> bool:
+    """Did the candidate change something it was not allowed to change?"""
+    original = protected_regions(before)
+    if original is None:
+        return True
+    if not original:
         return False
-    return protected_regions(before) != protected_regions(after)
+    return protected_regions(after) != original

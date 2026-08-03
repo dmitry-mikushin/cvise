@@ -153,13 +153,8 @@ def protected_rejection(changed, delta):
     """
     for original in changed:
         produced = Path(delta) / str(original).lstrip('/')
-        try:
-            before = Path(original).read_text()
-            after = produced.read_text()
-        except (OSError, UnicodeDecodeError):
-            continue  # nothing carrying a marker is unreadable or binary
-        if noreduce.disturbed(before, after):
-            return 1, b'', f'rejected: {original} has a region marked not to be reduced\n'.encode()
+        if noreduce.disturbed(Path(original), produced):
+            return 1, b'', f'rejected: {original} has a definition marked not to be reduced\n'.encode()
     return None
 
 
