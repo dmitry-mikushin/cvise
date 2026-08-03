@@ -538,6 +538,27 @@ def do_reduce(args):
 
         assert args.interestingness_test
 
+        def adopt_new_best():
+            """Move the tree every job reads through to the reduction's new state.
+
+            A job's delta holds what differs between its candidate and the
+            project, and the project only learned the answer at the very end --
+            so after the first accepted reduction the difference was the whole
+            reduction, not the candidate. MEASURED on ns-projection: 1246 of
+            1340 files in every delta, a full rebuild for every candidate,
+            gigabytes of scratch, and a candidate that had to be valid in 1246
+            places at once to be accepted.
+
+            Publishing here costs one build of what actually changed, once per
+            accepted reduction, and those are rare. It also means the answer is
+            on disk continuously rather than only when the run ends tidily --
+            which, after a run was lost to a rebuild of C-Vise underneath it, is
+            not a small thing.
+            """
+            written = project_utils.publish(project, staged)
+            logging.info('%d files written back; rebuilding what the jobs read', written)
+            project_utils.baseline_build(project)
+
         # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
         # Preloading is used as a speedup, so that every worker doesn't need to execute all import statements on startup.
         multiprocessing.set_start_method('forkserver')
@@ -573,6 +594,7 @@ def do_reduce(args):
             overlay_build_dir=project.build_dir,
             overlay_files=project.sources,
             launch_dir=launch_dir,
+            on_new_best=adopt_new_best,
         ) as test_manager:
             reducer = CVise(test_manager, args.skip_interestingness_test_check)
 

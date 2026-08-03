@@ -572,6 +572,7 @@ class TestManager:
         overlay_build_dir=None,
         overlay_files=None,
         launch_dir=None,
+        on_new_best=None,
     ):
         self.test_script: Path = test_script.absolute()
         self.timeout = timeout
@@ -592,6 +593,9 @@ class TestManager:
         self.overlay_root = overlay_root
         self.overlay_build_dir = overlay_build_dir
         self.overlay_files = overlay_files
+        # Called with no arguments each time a smaller test case is adopted, so
+        # that whatever the jobs read through can be moved along with it.
+        self.on_new_best = on_new_best
         self.launch_dir = Path(launch_dir) if launch_dir else Path.cwd()
         self.undecided_count = 0
         self.undecided_in_pass = 0
@@ -1305,6 +1309,22 @@ class TestManager:
             raise RuntimeError(
                 f"Can't find {self.current_test_case} -- did your interestingness test move it?"
             ) from None
+
+        # The reduction has moved, and whatever the jobs read through has to move
+        # with it. This is the one moment when that is safe: run_parallel_tests
+        # cancels and releases every job before returning, and the next batch
+        # begins by asserting there are none, so nothing is reading the shared
+        # tree right now.
+        #
+        # MEASURED on ns-projection, without this: after two accepted
+        # reductions the staged tree and the project differed in 1246 of 1340
+        # files, so every job copied all 1246 into its own delta with fresh
+        # timestamps and rebuilt the whole project for every candidate. The
+        # baseline build became worthless, the deltas grew to gigabytes, and a
+        # candidate had to be valid in 1246 places at once to be accepted at
+        # all.
+        if self.on_new_best is not None:
+            self.on_new_best()
 
         # Update global stats.
         if isinstance(self.success_candidate.pass_state, FoldingStateOut):

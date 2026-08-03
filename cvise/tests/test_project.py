@@ -599,3 +599,66 @@ class TestTheBaselineIsTimed:
         (root / 'src' / 'calc.cpp').write_text('this is not C++\n')
         project = configure(root / 'CMakeLists.txt', tmp_path / 'build')
         assert baseline_build(project) > 0
+
+
+class TestTheSharedTreeMovesWithTheReduction:
+    """What a job reads through has to be the current best, not the original.
+
+    A job's delta holds what differs between its candidate and the project. If
+    the project only learns the answer when the run ends, then after the first
+    accepted reduction that difference is the whole reduction rather than the
+    candidate -- and every job copies all of it, with fresh timestamps, and
+    rebuilds the project from scratch to judge one small change.
+
+    MEASURED on ns-projection: 1246 of 1340 files in every delta, gigabytes of
+    scratch, and a candidate that had to be valid in 1246 places at once.
+    """
+
+    def test_publishing_makes_the_next_delta_small_again(self, tmp_path):
+        from cvise.utils import overlay
+
+        root = tmp_path / 'project'
+        write_project(root)
+        project = configure(root / 'CMakeLists.txt', tmp_path / 'build')
+        staged = stage(project, tmp_path / 'staged')
+
+        # A reduction is accepted: the staged tree moves, the project does not.
+        for path in sorted(staged.rglob('*')):
+            if path.is_file():
+                path.write_text(path.read_text().replace('\n', '\n'))
+        (staged / 'src' / 'calc.cpp').write_text('int calc() { return 42; }\n')
+        (staged / 'src' / 'main.cpp').write_text('int main() {}\n')
+
+        job = tmp_path / 'before'
+        job.mkdir()
+        copy = job / staged.name
+        shutil.copytree(staged, copy)
+        _, changed_before = overlay.prepare_job_delta(
+            job, [(project.root, copy)], project.sources
+        )
+        assert len(changed_before) >= 2, 'the reduction did not move at all'
+
+        # Now the project is told, which is what this is about.
+        publish(project, staged)
+
+        job2 = tmp_path / 'after'
+        job2.mkdir()
+        copy2 = job2 / staged.name
+        shutil.copytree(staged, copy2)
+        _, unchanged_after = overlay.prepare_job_delta(
+            job2, [(project.root, copy2)], project.sources
+        )
+        assert unchanged_after == [], (
+            'a candidate that changed nothing still carried the whole reduction: '
+            f'{[p.name for p in unchanged_after]}'
+        )
+
+        # And a candidate that does change something carries only that.
+        (copy2 / 'src' / 'calc.cpp').write_text('int calc() { return 1; }\n')
+        job3 = tmp_path / 'after2'
+        job3.mkdir()
+        shutil.copytree(copy2, job3 / staged.name)
+        _, changed_after = overlay.prepare_job_delta(
+            job3, [(project.root, job3 / staged.name)], project.sources
+        )
+        assert [p.name for p in changed_after] == ['calc.cpp']
