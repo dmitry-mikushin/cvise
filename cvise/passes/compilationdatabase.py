@@ -34,6 +34,24 @@ from cvise.utils.hint import Hint, HintBundle
 
 FILEREF = b'@fileref'
 
+DATABASE_NAME = 'compile_commands.json'
+
+
+def database_file(given: str) -> Path:
+    """The database itself, whether the build directory or the file was named.
+
+    Both are correct, because both are what --compilation-database means:
+    clang_delta says so in its own help -- "give the file or the build directory
+    holding it" -- and accepts either. This pass read the value as a file and
+    nothing else, so with the directory form it raised IsADirectoryError, logged
+    a line nobody was watching for, and reported that the build refers to no
+    files at all. MEASURED on the same database: 1 hint given the file, 0 given
+    the directory. Zero is not a small error here -- it is the whole pass, and
+    what comes back is every round proposing to delete every translation unit.
+    """
+    path = Path(given)
+    return path / DATABASE_NAME if path.is_dir() else path
+
 
 class CompilationDatabasePass(HintBasedPass):
     """Reports every file the build compiles as referred-to, and nothing else.
@@ -59,13 +77,14 @@ class CompilationDatabasePass(HintBasedPass):
     def generate_hints(self, test_case: Path, *args, **kwargs):
         if not self._compilation_database or not test_case.is_dir():
             return HintBundle(hints=[])
+        database = database_file(self._compilation_database)
         try:
-            entries = json.loads(Path(self._compilation_database).read_text())
+            entries = json.loads(database.read_text())
         except (OSError, json.JSONDecodeError) as e:
-            # The database is C-Vise's own and is written before any pass runs,
-            # so this cannot happen quietly; say so rather than silently going
-            # back to proposing deletions that cannot work.
-            logging.warning('cannot read %s: %s', self._compilation_database, e)
+            # The database is what the build wrote and is read before any pass
+            # runs, so this cannot happen quietly; say so rather than silently
+            # going back to proposing deletions that cannot work.
+            logging.warning('cannot read %s: %s', database, e)
             return HintBundle(hints=[])
 
         vocabulary: list[bytes] = [FILEREF]

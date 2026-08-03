@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from cvise.passes.compilationdatabase import FILEREF, CompilationDatabasePass
+from cvise.passes.compilationdatabase import FILEREF, CompilationDatabasePass, database_file
 from cvise.utils.project import configure, database_for, stage
 
 pytestmark = pytest.mark.skipif(
@@ -129,3 +129,43 @@ class TestItProposesNothingItself:
         pass_ = CompilationDatabasePass(arg=None, external_programs={}, compilation_database=None)
         assert pass_.output_hint_types() == [FILEREF]
         assert all(t.startswith(b'@') for t in pass_.output_hint_types())
+
+
+class TestEitherWayOfNamingTheDatabase:
+    """--compilation-database means the file OR the build directory holding it.
+
+    clang_delta says exactly that in its own help and accepts either, so the
+    directory form is not a misuse -- it is what the harness that drives this
+    passes, because that is what clang_delta wants. Reading the value as a file
+    and nothing else made the directory form raise IsADirectoryError, log a line
+    nobody was watching for, and report that the build refers to no files at
+    all. MEASURED on one database: 1 hint given the file, 0 given the directory,
+    and 0 means every round proposing to delete every translation unit.
+    """
+
+    def test_the_file_is_accepted(self, tmp_path):
+        _, staged, database = a_project(tmp_path)
+        assert referenced(database, staged)
+
+    def test_the_build_directory_is_accepted_too(self, tmp_path):
+        _, staged, database = a_project(tmp_path)
+        assert referenced(database.parent, staged), (
+            'the directory form claimed nothing, so every translation unit is '
+            'proposed for deletion every round'
+        )
+
+    def test_both_answer_the_same(self, tmp_path):
+        _, staged, database = a_project(tmp_path)
+        assert referenced(database, staged) == referenced(database.parent, staged)
+
+    def test_which_file_each_form_resolves_to(self, tmp_path):
+        database = tmp_path / 'compile_commands.json'
+        database.write_text('[]')
+        assert database_file(str(database)) == database
+        assert database_file(str(tmp_path)) == database
+
+    def test_a_path_that_is_neither_is_left_to_fail_where_it_is_read(self, tmp_path):
+        """Not turned into a directory guess: the caller named a file that is
+        missing, and saying so about that name is the useful diagnostic."""
+        missing = tmp_path / 'nowhere.json'
+        assert database_file(str(missing)) == missing
