@@ -895,3 +895,28 @@ class TestConfiguringIsNotReducing:
         cmakelists = self.two_part_project(tmp_path / 'project')
         with pytest.raises(ProjectError, match='nothing is under it'):
             configure(cmakelists, tmp_path / 'build', under='no/such/place')
+
+
+class TestTheCheckBuildsTheSameThingTheBaselineDid:
+    """A check that builds more than the baseline judges candidates on code the
+    criterion never touches.
+
+    MEASURED: the baseline built the test's target in 130 s and succeeded, then
+    the sanity check of the UNTOUCHED tree failed, because it built the default
+    target and a component of that does not compile. Every candidate would have
+    failed the same way for the same irrelevant reason.
+    """
+
+    def test_the_target_reaches_the_generated_script(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        script = check_script(project, 'runs', tmp_path / 'check.sh', 'prog')
+        text = script.read_text()
+        assert '--target prog' in text, text
+
+    def test_without_a_target_it_builds_what_it_always_did(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        text = check_script(project, 'runs', tmp_path / 'check.sh').read_text()
+        assert '--target' not in text
+        assert 'cmake --build' in text

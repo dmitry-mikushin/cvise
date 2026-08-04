@@ -39,11 +39,30 @@ WHY A GIT WORKTREE PINNED TO HEAD
     criterion is that pin's behaviour, so continuing against a moved HEAD would
     grade the reduced tree by a different oracle.
 
-WHY THE STATE IS IN /tmp
-    It is a tmpfs sized for this. The build directory is written and read
+WHY THE STATE IS IN /dev/shm AND NOT /tmp
+    Both are tmpfs, and only one of them is for this. /tmp here is deliberately
+    sized at 16 GiB, for programs' own scratch; /dev/shm is 126 GiB. Dozens of
+    jobs each holding a build directory do not fit in the first and would starve
+    everything else that legitimately uses it.
+
+    In memory either way, because a build directory is written and read
     constantly and has no reason to touch a disk. Durability is not a reason to
     leave: the worktree is a git worktree, so what survives a reboot is what has
     been committed.
+
+WHY ccache IS GIVEN A DIRECTORY OF ITS OWN
+    The project's preset drives the compiler through ccache, and the image sets
+    CCACHE_DIR to /src/.ccache -- inside the tree being reduced, which is the
+    overlay's root. Every write then goes to the job's own delta, so ccache
+    creates the whole chain of directories afresh for each object it stores:
+    MEASURED, nine mkdir calls where an ordinary filesystem needs none, times
+    81 jobs times every compiler invocation. A system-wide profile put 62% of
+    the machine in ccache doing mkdir, 43% of all cycles in mkdir alone, and
+    3.6% in anything useful.
+
+    The cache was also worthless there: a delta belongs to one candidate and is
+    thrown away with it, so nothing stored in it can ever be read back. Moved
+    outside the overlay it is shared by every job and can actually hit.
 
 WHAT MAKES A CANDIDATE INTERESTING
     That the project builds and one named ctest test still passes. The test is
@@ -181,7 +200,7 @@ def remove_state(root: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('name', nargs='?', default='ns-projection',
-                        help='run label; state lives in /tmp/cvise-<name>')
+                        help='run label; state lives in /dev/shm/cvise-<name>')
     parser.add_argument('--jobs', type=int, help='override the derived job count')
     parser.add_argument('--resume', action='store_true',
                         help='continue on the worktree as C-Vise left it')
@@ -200,12 +219,12 @@ def main() -> int:
     check_image()
     repo, submodule = find_repo()
 
-    root = Path(f'/tmp/cvise-{args.name}')
+    root = Path(f'/dev/shm/cvise-{args.name}')
     if args.fresh:
         remove_state(root)
         subprocess.run(['git', '-C', str(submodule), 'worktree', 'prune'], capture_output=True)
-    worktree, tmp = root / 'ns-projection', root / 'tmp'
-    for directory in (root, tmp):
+    worktree, tmp, ccache = root / 'ns-projection', root / 'tmp', root / 'ccache'
+    for directory in (root, tmp, ccache):
         directory.mkdir(parents=True, exist_ok=True)
 
     print('=== cvise ns-projection reduction')
@@ -230,6 +249,10 @@ def main() -> int:
         # down about where it put things is true outside the container too.
         '-v', f'{root}:{root}',
         '-e', f'TMPDIR={tmp}',
+        # Outside the overlay root, so ccache writes once to a shared cache
+        # instead of rebuilding its directory tree inside every job's delta.
+        '-e', f'CCACHE_DIR={ccache}',
+        '-e', 'CCACHE_MAXSIZE=20G',
         '-w', SRC, IMAGE,
         # Configured from the root, because that is the only configuration in
         # which this component's tests exist at all -- cpp/test asks whether
