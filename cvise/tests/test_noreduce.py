@@ -235,3 +235,73 @@ class TestTheCandidateIsRefusedBeforeAnythingIsSpent:
         candidate.parent.mkdir(parents=True)
         candidate.write_bytes(b'\x00')
         assert protected_rejection([(original, candidate)]) is None
+
+
+class TestAMarkerThatDoesNothingSaysSo:
+    """The guard's own silent-no-op, which is the failure it exists to prevent.
+
+    A marker only counts when it begins its line. Written in prose, or indented
+    by an editor, it protects nothing -- and a file with an inert marker is
+    indistinguishable from one that never asked for a guard.
+    """
+
+    def test_an_indented_marker_still_protects(self, tmp_path, caplog):
+        """Indentation is not prose: a marker is recognised by what its line
+        begins with once stripped, so an editor reindenting it changes nothing."""
+        indented = GUARDED.replace('CVISE_NOREDUCE\n', '        CVISE_NOREDUCE\n')
+        path = write(tmp_path, 'g.cpp', indented)
+        noreduce.marked_files.cache_clear()
+        with caplog.at_level('WARNING'):
+            assert noreduce.marked_files(str(path.parent)) == (str(path),)
+        assert not caplog.records, 'warned about a marker that does work'
+
+    def test_prose_naming_the_marker_warns_too(self, tmp_path, caplog):
+        prose = '// see CVISE_NOREDUCE for why\nint f() { return 1; }\n'
+        path = write(tmp_path, 'p.cpp', prose)
+        noreduce.marked_files.cache_clear()
+        with caplog.at_level('WARNING'):
+            assert noreduce.marked_files(str(path.parent)) == ()
+        assert caplog.records, 'an inert marker went unmentioned'
+
+    def test_a_file_with_no_marker_at_all_is_silent(self, tmp_path, caplog):
+        path = write(tmp_path, 'q.cpp', 'int f() { return 1; }\n')
+        noreduce.marked_files.cache_clear()
+        with caplog.at_level('WARNING'):
+            assert noreduce.marked_files(str(path.parent)) == ()
+        assert not caplog.records, 'warned about a file that never mentioned the marker'
+
+
+class TestTheGuardCannotBeSwitchedOffQuietly:
+    """Ways the comparison could become vacuous without anyone noticing."""
+
+    def test_comparing_a_tree_with_itself_is_refused(self, tmp_path):
+        """Under python -O the assertion that keeps test cases relative is gone,
+        and `folder / absolute` is the absolute path, so a job would compare the
+        original against itself and agree with everything."""
+        root = tmp_path / 'src'
+        root.mkdir()
+        (root / 'g.cpp').write_text(GUARDED)
+        with pytest.raises(ValueError, match='against itself'):
+            noreduce.violation(root, root)
+
+    def test_an_absolute_test_case_is_refused_where_it_is_copied(self, tmp_path):
+        from cvise.utils import fileutil
+
+        source = tmp_path / 'abs.cpp'
+        source.write_text('int f() { return 1; }\n')
+        with pytest.raises(ValueError, match='relative to the working directory'):
+            fileutil.copy_test_case(source, tmp_path / 'job')
+
+    def test_an_unreadable_original_is_refused_not_ignored(self, tmp_path):
+        """Answering "nothing is protected" for a file nobody could read is the
+        one answer that must never be given on a guess."""
+        import os
+
+        original = write(tmp_path / 'a', 'g.cpp', GUARDED)
+        os.chmod(original, 0)
+        try:
+            if os.access(original, os.R_OK):
+                pytest.skip('running as a user that ignores file modes')
+            assert noreduce.protected_regions(original) is None
+        finally:
+            os.chmod(original, 0o644)

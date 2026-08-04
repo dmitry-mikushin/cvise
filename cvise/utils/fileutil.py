@@ -172,7 +172,13 @@ def copy_test_case(source: Path, destination_parent: Path) -> None:
     first candidate with FileNotFoundError, because copy2 will not create the
     parent it is copying into.
     """
-    assert not source.is_absolute()
+    if source.is_absolute():
+        # Not an assert: assertions vanish under -O, and this one is load-bearing.
+        # `destination_parent / source` with an absolute source yields the source
+        # itself, so the job would "copy" the test case onto itself, every job
+        # would share one tree, and the guard that compares a candidate against
+        # its original would compare a file with itself and always agree.
+        raise ValueError(f'a test case is named relative to the working directory, not {source}')
     destination = destination_parent / source
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_dir():

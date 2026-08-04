@@ -98,9 +98,21 @@ def configure(cmakelists: Path, build_dir: Path) -> Project:
     )
     database = build_dir / 'compile_commands.json'
     if not database.is_file():
+        # Written out whole, not tailed. A CMake failure says what it could not
+        # find in its first lines and spends the rest listing what it tried, so
+        # the end of the output is the least informative part of it.
+        whole = build_dir / 'cvise-configure-failure.log'
+        try:
+            whole.write_text(proc.stdout + proc.stderr)
+            where = f'the whole output is in {whole}'
+        except OSError:
+            where = '(the output could not be written out)'
         raise ProjectError(
-            f'CMake produced no compile_commands.json for {cmakelists}:\n'
-            + (proc.stderr or proc.stdout)[-2000:]
+            f'CMake produced no compile_commands.json for {cmakelists}; {where}\n'
+            + '\n'.join(
+                line for line in (proc.stderr or proc.stdout).splitlines()
+                if 'Error' in line or 'error' in line
+            )[:2000]
         )
 
     translation_units = sources_from(database, root)
@@ -511,6 +523,15 @@ def open_jobserver(path: Path, tokens: int) -> int:
     os.mkfifo(path, 0o600)
     # O_RDWR so that the pool never sees end-of-file when no build holds it.
     fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    if tokens < 1:
+        # Asked for as many jobs as the machine has cores, so nothing is left
+        # over to share. Every build then runs on its own implicit token alone
+        # and the pool stops being one; quietly rounding up to a single token
+        # would look like a pool and behave like a queue.
+        logging.warning(
+            'the job count leaves no cores for the shared build pool, so every candidate '
+            'builds one file at a time. Ask for fewer jobs than the machine has cores.'
+        )
     os.write(fd, b'x' * max(1, tokens))
     logging.info('%d build tokens for every candidate to share', max(1, tokens))
     return fd

@@ -60,6 +60,8 @@ shrinks.
 import functools
 import json
 import logging
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -71,7 +73,21 @@ MARKER = 'CVISE_NOREDUCE'
 
 @functools.cache
 def _lister() -> str | None:
-    return find_external_programs().get('treesitter_delta')
+    """Where treesitter_delta actually is, or None if it is nowhere.
+
+    find_external_programs() seeds its map with the bare program name and
+    replaces it only when it finds the file, so a missing tool comes back as
+    the string 'treesitter_delta' rather than as None. Believing that string is
+    what made the "not available" path below unreachable: absence turned into
+    an OSError inside a worker and was reported as the user's test case being
+    insane.
+    """
+    found = find_external_programs().get('treesitter_delta')
+    if not found:
+        return None
+    if os.path.isabs(found):
+        return found if os.path.exists(found) else None
+    return shutil.which(found)
 
 
 def _marks(line: str) -> bool:
@@ -99,10 +115,20 @@ def protected_regions(path: Path) -> list[str] | None:
     than waved through -- the whole point is that a silent failure here looks
     like a very good reduction.
     """
+    path = Path(path)
     try:
-        text = Path(path).read_text()
-    except (OSError, UnicodeDecodeError):
+        text = path.read_text()
+    except FileNotFoundError:
+        # A candidate may legitimately not have a file the original had. That
+        # protects nothing, which differs from the original and is refused by
+        # the comparison rather than here.
         return []
+    except (OSError, UnicodeDecodeError):
+        # Not the same thing at all: the file is there and cannot be read.
+        # Answering "nothing is protected" would hand the reduction exactly the
+        # permission this module exists to withhold.
+        logging.warning('cannot read %s to find out what it protects', path)
+        return None
     if not has_protection(text):
         return []
 
@@ -156,9 +182,32 @@ def disturbed(before: Path, after: Path) -> bool:
 
 def _uses_marker(path: Path) -> bool:
     try:
-        return has_protection(path.read_text())
-    except (OSError, UnicodeDecodeError):
+        text = path.read_text()
+    except UnicodeDecodeError:
+        # Binary. A marker is a line of ASCII in a source file, so this one
+        # carries none, and saying so is not a guess.
         return False
+    except OSError as e:
+        # Cannot tell. Counting it as unmarked would answer "nothing is
+        # protected here" for a file nobody could read, which is the one answer
+        # that must never be given on a guess.
+        logging.warning('cannot read %s; treating it as protected because it '
+                        'cannot be shown otherwise: %s', path, e)
+        return True
+    if has_protection(text):
+        return True
+    if MARKER in text:
+        # The word is there but no line begins with it, so nothing is protected
+        # and the file looks exactly like one that never asked to be. Somebody
+        # wrote the marker and got no guard, which is the failure this whole
+        # module exists to prevent, arriving through the guard itself.
+        logging.warning(
+            '%s mentions %s but no line begins with it, so nothing in it is protected. '
+            'A marker has to start its line; in prose or indented it does nothing.',
+            path,
+            MARKER,
+        )
+    return False
 
 
 @functools.lru_cache(maxsize=None)
@@ -179,7 +228,27 @@ def marked_files(root: str) -> tuple[str, ...]:
         return (root,) if _uses_marker(path) else ()
     if not path.is_dir():
         return ()
-    return tuple(str(p) for p in sorted(path.rglob('*')) if p.is_file() and _uses_marker(p))
+    # os.walk with followlinks, not rglob: rglob does not descend into
+    # symlinked directories, so a tree that reaches its sources through one --
+    # which is how several of these projects are laid out -- would report no
+    # marked files and protect nothing. Directories already visited are skipped
+    # by identity, so a link that points back up cannot spin.
+    found: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for directory, subdirectories, names in os.walk(path, followlinks=True):
+        try:
+            stat = os.stat(directory)
+        except OSError:
+            continue
+        if (stat.st_dev, stat.st_ino) in seen:
+            subdirectories[:] = []
+            continue
+        seen.add((stat.st_dev, stat.st_ino))
+        for name in names:
+            candidate = Path(directory) / name
+            if candidate.is_file() and _uses_marker(candidate):
+                found.append(str(candidate))
+    return tuple(sorted(found))
 
 
 def violation(original_root: Path, candidate_root: Path) -> Path | None:
@@ -189,7 +258,14 @@ def violation(original_root: Path, candidate_root: Path) -> Path | None:
     candidate produced any way at all: by patches, by clang_delta rewriting a
     whole file, or by a pass that simply deleted one.
     """
-    original_root = Path(original_root)
+    original_root, candidate_root = Path(original_root), Path(candidate_root)
+    if original_root.resolve() == candidate_root.resolve():
+        # The two are the same file or tree, so every comparison below would
+        # trivially agree and the guard would pass everything. Whatever put them
+        # here, that answer is worthless and must not be mistaken for consent.
+        raise ValueError(
+            f'a candidate cannot be compared against itself: {original_root} is {candidate_root}'
+        )
     directory = original_root.is_dir()
     for marked in marked_files(str(original_root)):
         marked = Path(marked)

@@ -30,6 +30,7 @@ import logging
 import subprocess
 from pathlib import Path
 
+from cvise.passes.compilationdatabase import database_file
 from cvise.passes.hint_based import HintBasedPass
 from cvise.utils.hint import Hint, HintBundle, Patch
 
@@ -95,7 +96,7 @@ class ReachabilityPass(HintBasedPass):
         stop agreeing the moment anything is generated or renamed.
         """
         try:
-            entries = json.loads(Path(self._compilation_database).read_text())
+            entries = json.loads(database_file(self._compilation_database).read_text())
         except (OSError, json.JSONDecodeError) as e:
             logging.warning('cannot read %s: %s', self._compilation_database, e)
             return {}

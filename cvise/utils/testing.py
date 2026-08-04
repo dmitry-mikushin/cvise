@@ -143,12 +143,17 @@ def protected_rejection(pairs):
     back interesting, be accepted, and every reduction after it would be measured
     against a test that no longer tests anything.
 
-    It takes the roots rather than a list of changed files, so that it holds for
-    a candidate produced any way at all. A pass that forgets a rule fails
-    silently and looks like progress; a comparison made afterwards cannot be
-    forgotten, and it covers the passes that emit patches, clang_delta which
-    rewrites whole files and never goes through the patch machinery, and a pass
-    that deletes the file outright.
+    It takes the roots rather than a list of changed files, so that however a
+    candidate was produced the same comparison applies: by patches, by
+    clang_delta rewriting a whole file outside the patch machinery, or by a
+    pass deleting the file outright. A pass that forgets a rule fails silently
+    and looks like progress; a comparison made afterwards cannot be forgotten.
+
+    What it does NOT cover is worth being exact about, because the guard is
+    easy to over-trust: it protects the TEXT of the marked definitions, and a
+    candidate can still empty the criterion without touching that text -- by
+    gutting a helper the test calls, or the CMake that registers it. This
+    refuses the direct edit, not every route to the same end.
     """
     for original, candidate in pairs:
         offender = noreduce.violation(original, candidate)

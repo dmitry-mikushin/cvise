@@ -311,6 +311,21 @@ def total_ram() -> int:
     return 0
 
 
+def _exec(argv: list[str]) -> int:
+    """Replace this process, or say plainly why it could not.
+
+    A traceback from execvp is the wrong answer from a program whose whole job
+    is to be careful on the user's behalf: the command was mistyped or is not
+    installed, and that is one line, not a stack.
+    """
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as e:
+        logging.error('cannot run %s: %s', argv[0], e.strerror)
+        return 127
+    return 0  # unreachable: execvp either replaces this process or raises
+
+
 def main(argv=None) -> int:
     """Run a command under the ceiling a reduction gives itself.
 
@@ -349,7 +364,7 @@ def main(argv=None) -> int:
     existing = memory_ceiling()
     if existing == UNKNOWN_CEILING or (existing is not None and (not ram or existing < ram)):
         logging.info('already bounded; running %s', argv[0])
-        os.execvp(argv[0], argv)
+        return _exec(argv)
 
     budget = int(available_ram() * CEILING_FRACTION)
     acquired = bound_this_process(budget) if budget > 0 else None
@@ -365,7 +380,7 @@ def main(argv=None) -> int:
         return 1
 
     logging.info('bounded to %.1f GiB of memory; running %s', acquired / 2**30, argv[0])
-    os.execvp(argv[0], argv)
+    return _exec(argv)
 
 
 if __name__ == '__main__':
