@@ -455,7 +455,13 @@ def do_reduce(args):
         # changed; without it each of them would build the project from nothing.
         # It runs before the token pool exists, because it is alone on the
         # machine and should have all of it.
-        baseline_seconds = project_utils.baseline_build(project)
+        #
+        # What is built is what the named test needs, worked out from the test
+        # itself, and not the default target: on a large project the default
+        # target is the whole tree, and a component the criterion never touches
+        # failing to compile would stop a reduction that has nothing to do with
+        # it.
+        baseline_seconds, build_target = project_utils.build_for_test(project, args.test)
 
         # One pool of build tokens shared by every candidate from here on. ninja
         # is a client of it and is never given a -j, so a build that can only
@@ -561,7 +567,7 @@ def do_reduce(args):
             """
             written = project_utils.publish(project, staged)
             logging.info('%d files written back; rebuilding what the jobs read', written)
-            project_utils.baseline_build(project)
+            project_utils.baseline_build(project, build_target)
 
         # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
         # Preloading is used as a speedup, so that every worker doesn't need to execute all import statements on startup.

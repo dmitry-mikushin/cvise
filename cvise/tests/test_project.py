@@ -19,7 +19,10 @@ import pytest
 
 from cvise.utils.project import (
     ProjectError,
+    preset_definitions,
     baseline_build,
+    build_for_test,
+    targets_for_test,
     build_failure_report,
     configure,
     database_for,
@@ -145,7 +148,7 @@ class TestDatabase:
     """
 
     def test_the_staged_files_are_the_ones_named(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         named = {e['file'] for e in json.loads(database_for(project, staged).read_text())}
@@ -155,7 +158,7 @@ class TestDatabase:
 
     def test_headers_are_named_too(self, tmp_path):
         """Most of a C++ program lives in them, and they have no command of their own."""
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         named = {e['file'] for e in json.loads(database_for(project, staged).read_text())}
@@ -168,7 +171,7 @@ class TestDatabase:
     @pytest.mark.parametrize('suffix', ['.hpp', '.cpp'])
     def test_clang_delta_accepts_a_staged_file(self, tmp_path, suffix):
         """The point of the entry, and it was wrong for sources as well as headers."""
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         database = database_for(project, staged)
@@ -189,7 +192,7 @@ class TestDatabase:
 
     def test_the_original_database_is_left_alone(self, tmp_path):
         """CMake owns it and rewrites it on every reconfigure."""
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         original = tmp_path / 'build' / 'compile_commands.json'
@@ -201,14 +204,14 @@ class TestDatabase:
 
 class TestStagingAndPublish:
     def test_only_the_reducible_files_are_staged(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         assert (staged / 'src' / 'calc.cpp').is_file()
         assert not (staged / 'CMakeLists.txt').exists(), 'the build definition must not be reduced'
 
     def test_a_change_is_written_back(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         (staged / 'src' / 'calc.cpp').write_text('int calc() { return 1; }\n')
@@ -217,7 +220,7 @@ class TestStagingAndPublish:
 
     def test_an_untouched_file_keeps_its_timestamp(self, tmp_path):
         """The user's build depends on it."""
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         before = (project.root / 'src' / 'main.cpp').stat().st_mtime_ns
@@ -232,7 +235,7 @@ class TestStagingAndPublish:
         reduction had proved unnecessary reappeared in the answer -- which then
         differed from the thing that was actually verified.
         """
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         staged = stage(project, tmp_path / 'staged')
         (staged / 'src' / 'calc.cpp').unlink()
@@ -587,7 +590,7 @@ class TestTheBaselineIsTimed:
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
     def test_it_says_how_long_it_took(self, tmp_path):
-        cmakelists = write_project(tmp_path / 'project')
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         took = baseline_build(project)
         assert took > 0
@@ -732,3 +735,95 @@ class TestReadingABuildFailure:
         report = build_failure_report(self.two_failures(), tmp_path / 'does' / 'not' / 'exist')
         assert 'could not be written' in report
         assert 'a.cpp:12:5: error: something went wrong here' in report
+
+
+class TestTheProjectsOwnConfigureSettings:
+    """A project that ships CMakePresets.json has already said how to configure it.
+
+    Some refuse anything else outright: one here answers a bare `cmake -S . -B`
+    with "a raw invocation leaves CMAKE_PRESET_NAME unset and is refused".
+    """
+
+    def presets(self, tmp_path, body):
+        (tmp_path / 'CMakePresets.json').write_text(json.dumps(body))
+        return tmp_path
+
+    def test_nothing_to_replay_without_the_file(self, tmp_path):
+        assert preset_definitions(tmp_path) == []
+
+    def test_the_default_preset_is_replayed(self, tmp_path):
+        root = self.presets(tmp_path, {'configurePresets': [
+            {'name': 'other', 'cacheVariables': {'A': 'no'}},
+            {'name': 'default', 'cacheVariables': {'CMAKE_PRESET_NAME': 'default', 'B': 'yes'}},
+        ]})
+        assert set(preset_definitions(root)) == {'-DCMAKE_PRESET_NAME=default', '-DB=yes'}
+
+    def test_a_lone_preset_is_replayed_whatever_it_is_called(self, tmp_path):
+        root = self.presets(tmp_path, {'configurePresets': [
+            {'name': 'only', 'cacheVariables': {'B': 'yes'}}]})
+        assert preset_definitions(root) == ['-DB=yes']
+
+    def test_several_with_no_default_is_left_to_cmake(self, tmp_path):
+        """Which one the project meant is a question this cannot answer alone."""
+        root = self.presets(tmp_path, {'configurePresets': [
+            {'name': 'a', 'cacheVariables': {'A': '1'}},
+            {'name': 'b', 'cacheVariables': {'B': '2'}}]})
+        assert preset_definitions(root) == []
+
+    def test_unreadable_presets_are_reported_not_ignored(self, tmp_path, caplog):
+        (tmp_path / 'CMakePresets.json').write_text('{not json')
+        with caplog.at_level('WARNING'):
+            assert preset_definitions(tmp_path) == []
+        assert caplog.records
+
+
+class TestBuildingWhatTheTestNeeds:
+    """The default target is the wrong answer for anything larger than a toy.
+
+    MEASURED on ns-rtc: the default target is the whole tree, one component of
+    it does not compile, and that component has nothing to do with the named
+    test -- so the reduction refused to start over code the criterion never
+    touches, while `--target ns_projection_unit_tests` builds in seconds.
+    """
+
+    def test_the_tests_own_executable_is_the_target(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        baseline_build(project)
+        targets = targets_for_test(project, 'says_v')
+        assert targets, 'ctest knows the command of every test it registers'
+        assert not Path(targets[0]).is_absolute(), 'a target is named inside the build directory'
+
+    def test_it_builds_and_says_which_target(self, tmp_path):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        test = 'says_v'
+        took, target = build_for_test(project, test)
+        assert took > 0
+        assert has_test(project, test)
+        assert target is not None, 'the target was worked out, not guessed at'
+
+    def test_a_test_nobody_registers_falls_back_and_says_so(self, tmp_path, caplog):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        with caplog.at_level('WARNING'):
+            took, target = build_for_test(project, 'NoSuch.TestAtAll')
+        assert target is None
+        assert took > 0, 'the fallback still builds something'
+        assert any('could not work out which target' in r.message for r in caplog.records)
+
+    def test_the_named_target_is_what_cmake_is_asked_for(self, tmp_path, monkeypatch):
+        cmakelists = write_project(tmp_path / 'project', TESTED_PROJECT)
+        project = configure(cmakelists, tmp_path / 'build')
+        seen = []
+
+        real = subprocess.run
+
+        def record(command, *args, **kwargs):
+            if command[:2] == ['cmake', '--build']:
+                seen.append(command)
+            return real(command, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, 'run', record)
+        baseline_build(project, 'some_target')
+        assert seen and seen[0][-2:] == ['--target', 'some_target']

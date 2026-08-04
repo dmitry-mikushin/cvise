@@ -59,6 +59,46 @@ class Project:
     output: dict[str, str]
 
 
+def preset_definitions(root: Path) -> list[str]:
+    """The project's own configure settings, replayed as -D flags.
+
+    A project that ships CMakePresets.json has already written down how it is
+    meant to be configured, and that is the same fact compile_commands.json
+    carries about files and flags: asking the user to repeat it, or configuring
+    without it, is another way for the answer to disagree with the build.
+
+    It is not a nicety. A project may refuse a configure that did not come from
+    its preset, and one here does, in as many words: "a raw cmake -S . -B <dir>
+    -D... invocation leaves CMAKE_PRESET_NAME unset and is refused". Its own
+    preset cannot simply be named instead, because a preset fixes binaryDir to
+    the source tree and C-Vise needs a build directory of its own -- which is
+    exactly why the project has a script that replays these variables too.
+
+    The preset called "default" if there is one, else the only one there is. A
+    project with several and no default is asking a question this cannot answer
+    on its own, so nothing is replayed and CMake is left to complain.
+    """
+    presets = root / 'CMakePresets.json'
+    if not presets.is_file():
+        return []
+    try:
+        described = json.loads(presets.read_text()).get('configurePresets', [])
+    except (OSError, json.JSONDecodeError) as e:
+        logging.warning('cannot read %s, so its settings are not replayed: %s', presets, e)
+        return []
+    usable = [p for p in described if p.get('cacheVariables')]
+    chosen = next((p for p in usable if p.get('name') == 'default'), None)
+    if chosen is None:
+        if len(usable) != 1:
+            return []
+        chosen = usable[0]
+    definitions = [f'-D{k}={v}' for k, v in chosen['cacheVariables'].items()]
+    logging.info(
+        'replaying %d cache variables from the %s preset', len(definitions), chosen.get('name')
+    )
+    return definitions
+
+
 def configure(cmakelists: Path, build_dir: Path) -> Project:
     """Run CMake once, for the database and nothing else.
 
@@ -91,6 +131,7 @@ def configure(cmakelists: Path, build_dir: Path) -> Project:
             # forgotten: it is rebuilt for every candidate, and what makes that
             # affordable is a build system that rebuilds exactly what changed.
             '-G', 'Ninja',
+            *preset_definitions(root),
             '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
         ],
         capture_output=True,
@@ -413,7 +454,108 @@ def build_failure_report(output: str, build_dir: Path) -> str:
     return '\n'.join(report)
 
 
-def baseline_build(project: 'Project') -> float:
+def targets_for_test(project: 'Project', test: str) -> list[str]:
+    """What to build so that the named test exists and can run.
+
+    Asked of ctest, which records the command each test runs: the executable in
+    it is an output of this build, and ninja takes an output path as a target.
+
+    Before the first build there may be no such test yet, because
+    gtest_discover_tests registers what it finds by running the binary and
+    leaves a "<target>_NOT_BUILT" placeholder until then. That placeholder names
+    the target, so it answers the same question one step earlier. Several may be
+    pending, and which of them carries the test cannot be told without building
+    one, so they are all returned and the caller stops at the first that works.
+    """
+    proc = subprocess.run(
+        ['ctest', '--test-dir', str(project.build_dir), '--show-only=json-v1'],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        described = json.loads(proc.stdout).get('tests', [])
+    except json.JSONDecodeError:
+        return []
+
+    pending = []
+    known = False
+    for entry in described:
+        name = entry.get('name', '')
+        command = entry.get('command') or []
+        if name == test:
+            known = True
+            if command:
+                return [_inside(project.build_dir, Path(command[0]))]
+        if name.endswith('_NOT_BUILT'):
+            pending.append(name[: -len('_NOT_BUILT')])
+
+    if known:
+        # Registered, but ctest reports no command for it: it fills that in from
+        # the file on disk, and the file is what has not been built yet. CMake
+        # resolved the target to a path at generate time all the same, and wrote
+        # it down, so ask the generated file rather than the tool that is
+        # waiting for the answer.
+        written = _test_command_from_generated(project.build_dir, test)
+        if written is not None:
+            return [_inside(project.build_dir, written)]
+    return pending
+
+
+def _inside(build_dir: Path, executable: Path) -> str:
+    """Name an executable the way ninja does: by its path under the build."""
+    return str(executable.relative_to(build_dir)) if executable.is_relative_to(build_dir) \
+        else executable.name
+
+
+def _test_command_from_generated(build_dir: Path, test: str) -> Path | None:
+    """The executable CMake wrote down for this test, before anything built it.
+
+    CTestTestfile.cmake carries the resolved path from generate time:
+
+        add_test([=[says_v]=] "/build/prog")
+
+    which is the same fact ctest reports once the file exists.
+    """
+    pattern = re.compile(r'add_test\(\[=\[' + re.escape(test) + r'\]=\]\s+"([^"]+)"')
+    for generated in build_dir.rglob('CTestTestfile.cmake'):
+        try:
+            found = pattern.search(generated.read_text())
+        except OSError:
+            continue
+        if found:
+            return Path(found.group(1))
+    return None
+
+
+def build_for_test(project: 'Project', test: str) -> tuple[float, str | None]:
+    """Build what the named test needs, and nothing else.
+
+    The default target is the wrong answer for anything larger than a toy: on
+    one project here it is the whole tree, it does not compile, and the part
+    that does not compile has nothing to do with the test -- so the reduction
+    refused to start over a component the criterion never touches. What a
+    candidate has to build is what the criterion runs.
+
+    Returns how long it took and which target it was, so that the same target
+    is rebuilt when an accepted result is published rather than the whole tree
+    again.
+    """
+    for target in targets_for_test(project, test):
+        took = baseline_build(project, target)
+        if has_test(project, test):
+            return took, target
+        logging.info('%s did not bring %s into being; trying the next target', target, test)
+    logging.warning(
+        'could not work out which target %s comes from, so the default target is built instead. '
+        'That is everything the project builds, which may be far more than the test needs.',
+        test,
+    )
+    return baseline_build(project), None
+
+
+def baseline_build(project: 'Project', target: str | None = None) -> float:
     """Build the project once, from the sources as they are.
 
     Every job gets this directory copy-on-write, so what it finds here is what
@@ -427,12 +569,13 @@ def baseline_build(project: 'Project') -> float:
     pristine sources produce. That is exactly what building here, outside any
     delta, guarantees.
 
-    What is built is the default target, not the one the user named to check
-    with. The two are usually the same work, but not always: a check target
-    typically runs the program, and running it is neither cheaper here than in a
-    job nor of any use to one. Building the check target meant C-Vise began by
-    executing the user's check -- which, for a check that waits for something,
-    is a reducer that appears to hang before it has printed a line.
+    What is built is what the caller names, which build_for_test works out from
+    the test itself. It used to be the default target, on the reasoning that
+    building the *check* would have C-Vise run the user's test before printing
+    a line. That reasoning was sound and its conclusion was not: the choice is
+    not between the check and everything, but between everything and the one
+    target the check needs. Building everything made a reduction refuse to
+    start over a component the criterion never touches.
 
     A failure is not fatal. Whether the project as it stands is interesting is
     the sanity check's question, and the user can waive that; this is only the
@@ -444,9 +587,12 @@ def baseline_build(project: 'Project') -> float:
     and how long that is a property of the project, not of C-Vise.
     """
     started = time.monotonic()
-    logging.info('building the project once, so that each candidate only rebuilds what it changed')
+    logging.info(
+        'building %s once, so that each candidate only rebuilds what it changed',
+        target or 'the default target',
+    )
     proc = subprocess.run(
-        ['cmake', '--build', str(project.build_dir)],
+        ['cmake', '--build', str(project.build_dir)] + (['--target', target] if target else []),
         capture_output=True,
         text=True,
     )
