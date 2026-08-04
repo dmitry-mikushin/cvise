@@ -231,7 +231,15 @@ def main() -> int:
         '-v', f'{root}:{root}',
         '-e', f'TMPDIR={tmp}',
         '-w', SRC, IMAGE,
-        'cvise', '--n', str(jobs), f'{SRC}/CMakeLists.txt', TEST,
+        # Configured from the root, because that is the only configuration in
+        # which this component's tests exist at all -- cpp/test asks whether
+        # targets the root creates are defined. Reduced under the component,
+        # because the question is about the component. MEASURED when the two
+        # were the same: 3651 translation units instead of 378, every job
+        # copying 6375 files and 1485 directories, 39% of the machine in mkdir
+        # and 4% doing useful work, and no verdict at all in 80 minutes.
+        'cvise', '--n', str(jobs), '--under', SUBMODULE,
+        f'{SRC}/CMakeLists.txt', TEST,
     ]
 
     if args.dry_run:

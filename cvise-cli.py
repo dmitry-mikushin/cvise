@@ -299,6 +299,17 @@ def main():
         help='Skip each pass after N successful transformations',
     )
     parser.add_argument(
+        '--under',
+        metavar='SUBTREE',
+        help='reduce only what is under this directory of the project, relative to the '
+        'CMakeLists.txt. Configuring and reducing are not the same scope: a component whose '
+        'tests only exist when the whole tree is configured still wants only itself reduced, '
+        'and CMake has no opinion on which part is under study. MEASURED on one such tree: '
+        '3651 translation units configured, 378 of them the component in question, and the '
+        'other 3273 cost every job 6375 files and 1485 directories to copy before it could '
+        'start',
+    )
+    parser.add_argument(
         'project',
         metavar='CMAKELISTS',
         nargs='?',
@@ -430,7 +441,7 @@ def do_reduce(args):
     staged = None
     script = None
     try:
-        project = project_utils.configure(Path(args.project), cmake_dir)
+        project = project_utils.configure(Path(args.project), cmake_dir, args.under)
         logging.info(
             # Not "translation units", which is what this said while counting
             # units and headers together -- so a run of 376 units and 513

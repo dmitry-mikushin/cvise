@@ -99,7 +99,7 @@ def preset_definitions(root: Path) -> list[str]:
     return definitions
 
 
-def configure(cmakelists: Path, build_dir: Path) -> Project:
+def configure(cmakelists: Path, build_dir: Path, under: str | None = None) -> Project:
     """Run CMake once, for the database and nothing else.
 
     The build directory here is C-Vise's own: the interestingness test builds
@@ -156,8 +156,13 @@ def configure(cmakelists: Path, build_dir: Path) -> Project:
             )[:2000]
         )
 
-    translation_units = sources_from(database, root)
-    headers, check_command = scan_headers(database, root, translation_units)
+    scope = root if under is None else (root / under).resolve()
+    if not scope.is_dir():
+        raise ProjectError(f'{scope} is not a directory of this project, so nothing is under it')
+    if scope != root:
+        logging.info('reducing only what is under %s', scope)
+    translation_units = sources_from(database, root, scope)
+    headers, check_command = scan_headers(database, root, translation_units, scope)
     return Project(
         cmakelists=cmakelists,
         root=root,
@@ -196,13 +201,27 @@ def outputs_from(database: Path, root: Path) -> dict[str, str]:
     return outputs
 
 
-def sources_from(database: Path, root: Path) -> list[Path]:
+def sources_from(database: Path, root: Path, scope: Path | None = None) -> list[Path]:
     """The translation units the project actually compiles, and nothing else.
 
     Files outside the project root are dependencies, not the thing under
     reduction: deleting from a system header or a vendored library would change
     what the reduction means and would not survive a rebuild anyway.
+
+    The scope narrows that further, to the part of the project under study.
+    Which part that is, is not something CMake knows -- it configures a build,
+    it does not decide what a person is investigating -- so it is asked rather
+    than guessed. Guessing it would be worse than asking: a wrong subtree
+    reduces the wrong code and still finishes and still prints a percentage.
+
+    MEASURED on ns-rtc, where the tests of one submodule only exist when the
+    root is configured: 3651 translation units, of which 378 belong to the
+    component under study. The other 3273 are not merely wasted candidates.
+    Every job copies the staged tree into its own scratch directory, so they are
+    6375 files and 1485 directories per job, and 82 jobs creating them at once
+    spent 39% of the machine in mkdir and 4% doing anything useful.
     """
+    scope = root if scope is None else scope
     try:
         entries = json.loads(database.read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -218,7 +237,7 @@ def sources_from(database: Path, root: Path) -> list[Path]:
             path = (Path(entry.get('directory', root)) / path).resolve()
         if not path.is_file():
             continue
-        if root not in path.parents:
+        if scope not in path.parents:
             continue
         if path not in seen:
             seen.append(path)
@@ -231,7 +250,11 @@ def sources_from(database: Path, root: Path) -> list[Path]:
 
 
 def scan_headers(
-    database: Path, root: Path, translation_units: list[Path], jobs: int = 0
+    database: Path,
+    root: Path,
+    translation_units: list[Path],
+    scope: Path | None = None,
+    jobs: int = 0,
 ) -> tuple[list[Path], dict[str, list[str]]]:
     """Ask the compiler what this project is made of.
 
@@ -249,6 +272,7 @@ def scan_headers(
     given header, which is what makes a cheap check possible for headers at
     all.
     """
+    scope = root if scope is None else scope
     try:
         entries = json.loads(database.read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -313,7 +337,7 @@ def scan_headers(
                 key = str(path)
                 if key in wanted or key in seen:
                     continue
-                if not path.is_file() or root not in path.parents:
+                if not path.is_file() or scope not in path.parents:
                     continue
                 seen.add(key)
                 headers.append(path)

@@ -827,3 +827,71 @@ class TestBuildingWhatTheTestNeeds:
         monkeypatch.setattr(subprocess, 'run', record)
         baseline_build(project, 'some_target')
         assert seen and seen[0][-2:] == ['--target', 'some_target']
+
+
+class TestConfiguringIsNotReducing:
+    """Where the build is configured and what is under study are two questions.
+
+    A component whose tests only exist when the whole tree is configured still
+    wants only itself reduced. MEASURED when the two were conflated: 3651
+    translation units instead of 378, every job copying 6375 files and 1485
+    directories before it could begin, 39% of the machine in mkdir and 4% doing
+    anything useful, and no verdict at all in eighty minutes.
+    """
+
+    def two_part_project(self, root):
+        """A project of two subdirectories, both compiled by the one build."""
+        for part in ('mine', 'theirs'):
+            (root / part).mkdir(parents=True, exist_ok=True)
+            (root / part / f'{part}.cpp').write_text(f'int {part}() {{ return 1; }}\n')
+            (root / part / f'{part}.hpp').write_text(f'#pragma once\nint {part}();\n')
+        (root / 'main.cpp').write_text(
+            '#include "mine/mine.hpp"\n#include "theirs/theirs.hpp"\n'
+            'int main() { return mine() + theirs() - 2; }\n'
+        )
+        (root / 'CMakeLists.txt').write_text(
+            'cmake_minimum_required(VERSION 3.20)\nproject(two CXX)\n'
+            'add_executable(prog main.cpp mine/mine.cpp theirs/theirs.cpp)\n'
+            'target_include_directories(prog PRIVATE .)\n'
+            'enable_testing()\nadd_test(NAME runs COMMAND prog)\n'
+        )
+        return root / 'CMakeLists.txt'
+
+    def test_without_a_scope_everything_is_reducible(self, tmp_path):
+        cmakelists = self.two_part_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build')
+        names = {p.name for p in project.sources}
+        assert {'mine.cpp', 'theirs.cpp', 'main.cpp'} <= names
+
+    def test_a_scope_keeps_only_what_is_under_it(self, tmp_path):
+        cmakelists = self.two_part_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build', under='mine')
+        names = {p.name for p in project.sources}
+        assert 'mine.cpp' in names
+        assert 'theirs.cpp' not in names, 'a file outside the scope was offered for reduction'
+        assert 'main.cpp' not in names
+
+    def test_the_headers_are_narrowed_too(self, tmp_path):
+        cmakelists = self.two_part_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build', under='mine')
+        names = {p.name for p in project.sources}
+        assert 'theirs.hpp' not in names, 'a header outside the scope came in through -M'
+
+    def test_narrowing_does_not_deprive_the_build(self, tmp_path):
+        """The point of the whole arrangement: the build still sees everything.
+
+        Only the reducible files are staged; everything else is read from the
+        real tree through the overlay. So a narrower scope makes each job cheaper
+        without making the build wrong.
+        """
+        cmakelists = self.two_part_project(tmp_path / 'project')
+        project = configure(cmakelists, tmp_path / 'build', under='mine')
+        staged = stage(project, tmp_path / 'staged')
+        assert (staged / 'mine' / 'mine.cpp').is_file()
+        assert not (staged / 'theirs' / 'theirs.cpp').exists()
+        assert baseline_build(project) > 0, 'the build compiles what was never staged'
+
+    def test_a_scope_that_is_not_there_is_refused(self, tmp_path):
+        cmakelists = self.two_part_project(tmp_path / 'project')
+        with pytest.raises(ProjectError, match='nothing is under it'):
+            configure(cmakelists, tmp_path / 'build', under='no/such/place')
