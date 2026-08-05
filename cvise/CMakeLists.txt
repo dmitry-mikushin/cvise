@@ -153,6 +153,7 @@ set(SOURCE_FILES
   "utils/noreduce.py"
   "utils/precheck.py"
   "utils/project.py"
+  "utils/projectcheck.py"
   "utils/process.py"
   "utils/readkey_posix.py"
   "utils/readkey_windows.py"

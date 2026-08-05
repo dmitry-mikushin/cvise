@@ -919,4 +919,4 @@ class TestTheCheckBuildsTheSameThingTheBaselineDid:
         project = configure(cmakelists, tmp_path / 'build')
         text = check_script(project, 'runs', tmp_path / 'check.sh').read_text()
         assert '--target' not in text
-        assert 'cmake --build' in text
+        assert f'--build {project.build_dir}' in text

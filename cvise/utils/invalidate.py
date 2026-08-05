@@ -29,9 +29,7 @@ somewhere this program cannot see -- a stale cache, an overlay that did not
 reach the compiler -- and that is reported rather than graded.
 """
 
-import re
 import subprocess
-import sys
 from pathlib import Path
 
 WHITEOUT_SUFFIX = '.cvise-whiteout'
@@ -70,33 +68,26 @@ def objects_depending_on(build: Path, paths: set[str]) -> list[str]:
     return hits
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        print('usage: invalidate.py <build-dir> <delta-dir>', file=sys.stderr)
-        return 2
-    build, delta = Path(sys.argv[1]), Path(sys.argv[2])
+def remove_stale(build: Path, delta: Path) -> int:
+    """Delete the objects that depended on what this candidate removed.
+
+    Returns how many, which is what tells the caller whether the build it is
+    about to run is allowed to do nothing.
+    """
     if not delta.is_dir():
-        print('0')  # nothing was delivered, so nothing can be stale
-        return 0
+        return 0  # nothing was delivered, so nothing can be stale
 
     gone = set(removed_by(delta))
     if not gone:
         # Modifications carry a new timestamp through the overlay and ninja
         # rebuilds them by itself. Only disappearance is invisible to it.
-        print('0')
         return 0
 
     removed = 0
     for obj in objects_depending_on(build, gone):
-        target = build / obj
         try:
-            target.unlink()
+            (build / obj).unlink()
             removed += 1
         except OSError:
             pass
-    print(removed)
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+    return removed

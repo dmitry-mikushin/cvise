@@ -11,16 +11,12 @@ is refused unless the binary under test actually came back new.
 """
 
 import os
-import shutil
-import stat
-import subprocess
-import sys
+import re
 from pathlib import Path
-
-import pytest
 
 from cvise.utils import invalidate
 from cvise.utils import project
+from cvise.utils import projectcheck
 
 
 DEPS = """\
@@ -102,8 +98,9 @@ class TestWhatTheCandidateRemoved:
         assert invalidate.removed_by(tmp_path / 'delta') == []
 
 
+
 class TestTheObjectsAreActuallyGone:
-    def run(self, tmp_path, monkeypatch, removed):
+    def setup(self, tmp_path, monkeypatch, removed):
         fake_ninja(tmp_path / 'bin', DEPS)
         monkeypatch.setenv('PATH', str(tmp_path / 'bin') + os.pathsep + os.environ['PATH'])
         build = tmp_path / 'build'
@@ -113,50 +110,28 @@ class TestTheObjectsAreActuallyGone:
         delta = tmp_path / 'delta'
         for path in removed:
             whiteout(delta, path)
-        proc = subprocess.run(
-            [sys.executable, str(Path(invalidate.__file__)), str(build), str(delta)],
-            capture_output=True,
-            text=True,
-        )
-        return proc, build
+        return build, delta
 
     def test_the_condemned_object_is_deleted_and_counted(self, tmp_path, monkeypatch):
-        proc, build = self.run(tmp_path, monkeypatch, ['/src/include/ids.hpp'])
-        assert proc.stdout.strip() == '1'
+        build, delta = self.setup(tmp_path, monkeypatch, ['/src/include/ids.hpp'])
+        assert invalidate.remove_stale(build, delta) == 1
         assert not (build / 'obj' / 'foo.o').exists()
         assert (build / 'obj' / 'bar.o').exists(), 'condemned an object that was fine'
 
     def test_removing_nothing_deletes_nothing(self, tmp_path, monkeypatch):
-        proc, build = self.run(tmp_path, monkeypatch, [])
-        assert proc.stdout.strip() == '0'
+        build, delta = self.setup(tmp_path, monkeypatch, [])
+        assert invalidate.remove_stale(build, delta) == 0
         assert (build / 'obj' / 'foo.o').exists()
 
     def test_a_delta_that_was_never_created_is_not_an_error(self, tmp_path, monkeypatch):
-        fake_ninja(tmp_path / 'bin', DEPS)
-        monkeypatch.setenv('PATH', str(tmp_path / 'bin') + os.pathsep + os.environ['PATH'])
-        proc = subprocess.run(
-            [sys.executable, str(Path(invalidate.__file__)), str(tmp_path), str(tmp_path / 'nope')],
-            capture_output=True,
-            text=True,
-        )
-        assert proc.returncode == 0
-        assert proc.stdout.strip() == '0'
+        build, _ = self.setup(tmp_path, monkeypatch, [])
+        assert invalidate.remove_stale(build, tmp_path / 'nope') == 0
 
 
 class TestTheVerdictRefusesToRestOnAnotherCandidatesBinary:
-    """The generated check script's own decision, exercised through sh.
-
-    Stubbed at the two places it reaches outside itself -- the thing that counts
-    removals and the thing that builds -- because what is under test is which
-    verdict it reaches from which facts, not whether cmake works.
-    """
-
-    def script(self, tmp_path, target='unit_tests'):
-        class Project:
-            build_dir = tmp_path / 'build'
-
-        Project.build_dir.mkdir(parents=True, exist_ok=True)
-        return project.check_script(Project, 'Some.Test', tmp_path / 'check.sh', target=target)
+    """Stubbed at the two places the check reaches outside itself -- the build
+    and the project's test -- because what is under test is which verdict it
+    reaches from which facts, not whether cmake works."""
 
     def stub(self, directory, name, body):
         directory.mkdir(parents=True, exist_ok=True)
@@ -164,79 +139,144 @@ class TestTheVerdictRefusesToRestOnAnotherCandidatesBinary:
         tool.write_text('#!/bin/sh\n' + body)
         tool.chmod(0o755)
 
-    def run(self, tmp_path, *, killed, rebuild, target='unit_tests', binary=True):
-        """Run the generated script with `killed` removals and a build that does
-        or does not touch the binary."""
-        path = self.script(tmp_path, target)
-        text = path.read_text()
-        # The count comes from an absolute path baked into the script; replace
-        # that one command rather than the logic that consumes it.
-        for line in text.splitlines():
-            if line.startswith('killed=$('):
-                text = text.replace(line, f'killed={killed}')
-        path.write_text(text)
-
-        binary_path = tmp_path / 'build' / 'unit_tests'
+    def run(self, tmp_path, monkeypatch, *, killed, rebuild, target='unit_tests', binary=True):
+        build = tmp_path / 'build'
+        build.mkdir(parents=True, exist_ok=True)
+        binary_path = build / 'unit_tests'
         if binary:
             binary_path.write_text('old')
             os.utime(binary_path, (1000, 1000))
+
         bin_dir = tmp_path / 'bin'
-        touch = f'touch {binary_path}\n' if rebuild else ''
-        self.stub(bin_dir, 'cmake', touch + 'exit 0\n')
+        self.stub(bin_dir, 'cmake', (f'touch {binary_path}\n' if rebuild else '') + 'exit 0\n')
         self.stub(bin_dir, 'ctest', 'echo "ctest ran"\nexit 0\n')
-        env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: killed)
+
         job = tmp_path / 'job'
         job.mkdir(exist_ok=True)
-        return subprocess.run(
-            ['sh', str(path)], cwd=job, env=env, capture_output=True, text=True
-        )
+        monkeypatch.chdir(job)
+        argv = ['--build', str(build), '--test', 'Some.Test']
+        if target:
+            argv += ['--target', target]
+        return projectcheck.main(argv)
 
-    def test_an_untouched_tree_that_rebuilds_nothing_is_allowed_through(self, tmp_path):
+    def test_an_untouched_tree_that_rebuilds_nothing_is_allowed_through(self, tmp_path, monkeypatch, capsys):
         """Removing nothing rightly rebuilds nothing; refusing that would refuse
         every candidate that only edited a file the test does not reach."""
-        proc = self.run(tmp_path, killed=0, rebuild=False)
-        assert proc.returncode == 0
-        assert 'ctest ran' in proc.stdout
+        assert self.run(tmp_path, monkeypatch, killed=0, rebuild=False) == 0
+        assert 'ctest ran' in capsys.readouterr().out
 
-    def test_removals_that_did_rebuild_are_allowed_through(self, tmp_path):
-        proc = self.run(tmp_path, killed=7, rebuild=True)
-        assert proc.returncode == 0
-        assert 'ctest ran' in proc.stdout
+    def test_removals_that_did_rebuild_are_allowed_through(self, tmp_path, monkeypatch, capsys):
+        assert self.run(tmp_path, monkeypatch, killed=7, rebuild=True) == 0
+        assert 'ctest ran' in capsys.readouterr().out
 
-    def test_removals_that_rebuilt_nothing_are_refused(self, tmp_path):
+    def test_removals_that_rebuilt_nothing_are_refused(self, tmp_path, monkeypatch, capsys):
         """The failure this exists for: the binary is the previous candidate's."""
-        proc = self.run(tmp_path, killed=7, rebuild=False)
-        assert proc.returncode == 125
-        assert 'judged by another one' in proc.stdout
-        assert 'ctest ran' not in proc.stdout
+        assert self.run(tmp_path, monkeypatch, killed=7, rebuild=False) == projectcheck.UNDECIDABLE
+        out = capsys.readouterr().out
+        assert 'judged by another one' in out
+        assert 'ctest ran' not in out
 
-    def test_a_binary_that_was_never_there_is_refused_not_assumed(self, tmp_path):
+    def test_a_binary_that_was_never_there_is_refused_not_assumed(self, tmp_path, monkeypatch, capsys):
         """Two absences compare equal, and calling that "unchanged" or calling it
         "fine" are both answers about a comparison that did not happen."""
-        proc = self.run(tmp_path, killed=7, rebuild=False, binary=False)
-        assert proc.returncode == 125
-        assert 'cannot be shown to' in proc.stdout
+        code = self.run(tmp_path, monkeypatch, killed=7, rebuild=False, binary=False)
+        assert code == projectcheck.UNDECIDABLE
+        assert 'cannot be shown' in capsys.readouterr().out
 
-    def test_without_a_target_the_check_still_refuses_rather_than_guesses(self, tmp_path):
+    def test_without_a_target_the_check_refuses_rather_than_guesses(self, tmp_path, monkeypatch):
         """No target means no binary to look for, so nothing can be verified."""
-        proc = self.run(tmp_path, killed=7, rebuild=True, target=None, binary=False)
-        assert proc.returncode == 125
+        code = self.run(tmp_path, monkeypatch, killed=7, rebuild=True, target=None, binary=False)
+        assert code == projectcheck.UNDECIDABLE
 
-    def test_a_failing_build_reports_the_build_and_not_the_guard(self, tmp_path):
-        path = self.script(tmp_path)
+    def test_a_failing_build_is_reported_by_the_usual_reporter(self, tmp_path, monkeypatch, capsys):
+        """Not `cat`: the generated shell could only print the raw log, which is
+        the failure build_failure_report was written to remove."""
+        build = tmp_path / 'build'
+        build.mkdir()
         bin_dir = tmp_path / 'bin'
-        self.stub(bin_dir, 'cmake', 'echo "error: ids.hpp not found"\nexit 1\n')
+        self.stub(bin_dir, 'cmake',
+                  'echo "FAILED: obj/foo.o "\necho "  /usr/bin/clang++ -c -o obj/foo.o foo.cpp"\n'
+                  'echo "foo.cpp:1:10: fatal error: ids.hpp file not found"\nexit 1\n')
         self.stub(bin_dir, 'ctest', 'echo "ctest ran"\nexit 0\n')
-        (tmp_path / 'build' / 'unit_tests').write_text('old')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
         job = tmp_path / 'job'
-        job.mkdir(exist_ok=True)
-        proc = subprocess.run(
-            ['sh', str(path)],
-            cwd=job,
-            env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH']),
-            capture_output=True,
-            text=True,
-        )
-        assert proc.returncode == 1
-        assert 'ids.hpp not found' in proc.stdout
-        assert 'ctest ran' not in proc.stdout
+        job.mkdir()
+        monkeypatch.chdir(job)
+        code = projectcheck.main(['--build', str(build), '--test', 'Some.Test'])
+        out = capsys.readouterr().out
+        assert code == 1
+        assert 'ids.hpp file not found' in out
+        assert 'ctest ran' not in out
+        assert (build / 'cvise-last-build-failure.log').exists()
+
+    def test_the_record_names_what_the_verdict_rested_on(self, tmp_path, monkeypatch):
+        witness = tmp_path / 'verdicts.log'
+        build = tmp_path / 'build'
+        build.mkdir()
+        (build / 'unit_tests').write_text('old')
+        bin_dir = tmp_path / 'bin'
+        self.stub(bin_dir, 'cmake', 'exit 0\n')
+        self.stub(bin_dir, 'ctest', 'exit 0\n')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: 0)
+        job = tmp_path / 'job'
+        job.mkdir()
+        monkeypatch.chdir(job)
+        projectcheck.main(['--build', str(build), '--test', 'S.T',
+                           '--target', 'unit_tests', '--witness', str(witness)])
+        line = witness.read_text()
+        assert 'build=0' in line and 'killed=0' in line and 'rebuilt=no' in line
+
+    def test_a_witness_that_cannot_be_written_does_not_change_a_verdict(self, tmp_path, monkeypatch, capsys):
+        build = tmp_path / 'build'
+        build.mkdir()
+        (build / 'unit_tests').write_text('old')
+        bin_dir = tmp_path / 'bin'
+        self.stub(bin_dir, 'cmake', 'exit 0\n')
+        self.stub(bin_dir, 'ctest', 'echo "ctest ran"\nexit 0\n')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: 0)
+        job = tmp_path / 'job'
+        job.mkdir()
+        monkeypatch.chdir(job)
+        code = projectcheck.main(['--build', str(build), '--test', 'S.T',
+                                  '--witness', str(tmp_path / 'no' / 'such' / 'dir' / 'log')])
+        assert code == 0
+        assert 'ctest ran' in capsys.readouterr().out
+
+
+class TestTheGeneratedFileCarriesNoLogic:
+    """The point of the rewrite: what is generated is an argv, not a program.
+
+    A branch written into a generated script is first executed in a live run,
+    where a wrong verdict is indistinguishable from a good reduction.
+    """
+
+    def script(self, tmp_path, target='unit_tests'):
+        class Project:
+            build_dir = tmp_path / 'build'
+
+        Project.build_dir.mkdir(parents=True, exist_ok=True)
+        return project.check_script(
+            Project, 'Some.Test', tmp_path / 'check.sh', target=target
+        ).read_text()
+
+    def test_it_is_a_shebang_a_comment_and_one_exec(self, tmp_path):
+        lines = [line for line in self.script(tmp_path).splitlines() if line.strip()]
+        assert len(lines) == 3
+        assert lines[0] == '#!/bin/sh'
+        assert lines[2].startswith('PYTHONPATH=') and ' exec ' in lines[2]
+
+    def test_it_decides_nothing(self, tmp_path):
+        body = self.script(tmp_path).splitlines()[-1]
+        words = set(re.findall(r'[a-z]+', body)) | set(re.findall(r'[&|$][&|(]', body))
+        for construct in ('if', 'then', 'else', 'fi', 'while', 'case', '&&', '||', '$('):
+            assert construct not in words, f'the generated script branches on {construct!r}'
+
+    def test_the_target_reaches_the_check(self, tmp_path):
+        assert '--target unit_tests' in self.script(tmp_path)
+
+    def test_no_target_means_no_target_argument(self, tmp_path):
+        assert '--target' not in self.script(tmp_path, target=None)
