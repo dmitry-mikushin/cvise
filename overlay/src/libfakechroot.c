@@ -421,6 +421,8 @@ LOCAL int fakechroot_overlay_hide (const char * path, char * buf)
    rebuild is still read from the shared original. */
 LOCAL const char * fakechroot_overlay_path_write (const char * path, char * buf, int truncating)
 {
+    char whiteout[FAKECHROOT_PATH_MAX];
+
     if (!overlay_delta_path(path, buf))
         return path;
 
@@ -428,6 +430,22 @@ LOCAL const char * fakechroot_overlay_path_write (const char * path, char * buf,
         return buf;
 
     overlay_make_parents(buf);
+
+    /* A path this candidate DELETED starts empty, never from the original.
+     *
+     * Copying up here would fetch the shared tree's version of a file the
+     * candidate removed, and the writer would then be extending content its
+     * own candidate does not contain. MEASURED before this check: delete a
+     * file, reopen it O_WRONLY|O_CREAT without O_TRUNC, write three bytes --
+     *
+     *     'NEWGINAL-CONTENT-THAT-THE-CANDIDATE-DELETED'
+     *
+     * the deletion silently undone underneath. The symptom that led here was
+     * milder and easy to dismiss: O_CREAT|O_EXCL over a deleted path returned
+     * EEXIST, because the copy-up had just put the file back. */
+    if (fakechroot_overlay_hidden(path, whiteout))
+        return buf;
+
     if (!truncating && overlay_exists(path) && overlay_copy_up(path, buf) != 0) {
         /* Nothing was copied up, so writing into the delta would start from an
            empty file and quietly lose what was there. Let the caller work on
