@@ -20,7 +20,20 @@
 
 #include <config.h>
 
-#if defined(HAVE_LSTAT64) && !defined(HAVE___LXSTAT64)
+/* Not `&& !defined(HAVE___LXSTAT64)`, which is what stood here.
+ *
+ * The assumption was that a libc with __lxstat64 spells lstat64 as an inline
+ * calling it, so wrapping both would be redundant. That has not been true since
+ * glibc 2.33: lstat64 is an exported function in its own right, and __lxstat64
+ * survives only as a compat symbol for older binaries. A libc has both, and
+ * different programs in the same build call different ones.
+ *
+ * MEASURED the moment the legacy family was enabled: eleven of twelve ways of
+ * asking whether a file exists were redirected and lstat64 was not, because
+ * enabling __lxstat64 compiled this file out. Its siblings -- stat.c, stat64.c,
+ * lstat.c, fstatat.c -- carry no such exclusion, and this one was alone in it.
+ */
+#ifdef HAVE_LSTAT64
 
 #define _LARGEFILE64_SOURCE
 #define _BSD_SOURCE

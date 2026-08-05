@@ -37,10 +37,14 @@ LOCAL int __lxstat64_rel(int, const char *, struct stat64 *);
 
 wrapper(__lxstat64, int, (int ver, const char * filename, struct stat64 * buf))
 {
+    /* Not inside the `if`, where it was: the pointer was made to point at a
+       buffer whose block ended on the next line, and the call below then read
+       it. Reachable only since this file started being compiled at all. */
+    char abs_filename[FAKECHROOT_PATH_MAX];
+
     debug("__lxstat64(%d, \"%s\", &buf)", ver, filename);
 
     if (filename && !fakechroot_localdir(filename)) {
-        char abs_filename[FAKECHROOT_PATH_MAX];
         rel2abs(filename, abs_filename);
         filename = abs_filename;
     }

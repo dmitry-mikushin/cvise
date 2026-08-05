@@ -15,6 +15,7 @@
 # It is a native component of this tool, so it is built like one.
 
 include(CheckCSourceCompiles)
+include(CheckFunctionExists)
 include(CheckIncludeFile)
 include(CheckStructHasMember)
 include(CheckSymbolExists)
@@ -58,12 +59,6 @@ foreach(symbol_and_header
     "unlinkat unistd.h"
     "utimensat sys/stat.h"
     "vfork unistd.h"
-    "__fxstatat sys/stat.h"
-    "__fxstatat64 sys/stat.h"
-    "__lxstat sys/stat.h"
-    "__lxstat64 sys/stat.h"
-    "__xstat sys/stat.h"
-    "__xstat64 sys/stat.h"
     "__open fcntl.h"
     "__open64 fcntl.h"
     "__open_2 fcntl.h"
@@ -81,6 +76,45 @@ foreach(symbol_and_header
   string(TOUPPER "HAVE_${symbol}" have_var)
   string(REGEX REPLACE "[^A-Z0-9_]" "_" have_var "${have_var}")
   check_symbol_exists("${symbol}" "${header}" "${have_var}")
+endforeach()
+
+# The pre-2.33 glibc stat family, asked of the C library rather than of its
+# headers -- which is the only question that has anything to do with the job.
+#
+# What must be redirected is not what this machine compiles, it is what other
+# people's binaries call. glibc 2.33 stopped DECLARING these and kept EXPORTING
+# them forever, so a header check says "absent" on any modern system while every
+# binary built before the change still calls them. Compiling the wrappers out on
+# that answer leaves those programs talking straight to the kernel.
+#
+# MEASURED, and it is not a corner case. The ninja in the project's build image
+# imports __xstat64 and __fxstat64; the overlay exported stat, stat64, lstat,
+# fstatat and statx and none of the legacy six. On one path, at one instant, in
+# one process:
+#
+#     stat()      -> ENOENT      <- python, clang, and every probe written here
+#     __xstat()   -> PRESENT     <- ninja
+#     __xstat64() -> PRESENT
+#
+# so a candidate that deleted 376 object files was told there was nothing to
+# rebuild, and was graded on the previous candidate's binary. Two full runs
+# ended that way, and a miniature of the same thing passed every time because
+# it used this machine's ninja, which is new enough to call stat().
+#
+# check_function_exists links against the C library without needing a
+# declaration, so it answers about the ABI. On a libc that genuinely lacks
+# these -- musl -- it says no and the wrappers stay out, which is correct there.
+foreach(symbol
+    "__xstat"
+    "__xstat64"
+    "__lxstat"
+    "__lxstat64"
+    "__fxstatat"
+    "__fxstatat64"
+    )
+  string(TOUPPER "HAVE_${symbol}" have_var)
+  string(REGEX REPLACE "[^A-Z0-9_]" "_" have_var "${have_var}")
+  check_function_exists("${symbol}" "${have_var}")
 endforeach()
 
 check_include_file("alloca.h" HAVE_ALLOCA_H)

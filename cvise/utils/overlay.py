@@ -75,14 +75,84 @@ def overlay_configured() -> bool:
     return bool(library_path())
 
 
+# Every way a program can ask "is this file there", and how to call each one.
+#
+# They are not interchangeable. glibc 2.33 stopped declaring the `__xstat`
+# family and kept exporting it, so a binary built before that change calls
+# symbols a modern header will not even mention -- and an overlay configured by
+# asking its own headers compiles those wrappers out and lets such a program
+# read straight through it. That is not hypothetical: the ninja in one project's
+# build image imports __xstat64 and __fxstat64, and on one path, in one process,
+# at one instant, the answers disagreed:
+#
+#     stat()      -> ENOENT        <- python, clang, every probe written by hand
+#     __xstat()   -> PRESENT       <- ninja
+#     __xstat64() -> PRESENT
+#
+# The build system therefore saw an untouched tree, rebuilt nothing, and every
+# candidate was graded on the previous candidate's binary. Two runs ended that
+# way while the overlay reported itself healthy, because the only question being
+# asked was whether the library had loaded.
+#
+# So each entry point is asked separately. A libc that does not have one at all
+# is not a failure -- musl has none of the legacy six -- but a libc that has one
+# and answers differently from the others is.
+AT_FDCWD = -100
+STAT_ENTRY_POINTS = (
+    # name, how to invoke it with (path, buffer)
+    ('__xstat', 'fn(1, path, buf)'),
+    ('__xstat64', 'fn(1, path, buf)'),
+    ('__lxstat', 'fn(1, path, buf)'),
+    ('__lxstat64', 'fn(1, path, buf)'),
+    ('__fxstatat', f'fn(1, {AT_FDCWD}, path, buf, 0)'),
+    ('__fxstatat64', f'fn(1, {AT_FDCWD}, path, buf, 0)'),
+    ('stat', 'fn(path, buf)'),
+    ('stat64', 'fn(path, buf)'),
+    ('lstat', 'fn(path, buf)'),
+    ('lstat64', 'fn(path, buf)'),
+    ('fstatat', f'fn({AT_FDCWD}, path, buf, 0)'),
+    ('fstatat64', f'fn({AT_FDCWD}, path, buf, 0)'),
+)
+
+# Asked in a child, because the library is preloaded into the jobs and their
+# compilers, never into the reducer. Prints the challenge answer, then one line
+# per entry point that this C library actually has.
+PROOF = r'''
+import ctypes, sys
+
+libc = ctypes.CDLL(None)
+fn = libc[{symbol!r}]
+fn.restype = ctypes.c_uint64
+fn.argtypes = [ctypes.c_uint64]
+print('challenge', fn({challenge}))
+
+path = {probe!r}.encode()
+buf = ctypes.create_string_buffer(1024)   # any struct stat variant fits
+for name in {names!r}:
+    try:
+        fn = getattr(libc, name)
+    except AttributeError:
+        continue                          # this libc does not have it at all
+    print(name, 'visible' if eval({calls!r}[name]) == 0 else 'hidden')
+'''
+
+
 def prove_overlay() -> int:
     """Prove the overlay works in a process built exactly like a job's.
 
-    Asking the question inside C-Vise itself would answer about the wrong
-    process: the library is preloaded into the interestingness test and its
-    compilers, not into the reducer. So the proof is run in a child set up the
-    same way a job will be -- same library, same kind of delta -- and what it
-    demonstrates is what the jobs will get.
+    Two independent questions, because either one passing alone is compatible
+    with a reduction that grades every candidate against untouched code.
+
+    Did this code run? The answer is a function of a random challenge, so a stub
+    returning a constant cannot forge it and a missing symbol cannot be mistaken
+    for a negative answer.
+
+    Is the redirection live, on every entry point? A path that exists only in the
+    delta must be visible, and it must be visible whichever way it is asked. This
+    was documented here and not actually performed: the probe file was written
+    into the delta and nothing ever looked for it, so the run that ended with the
+    build reading straight through the overlay had been told the overlay was
+    proven.
     """
     lib = library_path()
     if not lib:
@@ -97,13 +167,20 @@ def prove_overlay() -> int:
         probe = Path(delta) / PROBE_PATH.lstrip('/')
         probe.parent.mkdir(parents=True, exist_ok=True)
         probe.write_text('probe\n')
+        if Path(PROBE_PATH).exists():
+            # The probe proves redirection by being visible where only the delta
+            # has it. If the root has it too, every answer would be "visible"
+            # whether anything was redirected or not.
+            raise OverlayNotProvenError(
+                f'{PROBE_PATH} exists outside the delta, so it cannot show redirection'
+            )
         env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: delta, ROOT_ENV: '/'}
-        code = (
-            'import ctypes\n'
-            'fn = ctypes.CDLL(None)[%r]\n'
-            'fn.restype = ctypes.c_uint64\n'
-            'fn.argtypes = [ctypes.c_uint64]\n'
-            'print(fn(%d))\n' % (SYMBOL, challenge)
+        code = PROOF.format(
+            symbol=SYMBOL,
+            challenge=challenge,
+            probe=PROBE_PATH,
+            names=[name for name, _ in STAT_ENTRY_POINTS],
+            calls=dict(STAT_ENTRY_POINTS),
         )
         proc = subprocess.run([sys.executable, '-c', code], capture_output=True,
                               text=True, env=env)
@@ -112,14 +189,40 @@ def prove_overlay() -> int:
         raise OverlayNotProvenError(
             f'a child with {lib} preloaded could not answer: {proc.stderr.strip()[:200]}'
         )
+
+    answers = {}
+    challenge_answer = None
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(' ')
+        if key == 'challenge':
+            challenge_answer = value
+        else:
+            answers[key] = value
+
+    if challenge_answer is None:
+        raise OverlayNotProvenError(f'no answer at all: {proc.stdout.strip()[:80]}')
     try:
-        answer = int(proc.stdout.strip())
+        answer = int(challenge_answer)
     except ValueError:
-        raise OverlayNotProvenError(f'the answer was not a number: {proc.stdout.strip()[:80]}')
+        raise OverlayNotProvenError(f'the answer was not a number: {challenge_answer[:80]}')
     if answer != expected:
         raise OverlayNotProvenError(
             f'the answer to the challenge is wrong ({answer} instead of {expected}), so the '
             'library either does not redirect or is not the overlay this build expects'
+        )
+
+    if not answers:
+        raise OverlayNotProvenError(
+            'the library loaded but no way of asking whether a file exists could be '
+            'tested, so nothing shows the redirection is live'
+        )
+    blind = sorted(name for name, seen in answers.items() if seen != 'visible')
+    if blind:
+        raise OverlayNotProvenError(
+            f'{len(answers) - len(blind)} of {len(answers)} ways of asking whether a file '
+            f'exists are redirected, and these are not: {", ".join(blind)}. A build tool '
+            'that calls one of those reads the original tree, finds nothing changed and '
+            'rebuilds nothing, and its test then runs the previous candidate\'s binary'
         )
     return answer
 
