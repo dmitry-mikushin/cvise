@@ -198,6 +198,12 @@ def remove_state(root: Path) -> None:
 
 
 def main() -> int:
+    # Interleaved with the container's output rather than flushed after it.
+    # Left buffered, this program's own lines are written when it exits, so a
+    # log read afterwards shows the banner BELOW the run it introduces -- which
+    # reads exactly like a second run started after the first one failed, and
+    # was read that way once.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('name', nargs='?', default='ns-projection',
                         help='run label; state lives in /dev/shm/cvise-<name>')
@@ -206,6 +212,11 @@ def main() -> int:
                         help='continue on the worktree as C-Vise left it')
     parser.add_argument('--fresh', action='store_true',
                         help='discard the state and start over')
+    parser.add_argument(
+        '--keep',
+        action='store_true',
+        help='keep every job directory and the container, for diagnosing a run',
+    )
     parser.add_argument('--dry-run', action='store_true',
                         help='print the command that would run, and stop')
     args = parser.parse_args()
@@ -238,7 +249,15 @@ def main() -> int:
 
     ceiling_mb = available_mb() * 3 // 4
     command = [
-        'docker', 'run', '--rm',
+        'docker', 'run',
+    ]
+    # A diagnostic run keeps what it did. `--rm` is not what takes the job
+    # directories away -- they are under TMPDIR in the bind mount and outlive
+    # the container -- C-Vise deletes each one as soon as it has the verdict,
+    # and --save-temps is the switch for that. Both are held here so that a run
+    # being diagnosed leaves the container's exit status behind as well.
+    command += [] if args.keep else ['--rm']
+    command += [
         # The reduction's own cgroup ceiling cannot engage in here -- inside the
         # container it is already at the root of its hierarchy and has nothing
         # to bound itself under -- so the bound is put on the container.
@@ -275,8 +294,10 @@ def main() -> int:
         # copying 6375 files and 1485 directories, 39% of the machine in mkdir
         # and 4% doing useful work, and no verdict at all in 80 minutes.
         'cvise', '--n', str(jobs), '--under', SUBMODULE,
-        f'{SRC}/CMakeLists.txt', TEST,
     ]
+    if args.keep:
+        command.append('--save-temps')
+    command += [f'{SRC}/CMakeLists.txt', TEST]
 
     if args.dry_run:
         print('=== would run:')
