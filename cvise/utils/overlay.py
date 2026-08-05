@@ -75,44 +75,70 @@ def overlay_configured() -> bool:
     return bool(library_path())
 
 
-# Every way a program can ask "is this file there", and how to call each one.
+# How to call each way of asking "is this file there", and which of them the
+# library claims to handle -- read off the library, never listed here.
 #
-# They are not interchangeable. glibc 2.33 stopped declaring the `__xstat`
-# family and kept exporting it, so a binary built before that change calls
-# symbols a modern header will not even mention -- and an overlay configured by
-# asking its own headers compiles those wrappers out and lets such a program
-# read straight through it. That is not hypothetical: the ninja in one project's
-# build image imports __xstat64 and __fxstat64, and on one path, in one process,
-# at one instant, the answers disagreed:
+# A list written here is a second list. The overlay wrapped `stat` and not
+# `__xstat64`; this file asked about `stat` and not `__xstat64`; the ninja in
+# one project's build image calls `__xstat64`. Two hand-kept lists agreeing is a
+# coincidence that has to be renewed at every edit, and when they stopped
+# agreeing nothing said so:
 #
 #     stat()      -> ENOENT        <- python, clang, every probe written by hand
 #     __xstat()   -> PRESENT       <- ninja
 #     __xstat64() -> PRESENT
 #
-# The build system therefore saw an untouched tree, rebuilt nothing, and every
-# candidate was graded on the previous candidate's binary. Two runs ended that
-# way while the overlay reported itself healthy, because the only question being
-# asked was whether the library had loaded.
+# so the build system saw an untouched tree, rebuilt nothing, and two runs ended
+# with every candidate graded on the previous candidate's binary -- while this
+# check reported the overlay healthy, because all it asked was whether the
+# library had loaded.
 #
-# So each entry point is asked separately. A libc that does not have one at all
-# is not a failure -- musl has none of the legacy six -- but a libc that has one
-# and answers differently from the others is.
+# What is written here is only how each one is CALLED, which is a property of
+# the C library's signatures and not of what this build wraps. Whether it is
+# asked at all comes from the library's own exported symbols, so a wrapper that
+# gets compiled out takes its entry in this check with it, and a wrapper that
+# gets added is exercised without anyone remembering to add it here too.
 AT_FDCWD = -100
-STAT_ENTRY_POINTS = (
-    # name, how to invoke it with (path, buffer)
-    ('__xstat', 'fn(1, path, buf)'),
-    ('__xstat64', 'fn(1, path, buf)'),
-    ('__lxstat', 'fn(1, path, buf)'),
-    ('__lxstat64', 'fn(1, path, buf)'),
-    ('__fxstatat', f'fn(1, {AT_FDCWD}, path, buf, 0)'),
-    ('__fxstatat64', f'fn(1, {AT_FDCWD}, path, buf, 0)'),
-    ('stat', 'fn(path, buf)'),
-    ('stat64', 'fn(path, buf)'),
-    ('lstat', 'fn(path, buf)'),
-    ('lstat64', 'fn(path, buf)'),
-    ('fstatat', f'fn({AT_FDCWD}, path, buf, 0)'),
-    ('fstatat64', f'fn({AT_FDCWD}, path, buf, 0)'),
-)
+HOW_TO_ASK = {
+    'stat': 'fn(path, buf)',
+    'stat64': 'fn(path, buf)',
+    'lstat': 'fn(path, buf)',
+    'lstat64': 'fn(path, buf)',
+    'statx': f'fn({AT_FDCWD}, path, 0, 0, buf)',
+    'fstatat': f'fn({AT_FDCWD}, path, buf, 0)',
+    'fstatat64': f'fn({AT_FDCWD}, path, buf, 0)',
+    '__xstat': 'fn(1, path, buf)',
+    '__xstat64': 'fn(1, path, buf)',
+    '__lxstat': 'fn(1, path, buf)',
+    '__lxstat64': 'fn(1, path, buf)',
+    '__fxstatat': f'fn(1, {AT_FDCWD}, path, buf, 0)',
+    '__fxstatat64': f'fn(1, {AT_FDCWD}, path, buf, 0)',
+}
+
+# The least this may ever come down to. Reading the entry points off the library
+# makes the check follow the library, including downwards: a build that wrapped
+# nothing would be checked for nothing and would pass. These are the spellings
+# whose absence has already cost two runs, so their absence is a failure and not
+# a shorter list.
+REQUIRED = ('stat', '__xstat64')
+
+
+def stat_entry_points(library: str) -> dict:
+    """Which ways of asking this library actually wraps, and how to call them."""
+    try:
+        listing = subprocess.run(
+            ['nm', '-D', '--defined-only', library], capture_output=True, text=True
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        listing = ''
+    wrapped = {line.split()[-1] for line in listing.splitlines() if ' T ' in line}
+    if not wrapped:
+        # nm is missing or said nothing. Falling back to the whole table would
+        # test entry points the library may not wrap and fail for the wrong
+        # reason; testing none would pass for the wrong reason. Ask about the
+        # ones that must be there either way.
+        return {name: HOW_TO_ASK[name] for name in REQUIRED}
+    return {name: how for name, how in HOW_TO_ASK.items() if name in wrapped}
 
 # Asked in a child, because the library is preloaded into the jobs and their
 # compilers, never into the reducer. Prints the challenge answer, then one line
@@ -175,12 +201,21 @@ def prove_overlay() -> int:
                 f'{PROBE_PATH} exists outside the delta, so it cannot show redirection'
             )
         env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: delta, ROOT_ENV: '/'}
+        asked = stat_entry_points(lib)
+        missing = [name for name in REQUIRED if name not in asked]
+        if missing:
+            raise OverlayNotProvenError(
+                f'{lib} does not wrap {", ".join(missing)}. A build tool that spells '
+                'the question that way reads the original tree, finds nothing changed '
+                'and rebuilds nothing, and its test then runs the previous '
+                "candidate's binary"
+            )
         code = PROOF.format(
             symbol=SYMBOL,
             challenge=challenge,
             probe=PROBE_PATH,
-            names=[name for name, _ in STAT_ENTRY_POINTS],
-            calls=dict(STAT_ENTRY_POINTS),
+            names=sorted(asked),
+            calls=asked,
         )
         proc = subprocess.run([sys.executable, '-c', code], capture_output=True,
                               text=True, env=env)

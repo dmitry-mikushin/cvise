@@ -25,86 +25,75 @@ set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 # Every one of these guards a wrapper for a function that may or may not exist
 # on this libc. A wrapper compiled for a function that is absent would fail to
 # link; one skipped for a function that is present is a hole through which a job
-# writes into the shared tree.
-foreach(symbol_and_header
-    "canonicalize_file_name stdlib.h"
-    "creat64 fcntl.h"
-    "eaccess unistd.h"
-    "euidaccess unistd.h"
-    "fchdir unistd.h"
-    "faccessat unistd.h"
-    "fchmodat sys/stat.h"
-    "fopen64 stdio.h"
-    "freopen64 stdio.h"
-    "futimesat sys/time.h"
-    "futimens sys/stat.h"
-    "glob64 glob.h"
-    "linkat unistd.h"
-    "lstat64 sys/stat.h"
-    "lutimes sys/time.h"
-    "mkdirat sys/stat.h"
-    "mkdtemp stdlib.h"
-    "mkostemp stdlib.h"
-    "mkstemps stdlib.h"
-    "open64 fcntl.h"
-    "openat fcntl.h"
-    "openat64 fcntl.h"
-    "readlinkat unistd.h"
-    "renameat stdio.h"
-    "scandir dirent.h"
-    "stat64 sys/stat.h"
-    "statx sys/stat.h"
-    "symlinkat unistd.h"
-    "truncate64 unistd.h"
-    "unlinkat unistd.h"
-    "utimensat sys/stat.h"
-    "vfork unistd.h"
-    "__open fcntl.h"
-    "__open64 fcntl.h"
-    "__open_2 fcntl.h"
-    "__open64_2 fcntl.h"
-    "__openat_2 fcntl.h"
-    "__openat64_2 fcntl.h"
-    "__readlink_chk unistd.h"
-    "__readlinkat_chk unistd.h"
-    "__realpath_chk stdlib.h"
-    "__chk_fail stdlib.h"
-    )
-  separate_arguments(parts UNIX_COMMAND "${symbol_and_header}")
-  list(GET parts 0 symbol)
-  list(GET parts 1 header)
-  string(TOUPPER "HAVE_${symbol}" have_var)
-  string(REGEX REPLACE "[^A-Z0-9_]" "_" have_var "${have_var}")
-  check_symbol_exists("${symbol}" "${header}" "${have_var}")
-endforeach()
-
-# The pre-2.33 glibc stat family, asked of the C library rather than of its
-# headers -- which is the only question that has anything to do with the job.
+# reads the original tree or writes into it.
 #
-# What must be redirected is not what this machine compiles, it is what other
-# people's binaries call. glibc 2.33 stopped DECLARING these and kept EXPORTING
-# them forever, so a header check says "absent" on any modern system while every
-# binary built before the change still calls them. Compiling the wrappers out on
-# that answer leaves those programs talking straight to the kernel.
+# Asked of the C library, never of its headers. What has to be redirected is not
+# what this machine compiles, it is what other people's binaries call, and the
+# two answers differ:
 #
-# MEASURED, and it is not a corner case. The ninja in the project's build image
-# imports __xstat64 and __fxstat64; the overlay exported stat, stat64, lstat,
-# fstatat and statx and none of the legacy six. On one path, at one instant, in
-# one process:
+#   * glibc 2.33 stopped DECLARING the __xstat family and kept EXPORTING it
+#     forever, so a header check says "absent" on any modern system while every
+#     binary built before the change goes on calling it;
+#   * the fortified entry points -- __open_2, __readlink_chk, __realpath_chk --
+#     are never declared as ordinary functions at all. They are what a program
+#     compiled with -D_FORTIFY_SOURCE=2 calls, which on Debian and Ubuntu is
+#     every program in the image.
 #
-#     stat()      -> ENOENT      <- python, clang, and every probe written here
+# MEASURED against the configuration this file actually produced: sixteen
+# wrappers were being compiled out for functions the C library has, and the
+# ninja in one project's build image imports __xstat64. On one path, in one
+# process, at one instant:
+#
+#     stat()      -> ENOENT      <- python, clang, every probe written by hand
 #     __xstat()   -> PRESENT     <- ninja
 #     __xstat64() -> PRESENT
 #
-# so a candidate that deleted 376 object files was told there was nothing to
-# rebuild, and was graded on the previous candidate's binary. Two full runs
-# ended that way, and a miniature of the same thing passed every time because
-# it used this machine's ninja, which is new enough to call stat().
+# so the build system saw an untouched tree, rebuilt nothing, and the test ran
+# the previous candidate's binary. Two full runs ended with no verdict at all.
 #
-# check_function_exists links against the C library without needing a
-# declaration, so it answers about the ABI. On a libc that genuinely lacks
-# these -- musl -- it says no and the wrappers stay out, which is correct there.
+# check_function_exists links against the C library and needs no declaration, so
+# it answers about the ABI. On a libc that genuinely lacks one -- musl has none
+# of the legacy or fortified names -- it still says no and the wrapper stays out.
 foreach(symbol
+    "canonicalize_file_name"
+    "creat64"
+    "eaccess"
+    "euidaccess"
+    "fchdir"
+    "faccessat"
+    "fchmodat"
+    "fopen64"
+    "freopen64"
+    "futimesat"
+    "futimens"
+    "glob64"
+    "linkat"
+    "lstat64"
+    "lutimes"
+    "mkdirat"
+    "open64"
+    "openat"
+    "openat64"
+    "readlinkat"
+    "renameat"
+    "scandir"
+    "stat64"
+    "statx"
+    "symlinkat"
+    "truncate64"
+    "unlinkat"
+    "utimensat"
+    "vfork"
+    "__open"
+    "__open64"
+    "__open_2"
+    "__open64_2"
+    "__openat_2"
+    "__openat64_2"
+    "__readlink_chk"
+    "__readlinkat_chk"
+    "__realpath_chk"
+    "__chk_fail"
     "__xstat"
     "__xstat64"
     "__lxstat"

@@ -42,10 +42,6 @@ lstat64.c
 lutimes.c
 mkdir.c
 mkdirat.c
-mkdtemp.c
-mkostemp.c
-mkstemp.c
-mkstemps.c
 open.c
 open64.c
 openat.c

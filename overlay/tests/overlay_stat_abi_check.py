@@ -37,8 +37,13 @@ from pathlib import Path
 
 AT_FDCWD = -100
 
-# name -> how to call it with (path, buf) in scope
-ENTRY_POINTS = {
+# How each spelling is CALLED -- a property of the C library's signatures, not
+# of what this build wraps. WHICH of them are exercised is read off the library
+# below, so that a wrapper compiled out takes its entry here with it and a
+# wrapper added is exercised without anyone remembering to add it here too. Two
+# hand-kept lists agreeing is a coincidence renewed at every edit, and when they
+# stopped agreeing nothing said so.
+HOW_TO_ASK = {
     'stat': 'fn(path, buf)',
     'stat64': 'fn(path, buf)',
     'lstat': 'fn(path, buf)',
@@ -52,6 +57,11 @@ ENTRY_POINTS = {
     '__fxstatat': f'fn(1, {AT_FDCWD}, path, buf, 0)',
     '__fxstatat64': f'fn(1, {AT_FDCWD}, path, buf, 0)',
 }
+
+# The least this may ever come down to. Reading the list off the library makes
+# this follow the library downwards as well: one that wrapped nothing would be
+# checked for nothing and would pass.
+REQUIRED = ('stat', '__xstat64')
 
 ASK = '''
 import ctypes
@@ -67,9 +77,17 @@ for name in {names!r}:
 '''
 
 
-def ask(library, path, delta, root):
-    """What every entry point in this libc says about a path, inside a job."""
-    code = ASK.format(path=str(path).encode(), names=sorted(ENTRY_POINTS), calls=ENTRY_POINTS)
+def wrapped_by(library):
+    """Which spellings this library actually wraps."""
+    out = subprocess.run(['nm', '-D', '--defined-only', str(library)],
+                         capture_output=True, text=True).stdout
+    names = {line.split()[-1] for line in out.splitlines() if ' T ' in line}
+    return {name: how for name, how in HOW_TO_ASK.items() if name in names}
+
+
+def ask(library, path, delta, root, entry_points):
+    """What every entry point this library wraps says about a path, inside a job."""
+    code = ASK.format(path=str(path).encode(), names=sorted(entry_points), calls=entry_points)
     proc = subprocess.run(
         [sys.executable, '-c', code],
         capture_output=True,
@@ -109,6 +127,16 @@ def main():
         print('CVISE_OVERLAY_LIB is not set to an existing library', file=sys.stderr)
         return 2
 
+    entry_points = wrapped_by(library)
+    absent = [name for name in REQUIRED if name not in entry_points]
+    if absent:
+        print(f'  FAIL the library does not wrap {", ".join(absent)}, so a build tool '
+              f'that spells the question that way reads the original tree')
+        print('FAIL')
+        return 1
+    print(f'  ok   the library wraps {len(entry_points)} of '
+          f'{len(HOW_TO_ASK)} known spellings')
+
     work = Path(tempfile.mkdtemp(prefix='overlay-stat-abi-'))
     root, delta = work / 'root', work / 'delta'
     root.mkdir()
@@ -128,7 +156,7 @@ def main():
              'CVISE_OVERLAY_DELTA': str(delta), 'CVISE_OVERLAY_ROOT': str(root)},
         check=True,
     )
-    seen = ask(library, shared, delta, root)
+    seen = ask(library, shared, delta, root, entry_points)
     if seen is None:
         return 2
     ok &= report('a file this job deleted', seen, expected=False)
@@ -144,7 +172,7 @@ def main():
     only = root / 'candidate.cpp'
     (delta / str(only).lstrip('/')).parent.mkdir(parents=True, exist_ok=True)
     (delta / str(only).lstrip('/')).write_text('int main() { return 0; }\n')
-    seen = ask(library, only, delta, root)
+    seen = ask(library, only, delta, root, entry_points)
     if seen is None:
         return 2
     ok &= report('a file only this job has', seen, expected=True)
