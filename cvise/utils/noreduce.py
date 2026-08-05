@@ -61,6 +61,7 @@ import functools
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -88,6 +89,22 @@ def _lister() -> str | None:
     if os.path.isabs(found):
         return found if os.path.exists(found) else None
     return shutil.which(found)
+
+
+def _defines_marker(text: str) -> bool:
+    """Does this file provide the marker rather than use it?
+
+    The header that defines CVISE_NOREDUCE names it on every other line, and
+    none of those lines begins with it, so the warning below would fire on the
+    one file whose whole purpose is to mention it. MEASURED on a real run: 73
+    of 103 log lines were that warning about that header, drowning everything
+    the log was for -- including, on that occasion, whatever killed the run.
+
+    A warning nobody can act on trains its reader to ignore the channel it
+    arrives on, which costs more than it ever saves.
+    """
+    return re.search(rf'^\s*#\s*(?:define|undef|ifdef|ifndef)\s+{re.escape(MARKER)}\b',
+                     text, re.M) is not None
 
 
 def _marks(line: str) -> bool:
@@ -196,7 +213,7 @@ def _uses_marker(path: Path) -> bool:
         return True
     if has_protection(text):
         return True
-    if MARKER in text:
+    if MARKER in text and not _defines_marker(text):
         # The word is there but no line begins with it, so nothing is protected
         # and the file looks exactly like one that never asked to be. Somebody
         # wrote the marker and got no guard, which is the failure this whole

@@ -263,6 +263,23 @@ class TestAMarkerThatDoesNothingSaysSo:
             assert noreduce.marked_files(str(path.parent)) == ()
         assert caplog.records, 'an inert marker went unmentioned'
 
+    def test_the_header_that_defines_it_is_silent(self, tmp_path, caplog):
+        """The one file whose purpose is to name the marker must not be warned
+        about. MEASURED on a real run: 73 of 103 log lines were this warning
+        about that header, drowning everything the log was for."""
+        header = ('#pragma once\n'
+                  '// Marks a definition a reduction must not change.\n'
+                  '#if defined(__clang__)\n'
+                  '#define CVISE_NOREDUCE [[clang::annotate("cvise::noreduce")]]\n'
+                  '#else\n'
+                  '#define CVISE_NOREDUCE\n'
+                  '#endif\n')
+        path = write(tmp_path, 'noreduce.h', header)
+        noreduce.marked_files.cache_clear()
+        with caplog.at_level('WARNING'):
+            assert noreduce.marked_files(str(path.parent)) == ()
+        assert not caplog.records, 'warned about the header that provides the marker'
+
     def test_a_file_with_no_marker_at_all_is_silent(self, tmp_path, caplog):
         path = write(tmp_path, 'q.cpp', 'int f() { return 1; }\n')
         noreduce.marked_files.cache_clear()
