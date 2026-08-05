@@ -243,6 +243,14 @@ def main() -> int:
         # container it is already at the root of its hierarchy and has nothing
         # to bound itself under -- so the bound is put on the container.
         '--memory', f'{ceiling_mb}m',
+        # Equal to --memory, so the ceiling is a ceiling. Left larger, the
+        # cgroup may swap instead of refusing: on this machine a run with
+        # --memory 179G --memory-swap 358G exhausted 28.6 GB of swap, put 3539
+        # tasks in uninterruptible sleep and 2543 of them in one disk queue,
+        # reached a load of 3583 with the CPU idle, and had to be killed from
+        # another machine. An honest OOM kills one candidate; eternal direct
+        # reclaim kills the host.
+        '--memory-swap', f'{ceiling_mb}m',
         '-v', f'{repo}:{SRC}',
         '-v', f'{worktree}:{SRC}/{SUBMODULE}',
         # At an identical path on both sides, so that anything C-Vise writes
@@ -253,6 +261,11 @@ def main() -> int:
         # instead of rebuilding its directory tree inside every job's delta.
         '-e', f'CCACHE_DIR={ccache}',
         '-e', 'CCACHE_MAXSIZE=20G',
+        # The test target carries a precompiled header, and without this ccache
+        # refuses to use its own entries for anything built with one: MEASURED,
+        # 891 calls missed with "Could not use precompiled header" while the
+        # rest of the run hit 86.67% of the time.
+        '-e', 'CCACHE_SLOPPINESS=pch_defines,time_macros',
         '-w', SRC, IMAGE,
         # Configured from the root, because that is the only configuration in
         # which this component's tests exist at all -- cpp/test asks whether
