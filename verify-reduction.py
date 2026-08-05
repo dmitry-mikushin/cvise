@@ -23,7 +23,6 @@ is being verified.
 """
 
 import argparse
-import shutil
 import subprocess
 import sys
 import time
@@ -72,7 +71,17 @@ def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
     reduction = container_of(state)
     work = state / 'verify'
     if work.exists():
-        shutil.rmtree(work, ignore_errors=True)
+        # Removed from inside a container, because the previous attempt made it
+        # as root and this process is not. `shutil.rmtree(ignore_errors=True)`
+        # was here and did what it was told: it failed, said nothing, and the
+        # mkdir on the next line raised FileExistsError about a directory the
+        # code believed it had just deleted. An error discarded is an error that
+        # surfaces somewhere it cannot be understood.
+        removed = run(['docker', 'run', '--rm', '-v', f'{state}:{state}',
+                       IMAGE, 'rm', '-rf', str(work)])
+        if removed.returncode != 0 or work.exists():
+            print(f'cannot clear {work}: {removed.stderr.strip()[:200]}', file=sys.stderr)
+            return 2
     (work / 'build').mkdir(parents=True)
     (work / 'ccache').mkdir(parents=True)
 
@@ -109,7 +118,14 @@ def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
     if proc.returncode == 0:
         print(f'VERIFIED: the published tree builds from nothing and {test} passes')
         if not keep:
-            shutil.rmtree(work, ignore_errors=True)
+            # Through a container again: the build wrote as root, and a failure
+            # to clean up must be visible rather than left for the next run to
+            # trip over. It is the tmpfs the reduction itself lives in.
+            gone = run(['docker', 'run', '--rm', '-v', f'{work.parent}:{work.parent}',
+                        IMAGE, 'rm', '-rf', str(work)])
+            if gone.returncode != 0 or work.exists():
+                print(f'note: {work} could not be removed and still occupies the '
+                      'tmpfs the reduction runs in', file=sys.stderr)
         return 0
 
     print(f'FAILED (exit {proc.returncode}): what the reduction has published does '

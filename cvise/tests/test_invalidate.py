@@ -428,3 +428,93 @@ class TestKeptDirectoriesCanBeRead:
         with fileutil.TmpDirManager(prefix=str(tmp_path / 'private-')) as m:
             job = m.create_dir(prefix='job')
             assert not job.stat().st_mode & 0o077, oct(job.stat().st_mode)
+
+
+class TestOnlyAnUnusualVerdictKeepsItsDirectory:
+    """--save-temps once meant "keep every job directory", and that is not a
+    diagnostic aid on a real project. MEASURED on ns-projection: 3403 of them
+    holding the objects each job rebuilt came to 112 GB and filled a 126 GB
+    tmpfs, which is RAM on that machine. The run had to be killed, and not one
+    of the directories it was keeping had been opened.
+
+    What is worth opening is the verdict that was not ordinary, and only the
+    interestingness test knows which those are: C-Vise sees an exit code, and a
+    build that failed and a test that failed are both "nonzero".
+    """
+
+    def stub(self, directory, name, body):
+        directory.mkdir(parents=True, exist_ok=True)
+        tool = directory / name
+        tool.write_text('#!/bin/sh\n' + body)
+        tool.chmod(0o755)
+
+    def run(self, tmp_path, monkeypatch, *, ctest_exit=0, build_exit=0, killed=0):
+        build = tmp_path / 'build'
+        build.mkdir(exist_ok=True)
+        (build / 'unit_tests').write_text('old')
+        bin_dir = tmp_path / 'bin'
+        self.stub(bin_dir, 'cmake', f'echo "[1/3] Building"\nexit {build_exit}\n')
+        self.stub(bin_dir, 'ctest', f'exit {ctest_exit}\n')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: killed)
+        job = tmp_path / 'job'
+        job.mkdir(exist_ok=True)
+        monkeypatch.chdir(job)
+        projectcheck.main(['--build', str(build), '--test', 'S.T', '--target', 'unit_tests'])
+        marker = job / projectcheck.KEEP_MARKER
+        return marker.read_text().strip() if marker.exists() else None
+
+    def test_a_passing_candidate_leaves_nothing_behind(self, tmp_path, monkeypatch):
+        """The 99% whose line in the log says everything their directory would."""
+        assert self.run(tmp_path, monkeypatch, ctest_exit=0) is None
+
+    def test_a_candidate_that_did_not_compile_leaves_nothing_behind(self, tmp_path, monkeypatch):
+        assert self.run(tmp_path, monkeypatch, build_exit=1) is None
+
+    def test_a_failing_test_asks_to_be_kept(self, tmp_path, monkeypatch):
+        """It compiled, so the code is well-formed, and behaviour changed. That
+        is the rejection a person has to look at."""
+        why = self.run(tmp_path, monkeypatch, ctest_exit=8)
+        assert why is not None and '8' in why
+
+    def test_an_undecided_candidate_asks_to_be_kept(self, tmp_path, monkeypatch):
+        """The signature of a build that could not see the deletions."""
+        why = self.run(tmp_path, monkeypatch, killed=5)
+        assert why is not None and 'undecided' in why
+
+
+class TestWhatSurvivesAndWhatDoesNot:
+    """The manager's side of the same bargain."""
+
+    def test_a_marked_directory_survives_release(self, tmp_path):
+        from cvise.utils import fileutil
+
+        with fileutil.TmpDirManager(prefix=str(tmp_path / 'm-'), save_temps=True) as m:
+            kept, ordinary = m.create_dir(prefix='kept'), m.create_dir(prefix='plain')
+            (kept / fileutil.KEEP_MARKER).write_text('test failed with 8\n')
+            m.delete_dir(kept)
+            m.delete_dir(ordinary)
+            assert kept.exists(), 'the one directory worth opening was deleted'
+            assert not ordinary.exists(), 'an ordinary rejection was kept'
+
+    def test_a_kept_directory_stays_known_to_the_janitor(self, tmp_path):
+        """It is the janitor that removes whatever it does not recognise, so
+        forgetting a kept directory here deletes it a few seconds later."""
+        from cvise.utils import fileutil
+
+        with fileutil.TmpDirManager(prefix=str(tmp_path / 'j-'), save_temps=True) as m:
+            kept = m.create_dir(prefix='kept')
+            (kept / fileutil.KEEP_MARKER).write_text('undecided\n')
+            m.delete_dir(kept)
+            assert kept in m._dirs
+
+    def test_without_save_temps_even_a_marked_directory_goes(self, tmp_path):
+        """The marker asks; --save-temps decides. A run that was not asked to
+        keep anything must not start keeping things because a test failed."""
+        from cvise.utils import fileutil
+
+        with fileutil.TmpDirManager(prefix=str(tmp_path / 'n-')) as m:
+            marked = m.create_dir(prefix='marked')
+            (marked / fileutil.KEEP_MARKER).write_text('test failed with 8\n')
+            m.delete_dir(marked)
+            assert not marked.exists()

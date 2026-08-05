@@ -38,6 +38,22 @@ def CloseableTemporaryFile(mode='w+b', dir: Path | None = None):
         raise
 
 
+# What a job leaves behind to say it is worth keeping.
+#
+# --save-temps used to keep every job directory, and on a project of any size
+# that is not a diagnostic aid but a way to run out of memory: MEASURED on
+# ns-projection, 3403 job directories holding the objects each one rebuilt came
+# to 112 GB and filled a 126 GB tmpfs, which is RAM on this machine. The run had
+# to be killed, and the directories it was keeping were never looked at.
+#
+# Almost every candidate is rejected for an ordinary reason and its directory
+# answers nothing. The few that are worth opening are the ones whose verdict was
+# not ordinary, and only the interestingness test knows which those are -- C-Vise
+# sees an exit code, and a build failure and a test failure are both "nonzero".
+# So the test says so where it stands, and this reads what it said.
+KEEP_MARKER = '.cvise-keep'
+
+
 class TmpDirManager:
     TEMP_PREFIX = 'cvise-'
     JANITOR_INTERVAL = 10  # seconds
@@ -65,7 +81,10 @@ class TmpDirManager:
 
     def delete_dir(self, dir: Path) -> None:
         assert dir in self._dirs
-        if self._save_temps:
+        if self._save_temps and (dir / KEEP_MARKER).exists():
+            # Left in _dirs deliberately: the janitor removes whatever it finds
+            # under the root that it does not know about, so forgetting it here
+            # would delete it a few seconds later.
             return
         shutil.rmtree(dir, ignore_errors=True)  # the janitor thread will clean leftovers on error
         with self._lock:

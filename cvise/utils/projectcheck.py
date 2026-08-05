@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 from cvise.utils import invalidate
+from cvise.utils.fileutil import KEEP_MARKER
 from cvise.utils.project import build_failure_report
 
 
@@ -103,6 +104,26 @@ def edges_run(output: str) -> int:
     return max((int(k) for k, _ in numbered), default=0)
 
 
+def keep_this_job(why: str) -> None:
+    """Ask for this job's directory to survive, because its verdict was not ordinary.
+
+    Almost every candidate is rejected for a reason that is fully described by
+    the one line in the witness log, and its directory answers nothing that the
+    line does not. Keeping all of them is not a diagnostic aid: MEASURED on
+    ns-projection, 3403 of them came to 112 GB and filled a 126 GB tmpfs, which
+    is RAM here, and the run had to be killed with none of them ever opened.
+
+    The few worth opening are the ones whose verdict was not ordinary, and only
+    this program knows which those are. C-Vise sees an exit code, and a build
+    that failed and a test that failed are both "nonzero" -- the distinction
+    exists here and nowhere else, so it is recorded here.
+    """
+    try:
+        (Path.cwd() / KEEP_MARKER).write_text(why + '\n')
+    except OSError:
+        pass  # a lost marker costs a directory, never a verdict
+
+
 def record(witness: Path | None, **facts: object) -> None:
     """What a verdict rested on, written down as it is made.
 
@@ -158,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     if killed:
         if before is None:
             record(args.witness, **facts, test='undecided', rc='-', dir=Path.cwd())
+            keep_this_job(f'undecided: {killed} objects removed, no binary to compare')
             # Two absences compare equal, so there is nothing here to compare.
             # "I could not tell" must not be recorded as "it passed", which is
             # the very substitution this check exists to prevent.
@@ -167,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
             return UNDECIDABLE
         if before == after:
             record(args.witness, **facts, test='undecided', rc='-', dir=Path.cwd())
+            # The signature of a build that could not see the candidate's
+            # deletions, which is the failure this whole check exists for.
+            keep_this_job(f'undecided: {killed} objects removed and the binary did not change')
             # Something rebuilt it from a source this program cannot see -- a
             # cache that kept the old object, an overlay that never reached the
             # compiler. A verdict on that binary is a verdict about whichever
@@ -209,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
         rc=proc.returncode,
         dir=Path.cwd(),
     )
+    if proc.returncode != 0:
+        # A test that ran and failed is the interesting rejection: the candidate
+        # compiled, so the code is well-formed, and it changed behaviour. That is
+        # the one a person has to look at, and looking needs the directory.
+        keep_this_job(f'test failed with {proc.returncode}')
     print(proc.stdout, end='')
     return proc.returncode
 
