@@ -46,6 +46,7 @@ open.c
 open64.c
 openat.c
 openat64.c
+posix_spawn_file_actions_addopen.c
 opendir.c
 readlink.c
 readlinkat.c

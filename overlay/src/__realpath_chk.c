@@ -24,7 +24,12 @@
 
 #define _BSD_SOURCE
 #define _DEFAULT_SOURCE
+/* Guarded: a distribution that fortifies by default -- Debian and Ubuntu do --
+   has already defined this on the command line, and redefining it is an error
+   under -Werror. Never seen until these wrappers started being compiled. */
+#ifndef _FORTIFY_SOURCE
 #define _FORTIFY_SOURCE 2
+#endif
 #include <stddef.h>
 #include <stdlib.h>
 #include "libfakechroot.h"

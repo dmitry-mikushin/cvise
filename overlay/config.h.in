@@ -25,6 +25,7 @@
 #cmakedefine HAVE_OPEN64 1
 #cmakedefine HAVE_OPENAT 1
 #cmakedefine HAVE_OPENAT64 1
+#cmakedefine HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDOPEN 1
 #cmakedefine HAVE_READLINKAT 1
 #cmakedefine HAVE_RENAMEAT 1
 #cmakedefine HAVE_SCANDIR 1

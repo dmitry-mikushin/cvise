@@ -54,7 +54,7 @@ set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 # check_function_exists links against the C library and needs no declaration, so
 # it answers about the ABI. On a libc that genuinely lacks one -- musl has none
 # of the legacy or fortified names -- it still says no and the wrapper stays out.
-foreach(symbol
+set(checked_symbols
     "canonicalize_file_name"
     "creat64"
     "eaccess"
@@ -74,6 +74,7 @@ foreach(symbol
     "open64"
     "openat"
     "openat64"
+    "posix_spawn_file_actions_addopen"
     "readlinkat"
     "renameat"
     "scandir"
@@ -101,10 +102,31 @@ foreach(symbol
     "__fxstatat"
     "__fxstatat64"
     )
+foreach(symbol ${checked_symbols})
   string(TOUPPER "HAVE_${symbol}" have_var)
   string(REGEX REPLACE "[^A-Z0-9_]" "_" have_var "${have_var}")
   check_function_exists("${symbol}" "${have_var}")
 endforeach()
+
+# A symbol checked here whose guard is not in config.h.in gets no #define, so
+# its wrapper compiles out and the library quietly does not have it. That is the
+# same silent omission this whole file has been chasing, arriving through the
+# door of adding one. MEASURED the first time it happened: the wrapper was
+# written, listed and compiled, and exported nothing.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/config.h.in" config_template)
+set(ungarded "")
+foreach(symbol ${checked_symbols})
+  string(TOUPPER "HAVE_${symbol}" have_var)
+  string(REGEX REPLACE "[^A-Z0-9_]" "_" have_var "${have_var}")
+  if(NOT config_template MATCHES "#cmakedefine ${have_var} ")
+    list(APPEND ungarded "${have_var}")
+  endif()
+endforeach()
+if(ungarded)
+  message(FATAL_ERROR
+    "config.h.in has no #cmakedefine for: ${ungarded}. Without it the wrapper is "
+    "compiled out however present the function is, and nothing says so.")
+endif()
 
 check_include_file("alloca.h" HAVE_ALLOCA_H)
 check_include_file("sys/syscall.h" HAVE_SYS_SYSCALL_H)
