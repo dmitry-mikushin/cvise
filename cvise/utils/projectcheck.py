@@ -139,22 +139,25 @@ def main(argv: list[str] | None = None) -> int:
     seconds = time.monotonic() - started
     after = signature(binary)
 
-    record(
-        args.witness,
+    # Everything known so far, so that a candidate whose build failed leaves a
+    # record even though it never reaches the test. `test` says so rather than
+    # being absent, because an absent field reads as an unnoticed omission.
+    facts = dict(
         build=returncode,
         killed=killed,
         edges=edges_run(output),
         secs=f'{seconds:.1f}',
         rebuilt='no' if before == after else 'yes',
-        dir=Path.cwd(),
     )
 
     if returncode != 0:
+        record(args.witness, **facts, test='notrun', rc='-', dir=Path.cwd())
         print(build_failure_report(output, args.build))
         return returncode
 
     if killed:
         if before is None:
+            record(args.witness, **facts, test='undecided', rc='-', dir=Path.cwd())
             # Two absences compare equal, so there is nothing here to compare.
             # "I could not tell" must not be recorded as "it passed", which is
             # the very substitution this check exists to prevent.
@@ -163,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             print('cvise: to have been compiled at all.')
             return UNDECIDABLE
         if before == after:
+            record(args.witness, **facts, test='undecided', rc='-', dir=Path.cwd())
             # Something rebuilt it from a source this program cannot see -- a
             # cache that kept the old object, an overlay that never reached the
             # compiler. A verdict on that binary is a verdict about whichever
@@ -187,6 +191,23 @@ def main(argv: list[str] | None = None) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+    )
+    # Written after the test, not before it.
+    #
+    # The record used to be made as soon as the build finished, which left the
+    # one outcome that decides everything out of it: whether the candidate is
+    # interesting. A run then showed 36 records saying the build succeeded and
+    # the binary changed, against nothing published at all, and there was no way
+    # to tell an honestly failing test from a publication that had stopped
+    # working -- two faults repaired in opposite directions. Reported as
+    # "36 accepts" until the published tree was looked at, which is a guess
+    # dressed as a measurement.
+    record(
+        args.witness,
+        **facts,
+        test='pass' if proc.returncode == 0 else 'fail',
+        rc=proc.returncode,
+        dir=Path.cwd(),
     )
     print(proc.stdout, end='')
     return proc.returncode

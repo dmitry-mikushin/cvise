@@ -326,3 +326,105 @@ class TestHowMuchTheBuildActuallyDid:
         line = witness.read_text()
         assert 'edges=7' in line
         assert 'secs=' in line
+
+
+class TestTheRecordSaysHowTheTestWent:
+    """The outcome that decides everything, which the record used to omit.
+
+    It was written as soon as the build finished, so a candidate that built and
+    then failed its test and a candidate that built and passed produced the same
+    line. A run then showed 36 records saying the build succeeded and the binary
+    changed, against nothing published at all -- an honestly failing test and a
+    publication that had stopped working, which are repaired in opposite
+    directions, and nothing on hand to tell them apart. Reported as 36 accepts
+    until the published tree was looked at.
+    """
+
+    def stub(self, directory, name, body):
+        directory.mkdir(parents=True, exist_ok=True)
+        tool = directory / name
+        tool.write_text('#!/bin/sh\n' + body)
+        tool.chmod(0o755)
+
+    def run(self, tmp_path, monkeypatch, *, ctest_exit, build_exit=0):
+        build = tmp_path / 'build'
+        build.mkdir(exist_ok=True)
+        (build / 'unit_tests').write_text('old')
+        bin_dir = tmp_path / 'bin'
+        self.stub(bin_dir, 'cmake', f'echo "[1/3] Building"\nexit {build_exit}\n')
+        self.stub(bin_dir, 'ctest', f'echo "ctest ran"\nexit {ctest_exit}\n')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: 0)
+        job = tmp_path / 'job'
+        job.mkdir(exist_ok=True)
+        monkeypatch.chdir(job)
+        witness = tmp_path / 'verdicts.log'
+        code = projectcheck.main(['--build', str(build), '--test', 'S.T',
+                                  '--target', 'unit_tests', '--witness', str(witness)])
+        return code, witness.read_text()
+
+    def test_a_passing_test_is_recorded_as_passing(self, tmp_path, monkeypatch):
+        code, line = self.run(tmp_path, monkeypatch, ctest_exit=0)
+        assert code == 0
+        assert 'test=pass' in line and 'rc=0' in line
+
+    def test_a_failing_test_is_recorded_as_failing(self, tmp_path, monkeypatch):
+        """The line that used to be indistinguishable from the one above."""
+        code, line = self.run(tmp_path, monkeypatch, ctest_exit=8)
+        assert code == 8
+        assert 'test=fail' in line and 'rc=8' in line
+
+    def test_a_build_that_failed_says_the_test_never_ran(self, tmp_path, monkeypatch):
+        """Not an absent field: absent reads as an omission nobody noticed."""
+        code, line = self.run(tmp_path, monkeypatch, ctest_exit=0, build_exit=1)
+        assert code == 1
+        assert 'test=notrun' in line
+        assert 'ctest ran' not in line
+
+    def test_exactly_one_record_per_candidate(self, tmp_path, monkeypatch):
+        """Two lines for one verdict would double every count read off this."""
+        _, text = self.run(tmp_path, monkeypatch, ctest_exit=0)
+        assert len([line for line in text.splitlines() if line.strip()]) == 1
+
+    def test_an_undecidable_candidate_says_so_rather_than_passing(self, tmp_path, monkeypatch):
+        build = tmp_path / 'build'
+        build.mkdir()
+        bin_dir = tmp_path / 'bin'
+        self.stub(bin_dir, 'cmake', 'exit 0\n')
+        self.stub(bin_dir, 'ctest', 'echo "ctest ran"\nexit 0\n')
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: 5)
+        job = tmp_path / 'job'
+        job.mkdir()
+        monkeypatch.chdir(job)
+        witness = tmp_path / 'verdicts.log'
+        code = projectcheck.main(['--build', str(build), '--test', 'S.T',
+                                  '--target', 'unit_tests', '--witness', str(witness)])
+        assert code == projectcheck.UNDECIDABLE
+        assert 'test=undecided' in witness.read_text()
+
+
+class TestKeptDirectoriesCanBeRead:
+    """--save-temps is for examining a run afterwards, which needs opening them.
+
+    Inside a container these are made by root while the person reading them is
+    not, and `ls 2>/dev/null | wc -l` on a directory that cannot be opened
+    reports 0 -- which reads exactly like --save-temps having done nothing. That
+    reading has been made twice in this project, once about a run that had in
+    fact kept all 301 of its directories.
+    """
+
+    def test_kept_directories_are_readable(self, tmp_path):
+        from cvise.utils import fileutil
+
+        with fileutil.TmpDirManager(prefix=str(tmp_path / 'kept-'), save_temps=True) as m:
+            job = m.create_dir(prefix='job')
+            assert job.stat().st_mode & 0o055, oct(job.stat().st_mode)
+            assert m.root.stat().st_mode & 0o055, oct(m.root.stat().st_mode)
+
+    def test_ordinary_runs_keep_their_directories_private(self, tmp_path):
+        from cvise.utils import fileutil
+
+        with fileutil.TmpDirManager(prefix=str(tmp_path / 'private-')) as m:
+            job = m.create_dir(prefix='job')
+            assert not job.stat().st_mode & 0o077, oct(job.stat().st_mode)

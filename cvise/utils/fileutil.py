@@ -48,6 +48,10 @@ class TmpDirManager:
     def __init__(self, prefix=None, save_temps: bool = False):
         self._save_temps = save_temps
         self.root = Path(tempfile.mkdtemp(prefix=self.TEMP_PREFIX if prefix is None else prefix))
+        if save_temps:
+            # mkdtemp makes it 0700, so the directories underneath are
+            # unreachable however readable they are themselves.
+            self.root.chmod(0o755)
         self._lock = threading.Lock()
         self._dirs = set()
         self._janitor_thread = threading.Thread(target=self._janitor_thread_main)
@@ -100,7 +104,15 @@ class TmpDirManager:
                 self._dirs.add(candidate)
 
             try:
-                candidate.mkdir(mode=0o700)
+                # 0700 normally, because a job's directory is nobody else's
+                # business. Readable when they are being kept: --save-temps
+                # exists so that a run can be examined afterwards, and inside a
+                # container these are made by root while the person reading them
+                # is not. A directory nobody can open is barely better than one
+                # that was deleted -- and worse, because `ls 2>/dev/null | wc -l`
+                # reports it as empty, which reads exactly like --save-temps
+                # having done nothing. That reading has already been made twice.
+                candidate.mkdir(mode=0o755 if self._save_temps else 0o700)
             except FileExistsError:
                 pass
             else:
