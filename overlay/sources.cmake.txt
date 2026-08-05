@@ -15,6 +15,7 @@ __xstat.c
 __xstat64.c
 access.c
 canonicalize_file_name.c
+chdir.c
 chmod.c
 creat.c
 creat64.c
