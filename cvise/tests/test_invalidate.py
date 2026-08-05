@@ -280,3 +280,49 @@ class TestTheGeneratedFileCarriesNoLogic:
 
     def test_no_target_means_no_target_argument(self, tmp_path):
         assert '--target' not in self.script(tmp_path, target=None)
+
+
+class TestHowMuchTheBuildActuallyDid:
+    """"The binary did not change" has two causes repaired in opposite ways.
+
+    A build that compiled nothing and a build that compiled a great deal and
+    produced the same bytes look identical in the verdict. A live run gave 69
+    such verdicts and the number that tells them apart had never been written
+    down, so the run could not be diagnosed from what it left behind.
+    """
+
+    def test_the_highest_edge_ninja_reached_is_the_count(self):
+        output = '[1/376] Building CXX object a.o\n[2/376] Building CXX object b.o\n[376/376] Linking\n'
+        assert projectcheck.edges_run(output) == 376
+
+    def test_a_build_that_did_nothing_counts_zero(self):
+        assert projectcheck.edges_run('ninja: no work to do.\n') == 0
+
+    def test_output_that_mentions_brackets_elsewhere_is_not_counted(self):
+        """Compiler diagnostics quote code, and code contains brackets."""
+        assert projectcheck.edges_run('note: in expansion of [1/2] here\n') == 0
+
+    def test_an_empty_build_output_counts_zero(self):
+        assert projectcheck.edges_run('') == 0
+
+    def test_the_record_carries_the_count_and_the_time(self, tmp_path, monkeypatch):
+        witness = tmp_path / 'verdicts.log'
+        build = tmp_path / 'build'
+        build.mkdir()
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        cmake = bin_dir / 'cmake'
+        cmake.write_text('#!/bin/sh\necho "[1/7] Building CXX object x.o"\necho "[7/7] Linking"\nexit 0\n')
+        cmake.chmod(0o755)
+        ctest = bin_dir / 'ctest'
+        ctest.write_text('#!/bin/sh\nexit 0\n')
+        ctest.chmod(0o755)
+        monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ['PATH'])
+        monkeypatch.setattr(projectcheck.invalidate, 'remove_stale', lambda *a: 0)
+        job = tmp_path / 'job'
+        job.mkdir()
+        monkeypatch.chdir(job)
+        projectcheck.main(['--build', str(build), '--test', 'S.T', '--witness', str(witness)])
+        line = witness.read_text()
+        assert 'edges=7' in line
+        assert 'secs=' in line

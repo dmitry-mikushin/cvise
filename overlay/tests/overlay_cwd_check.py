@@ -77,6 +77,20 @@ def main():
     (root / 'existing.txt').write_text('from the shared tree')
     (root / 'shared').mkdir()   # a directory the baseline build already made
 
+    # The arrangement has to be able to give a wrong answer. With the delta
+    # underneath the root, a write that correctly went to the delta and a write
+    # that leaked into the shared tree are the same write; with the root at `/`,
+    # every path is inside it and "did this stay out of the shared tree" means
+    # nothing. Both have already produced one confident report of a leak that
+    # was not there.
+    if delta.resolve() == root.resolve() or root.resolve() in delta.resolve().parents:
+        print(f'  FAIL the delta {delta} is inside the root {root}; this probe '
+              'cannot tell a redirected write from a leaked one')
+        return 2
+    if str(root.resolve()) == '/':
+        print('  FAIL the root is the filesystem root, so nothing is outside it')
+        return 2
+
     print(f'root  {root}')
     print(f'delta {delta}   (outside the root, so a leak cannot look like a success)')
     print()

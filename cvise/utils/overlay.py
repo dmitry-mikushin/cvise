@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 import secrets
 
+from cvise.utils import overlay_contract as contract
 from cvise.utils.error import CViseError
 
 # Must match overlay/src/libfakechroot.h, which is built alongside this.
@@ -144,14 +145,9 @@ def stat_entry_points(library: str) -> dict:
 # compilers, never into the reducer. Prints the challenge answer, then one line
 # per entry point that this C library actually has.
 PROOF = r'''
-import ctypes, sys
+import ctypes
 
 libc = ctypes.CDLL(None)
-fn = libc[{symbol!r}]
-fn.restype = ctypes.c_uint64
-fn.argtypes = [ctypes.c_uint64]
-print('challenge', fn({challenge}))
-
 path = {probe!r}.encode()
 buf = ctypes.create_string_buffer(1024)   # any struct stat variant fits
 for name in {names!r}:
@@ -164,21 +160,30 @@ for name in {names!r}:
 
 
 def prove_overlay() -> int:
-    """Prove the overlay works in a process built exactly like a job's.
+    """Prove the overlay keeps its contract, in a process built like a job's.
 
-    Two independent questions, because either one passing alone is compatible
-    with a reduction that grades every candidate against untouched code.
+    Three questions, because any two of them passing is compatible with a
+    reduction that grades every candidate against untouched code.
 
     Did this code run? The answer is a function of a random challenge, so a stub
     returning a constant cannot forge it and a missing symbol cannot be mistaken
     for a negative answer.
 
-    Is the redirection live, on every entry point? A path that exists only in the
-    delta must be visible, and it must be visible whichever way it is asked. This
-    was documented here and not actually performed: the probe file was written
-    into the delta and nothing ever looked for it, so the run that ended with the
-    build reading straight through the overlay had been told the overlay was
-    proven.
+    Is every way of asking whether a file exists redirected? Read off the
+    library, so that a wrapper compiled out takes its entry in the check with it.
+
+    And -- the part that survives the next hole -- does the overlay keep its
+    CONTRACT? A build tool given an artefact that exists only in the delta sees
+    it; given one the delta overrides, it sees the delta's; and what a job writes
+    never reaches the tree the other jobs are reading. That is stated without
+    naming a syscall, so it does not have to be extended each time a new one
+    turns out to matter.
+
+    It had to be. The previous gate asked about the stat family and nothing else,
+    and three holes passed it in a row -- a child writing into the shared tree
+    through a spawn file action, sixteen wrappers including the whole fortified
+    family compiled out, and a job unable to enter a directory it had just
+    created. Each one ended a run, and each was found by hand afterwards.
     """
     lib = library_path()
     if not lib:
@@ -189,67 +194,94 @@ def prove_overlay() -> int:
     challenge = secrets.randbits(64)
     expected = ((challenge ^ OVERLAY_MAGIC) + 1) & 0xFFFFFFFFFFFFFFFF
 
-    with tempfile.TemporaryDirectory(prefix='cvise-overlay-proof-') as delta:
-        probe = Path(delta) / PROBE_PATH.lstrip('/')
-        probe.parent.mkdir(parents=True, exist_ok=True)
-        probe.write_text('probe\n')
-        if Path(PROBE_PATH).exists():
-            # The probe proves redirection by being visible where only the delta
-            # has it. If the root has it too, every answer would be "visible"
-            # whether anything was redirected or not.
-            raise OverlayNotProvenError(
-                f'{PROBE_PATH} exists outside the delta, so it cannot show redirection'
-            )
-        env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: delta, ROOT_ENV: '/'}
-        asked = stat_entry_points(lib)
-        missing = [name for name in REQUIRED if name not in asked]
-        if missing:
-            raise OverlayNotProvenError(
-                f'{lib} does not wrap {", ".join(missing)}. A build tool that spells '
-                'the question that way reads the original tree, finds nothing changed '
-                'and rebuilds nothing, and its test then runs the previous '
-                "candidate's binary"
-            )
-        code = PROOF.format(
-            symbol=SYMBOL,
-            challenge=challenge,
-            probe=PROBE_PATH,
-            names=sorted(asked),
-            calls=asked,
-        )
-        proc = subprocess.run([sys.executable, '-c', code], capture_output=True,
-                              text=True, env=env)
+    with tempfile.TemporaryDirectory(prefix='cvise-overlay-proof-') as work:
+        # Laid out the way a job is: a real root, and the delta OUTSIDE it. With
+        # the delta underneath the root, a write that correctly went to the delta
+        # and a write that leaked into the shared tree are the same write.
+        root = Path(work) / 'root'
+        delta = Path(work) / 'delta'
+        contract.build_fixture(root, delta)
+        refusal = contract.refuse_nested(root, delta)
+        if refusal:
+            raise OverlayNotProvenError(refusal)
 
+        # The challenge is asked under its own conditions. Its answer carries
+        # one bit saying the built-in probe path was redirected, and that path
+        # is at the filesystem root, so it can only be redirected when the root
+        # is `/`. Asking it beside the contract would silently lose that bit and
+        # leave the challenge proving only that the library loaded.
+        answer = _answer_challenge(lib, Path(work) / 'challenge', challenge, expected)
+
+        env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: str(delta),
+               ROOT_ENV: str(root)}
+        _check_entry_points(lib, env, root)
+        _check_contract(env, root, delta)
+
+    return answer
+
+
+def _run_in_job(env, *args):
+    """A child set up exactly as a job is, since that is what has to work."""
+    root = Path(__file__).resolve().parents[2]
+    env = {**env, 'PYTHONPATH': f'{root}:{env.get("PYTHONPATH", "")}'.rstrip(':')}
+    return subprocess.run([sys.executable, *args], capture_output=True, text=True, env=env)
+
+
+def _answer_challenge(lib, delta: Path, challenge, expected) -> int:
+    probe = delta / PROBE_PATH.lstrip('/')
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text('probe\n')
+    if Path(PROBE_PATH).exists():
+        # The bit is set by the probe being visible where only the delta has it.
+        # If the real root has it too, it would be set whether anything was
+        # redirected or not.
+        raise OverlayNotProvenError(
+            f'{PROBE_PATH} exists outside the delta, so it cannot show redirection'
+        )
+    env = {**os.environ, 'LD_PRELOAD': lib, DELTA_ENV: str(delta), ROOT_ENV: '/'}
+    code = ('import ctypes\n'
+            f'fn = ctypes.CDLL(None)[{SYMBOL!r}]\n'
+            'fn.restype = ctypes.c_uint64\n'
+            'fn.argtypes = [ctypes.c_uint64]\n'
+            f'print(fn({challenge}))\n')
+    proc = _run_in_job(env, '-c', code)
     if proc.returncode != 0:
         raise OverlayNotProvenError(
             f'a child with {lib} preloaded could not answer: {proc.stderr.strip()[:200]}'
         )
-
-    answers = {}
-    challenge_answer = None
-    for line in proc.stdout.splitlines():
-        key, _, value = line.partition(' ')
-        if key == 'challenge':
-            challenge_answer = value
-        else:
-            answers[key] = value
-
-    if challenge_answer is None:
-        raise OverlayNotProvenError(f'no answer at all: {proc.stdout.strip()[:80]}')
     try:
-        answer = int(challenge_answer)
+        answer = int(proc.stdout.strip())
     except ValueError:
-        raise OverlayNotProvenError(f'the answer was not a number: {challenge_answer[:80]}')
+        raise OverlayNotProvenError(f'the answer was not a number: {proc.stdout.strip()[:80]}')
     if answer != expected:
         raise OverlayNotProvenError(
             f'the answer to the challenge is wrong ({answer} instead of {expected}), so the '
             'library either does not redirect or is not the overlay this build expects'
         )
+    return answer
 
+
+def _check_entry_points(lib, env, root) -> None:
+    asked = stat_entry_points(lib)
+    missing = [name for name in REQUIRED if name not in asked]
+    if missing:
+        raise OverlayNotProvenError(
+            f'{lib} does not wrap {", ".join(missing)}. A build tool that spells '
+            'the question that way reads the original tree, finds nothing changed '
+            "and rebuilds nothing, and its test then runs the previous candidate's binary"
+        )
+    probe = str(root / contract.DELTA_ONLY)
+    code = PROOF.format(probe=probe, names=sorted(asked), calls=asked)
+    proc = _run_in_job(env, '-c', code)
+    if proc.returncode != 0:
+        raise OverlayNotProvenError(
+            f'the entry points could not be asked: {proc.stderr.strip()[:200]}'
+        )
+    answers = dict(line.split() for line in proc.stdout.splitlines() if ' ' in line)
     if not answers:
         raise OverlayNotProvenError(
-            'the library loaded but no way of asking whether a file exists could be '
-            'tested, so nothing shows the redirection is live'
+            'no way of asking whether a file exists could be tested, so nothing '
+            'shows the redirection is live'
         )
     blind = sorted(name for name, seen in answers.items() if seen != 'visible')
     if blind:
@@ -257,9 +289,45 @@ def prove_overlay() -> int:
             f'{len(answers) - len(blind)} of {len(answers)} ways of asking whether a file '
             f'exists are redirected, and these are not: {", ".join(blind)}. A build tool '
             'that calls one of those reads the original tree, finds nothing changed and '
-            'rebuilds nothing, and its test then runs the previous candidate\'s binary'
+            "rebuilds nothing, and its test then runs the previous candidate's binary"
         )
-    return answer
+
+
+def _check_contract(env, root: Path, delta: Path) -> None:
+    """The clauses that do not mention a syscall, and the shared tree afterwards."""
+    proc = _run_in_job(env, '-m', 'cvise.utils.overlay_contract', '--root', str(root))
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise OverlayNotProvenError(
+            f'the contract could not be exercised at all: {proc.stderr.strip()[:300]}'
+        )
+
+    failed = []
+    for line in proc.stdout.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 3:
+            continue
+        name, verdict, detail = parts
+        if verdict != 'PASS':
+            failed.append(f'{name} ({detail})')
+
+    # What the job did to the tree everybody else is reading. Asked here rather
+    # than inside, because inside is precisely the view that is redirected.
+    for name in (contract.DELTA_DIR, contract.SPAWNED, 'relative.o'):
+        if (root / name).exists():
+            failed.append(f'{name} leaked into the shared tree')
+    if not (root / contract.DELETED).exists():
+        failed.append(f'{contract.DELETED} was deleted from the shared tree, which '
+                      'every other job is reading')
+    if (root / contract.OVERRIDDEN).read_text() != contract.SHARED_TEXT:
+        failed.append(f'{contract.OVERRIDDEN} was modified in the shared tree')
+
+    if failed:
+        raise OverlayNotProvenError(
+            'the overlay does not keep its contract. A build tool given an artefact '
+            'that exists only in the delta must see it, one the delta overrides must '
+            'see the delta\'s, and nothing a job writes may reach the tree the other '
+            'jobs read. These do not hold: ' + '; '.join(failed)
+        )
 
 
 # Where the library is installed alongside C-Vise's other helpers, and where it

@@ -151,6 +151,7 @@ set(SOURCE_FILES
   "utils/mplogging.py"
   "utils/nestedmatcher.py"
   "utils/noreduce.py"
+  "utils/overlay_contract.py"
   "utils/precheck.py"
   "utils/project.py"
   "utils/projectcheck.py"

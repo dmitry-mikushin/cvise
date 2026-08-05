@@ -33,6 +33,7 @@ import argparse
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from cvise.utils import invalidate
@@ -84,6 +85,24 @@ def build(build_dir: Path, target: str | None) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def edges_run(output: str) -> int:
+    """How much the build actually did.
+
+    "The binary did not change" has two causes that are repaired in opposite
+    ways and that the verdict alone cannot tell apart: a build that compiled
+    nothing, and a build that compiled a great deal and produced the same bytes.
+    A live run gave 69 verdicts and 69 said the binary had not changed, and
+    there was no way to say which of the two it was -- the build's output is
+    thrown away on success, so the one number that distinguishes them was never
+    written down.
+
+    Ninja numbers each edge it starts, `[k/n]`, so the largest k it reached is
+    that number, and it costs a regular expression over output already in hand.
+    """
+    numbered = re.findall(r'^\[(\d+)/(\d+)\]', output, re.M)
+    return max((int(k) for k, _ in numbered), default=0)
+
+
 def record(witness: Path | None, **facts: object) -> None:
     """What a verdict rested on, written down as it is made.
 
@@ -115,13 +134,17 @@ def main(argv: list[str] | None = None) -> int:
     before = signature(binary)
 
     killed = invalidate.remove_stale(args.build, Path.cwd() / DELTA)
+    started = time.monotonic()
     returncode, output = build(args.build, args.target)
+    seconds = time.monotonic() - started
     after = signature(binary)
 
     record(
         args.witness,
         build=returncode,
         killed=killed,
+        edges=edges_run(output),
+        secs=f'{seconds:.1f}',
         rebuilt='no' if before == after else 'yes',
         dir=Path.cwd(),
     )
