@@ -33,7 +33,9 @@ pub struct Snapshot {
     pub cores: usize,
     pub shm_used: f64,
     pub shm_total: f64,
-    pub live: Vec<(String, usize)>,
+    /// None when the container could not be asked -- which is not the same
+    /// as nothing running, and must not print like it.
+    pub live: Option<Vec<(String, usize)>>,
     pub pass_bugs: usize,
     pub tracebacks: usize,
     pub traceback: Option<String>,
@@ -91,12 +93,13 @@ fn gather(previous: Option<&Snapshot>, elapsed: Option<f64>) -> Option<Snapshot>
         _ => None,
     };
 
-    let live_counts = docker::live_processes(&run.id);
     let interesting = ["clang++-19", "clang_delta", "ninja", "cmake", "ccache", "python3"];
-    let live = interesting
-        .iter()
-        .filter_map(|name| live_counts.get(*name).map(|n| (name.to_string(), *n)))
-        .collect();
+    let live = docker::live_processes(&run.id).map(|counts| {
+        interesting
+            .iter()
+            .filter_map(|name| counts.get(*name).map(|n| (name.to_string(), *n)))
+            .collect()
+    });
 
     let (shm_used, shm_total) = shm();
     Some(Snapshot {
@@ -178,11 +181,14 @@ fn plain(snap: &Snapshot) -> String {
         snap.published,
         snap.baseline_failed
     ));
-    let live: Vec<String> = snap
-        .live
-        .iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect();
+    let live = match &snap.live {
+        Some(counts) => counts
+            .iter()
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join("   "),
+        None => "could not ask -- the container refused an exec".to_string(),
+    };
     out.push_str(&format!(
         "machine     cpu {:.0} of {} %   mem {} of {}   shm {:.0} of {:.0} GiB\n            live {}\n\n",
         snap.load.cpu_percent,
@@ -191,7 +197,7 @@ fn plain(snap: &Snapshot) -> String {
         snap.load.mem_limit,
         snap.shm_used,
         snap.shm_total,
-        live.join("   ")
+        live
     ));
     out.push_str(&format!(
         "health      pass bugs {}   tracebacks {}\n",
@@ -337,7 +343,7 @@ impl Snapshot {
             cores: 1,
             shm_used: 0.0,
             shm_total: 0.0,
-            live: Vec::new(),
+            live: None,
             pass_bugs: 0,
             tracebacks: 0,
             traceback: None,

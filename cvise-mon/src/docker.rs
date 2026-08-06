@@ -190,8 +190,15 @@ pub fn load(id: &str) -> Load {
 /// A zombie keeps the name of what it was, so a count that does not look at the
 /// state answers "entries in the process table" while being read as "work being
 /// done". In one run those were 44 and 4.
-pub fn live_processes(id: &str) -> BTreeMap<String, usize> {
-    let listing = output("docker", &["exec", id, "ps", "-eo", "stat=,comm="]);
+pub fn live_processes(id: &str) -> Option<BTreeMap<String, usize>> {
+    let proc = Command::new("docker")
+        .args(["exec", id, "ps", "-eo", "stat=,comm="])
+        .output()
+        .ok()?;
+    if !proc.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&proc.stdout);
     let mut counts = BTreeMap::new();
     for line in listing.lines() {
         let mut fields = line.split_whitespace();
@@ -203,7 +210,16 @@ pub fn live_processes(id: &str) -> BTreeMap<String, usize> {
         }
         *counts.entry(name.to_string()).or_insert(0) += 1;
     }
-    counts
+    // An empty table is not something `ps` produces -- it would have listed
+    // itself -- so an empty result means the question failed, not that nothing
+    // is running. MEASURED: at its memory ceiling the container OOM-kills the
+    // process `docker exec` starts, `ps` returns nothing, and "could not ask"
+    // then reads on the screen exactly like "nothing is running". The run was
+    // publishing normally at the time.
+    if counts.is_empty() {
+        return None;
+    }
+    Some(counts)
 }
 
 pub struct Journal {

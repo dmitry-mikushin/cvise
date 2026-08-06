@@ -178,11 +178,16 @@ fn machine(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     frame.render_widget(block, area);
 
     let ceiling = (snap.cores * 100) as f64;
-    let live: Vec<String> = snap
-        .live
-        .iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect();
+    let live = match &snap.live {
+        Some(counts) => counts
+            .iter()
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join("   "),
+        // Not "nothing": the container refuses an exec when it is at its memory
+        // ceiling, and an empty list there reads as an idle machine.
+        None => "could not ask -- the container refused an exec".to_string(),
+    };
     frame.render_widget(
         Paragraph::new(vec![
             plain_row(
@@ -207,7 +212,7 @@ fn machine(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                 format!("{:.0} of {:.0} GiB", snap.shm_used, snap.shm_total),
             ),
             Line::from(Span::styled(
-                format!(" live       {}", live.join("   ")),
+                format!(" live       {live}"),
                 Style::default().fg(DIM),
             )),
         ])
