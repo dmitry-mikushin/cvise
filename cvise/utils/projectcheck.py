@@ -30,9 +30,13 @@ Only then is the project's own test asked.
 """
 
 import argparse
+import contextlib
+import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -46,6 +50,20 @@ DELTA = '.cvise-delta'
 # Not 1, which the project's test uses for "not interesting", and not 0. A
 # candidate whose verdict could not be established is neither.
 UNDECIDABLE = 125
+
+# How many processes a candidate may have at once before it is refused.
+#
+# The number separates two things that differ by orders of magnitude, so its
+# exact value does not matter much -- only that it sits between them. Legitimate
+# parallelism in this test binary is bounded by hardware_concurrency, 88 on this
+# machine, and the check invokes ctest with an exact single filter, which takes
+# the in-process path and needs a handful. MEASURED against a candidate that
+# went wrong: 43 332 processes.
+PROCESS_CEILING = 256
+
+# How often the swarm is looked for. A bomb reaches thousands in seconds, so
+# this is fast enough to catch it while costing one /proc scan per second.
+SWARM_POLL_SECONDS = 1.0
 
 
 def binary_under_test(build: Path, target: str | None) -> Path | None:
@@ -143,6 +161,66 @@ def record(witness: Path | None, **facts: object) -> None:
         pass  # a lost record must not change a verdict
 
 
+def my_process_group() -> list[int]:
+    """Every process in this candidate's group, ours included.
+
+    Exact rather than approximate, and that is the point of it. Since C-Vise
+    starts each candidate with start_new_session, this check leads a process
+    group that contains its build, its test, and everything either of them
+    spawned -- and nothing else on the machine, however busy the machine is.
+    Counting descendants instead would ask a question the kernel stops
+    answering the moment a parent dies.
+    """
+    mine = os.getpgrp()
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.getpgid(int(entry)) == mine:
+                found.append(int(entry))
+        except (ProcessLookupError, PermissionError, ValueError):
+            continue
+    return found
+
+
+def disperse(members: list[int]) -> None:
+    """Kill the group, one by one, sparing this process.
+
+    Not killpg: that would include us, and then nothing would be left to write
+    the verdict -- which is the whole reason for noticing.
+    """
+    for pid in members:
+        if pid == os.getpid():
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def watch_for_a_swarm(ceiling: int, done: threading.Event) -> list[int]:
+    """Refuse a candidate that spawns without bound, while it is still cheap.
+
+    MEASURED, and it cost eleven hours. A candidate's test binary re-executed
+    itself; 43 332 of its processes were left holding 134 GiB, and the run kept
+    going for an hour before it could no longer run the test at all. The
+    candidate was never accepted -- the test could not decide, and an undecided
+    candidate keeps its previous state -- so correctness was never at stake.
+    Availability was: the run died of it.
+
+    Killing the swarm from outside is a cure for the symptom. Refusing the
+    candidate that produced it is the verdict the reduction actually needs, and
+    it belongs here, where the candidate is.
+    """
+    seen: list[int] = []
+    while not done.wait(SWARM_POLL_SECONDS):
+        members = my_process_group()
+        if len(members) > ceiling:
+            seen = members
+            disperse(members)
+            return seen
+    return seen
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--build', required=True, type=Path)
@@ -203,20 +281,48 @@ def main(argv: list[str] | None = None) -> int:
     # Both streams, merged, because ctest writes the failing test's output to
     # one and its own summary to the other, and a report missing either half is
     # the report of a failure nobody can act on.
-    proc = subprocess.run(
-        [
-            'ctest',
-            '--test-dir',
-            str(args.build),
-            '-R',
-            '^' + re.escape(args.test) + '$',
-            '--no-tests=error',
-            '--output-on-failure',
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    # Watched while it runs rather than inspected afterwards: a candidate that
+    # spawns without bound has to be refused while refusing it is still cheap.
+    done = threading.Event()
+    swarm: list[int] = []
+
+    def watch() -> None:
+        nonlocal swarm
+        swarm = watch_for_a_swarm(PROCESS_CEILING, done)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        proc = subprocess.run(
+            [
+                'ctest',
+                '--test-dir',
+                str(args.build),
+                '-R',
+                '^' + re.escape(args.test) + '$',
+                '--no-tests=error',
+                '--output-on-failure',
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        done.set()
+        watcher.join(timeout=SWARM_POLL_SECONDS * 3)
+
+    if swarm:
+        record(args.witness, **facts, test='swarm', rc=len(swarm), dir=Path.cwd())
+        keep_this_job(f'swarm: {len(swarm)} processes in this candidate group')
+        # UNDECIDABLE, not "not interesting". What this candidate does to the
+        # machine says nothing about whether the code it deleted mattered, and
+        # recording it as uninteresting would throw away a reduction on the
+        # strength of an accident. The undecided budget is what stops a run
+        # where this keeps happening.
+        print(f'cvise: this candidate had {len(swarm)} processes at once, past the')
+        print(f'cvise: ceiling of {PROCESS_CEILING}. They have been killed. A candidate')
+        print('cvise: that spawns without bound cannot be judged on this machine.')
+        return UNDECIDABLE
     # Written after the test, not before it.
     #
     # The record used to be made as soon as the build finished, which left the
