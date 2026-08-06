@@ -10,6 +10,7 @@ import multiprocessing.managers
 import os
 import queue
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -109,11 +110,36 @@ class ProcessMonitor:
             self._killer.kill_process_tree(event.child_pid)
 
 
+def signal_own_group(pid: int, signal_number: int) -> None:
+    """Signal the process group led by `pid`, which is the whole candidate.
+
+    Only ever called with a pid that run_process started, and run_process starts
+    every child with start_new_session -- so the child leads a group of its own
+    and its group id IS this pid. That matters: the group is addressed by the
+    number we already hold, not looked up through a process that may already be
+    gone. In the failure this exists for, the leader was the first to die.
+
+    The guard is not decoration. Signalling a group that merely contains us
+    would deliver the signal to C-Vise itself and to every worker, so the pool
+    would go down along with the candidate that was meant to be the only
+    casualty.
+    """
+    if pid == os.getpgrp():
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal_number)
+
+
 @dataclass(order=True, frozen=True)
 class ProcessKillerTask:
     hard_kill: bool  # whether to kill() - as opposed to terminate()
     when: float  # seconds (in terms of the monotonic timer)
     proc: psutil.Process = field(compare=False)
+    # True only for the process we were asked about, which is the one that
+    # leads its own group. The descendants found by walking do not lead
+    # anything, and signalling a group by one of their pids would reach an
+    # unrelated group whenever a pid has been reused.
+    own_group: bool = field(compare=False, default=False)
 
 
 class ProcessKiller:
@@ -149,7 +175,7 @@ class ProcessKiller:
             proc = psutil.Process(pid)
         except psutil.NoSuchProcess:
             return
-        task = ProcessKillerTask(hard_kill=False, when=0, proc=proc)
+        task = ProcessKillerTask(hard_kill=False, when=0, proc=proc, own_group=True)
         with self._condition:
             heapq.heappush(self._task_queue, task)
             self._condition.notify()
@@ -170,11 +196,22 @@ class ProcessKiller:
                     continue
                 task = heapq.heappop(self._task_queue)
             if task.hard_kill:
-                self._do_hard_kill(task.proc)
+                self._do_hard_kill(task)
             else:
-                self._do_terminate(task.proc)
+                self._do_terminate(task)
 
-    def _do_terminate(self, proc: psutil.Process) -> None:
+    def _do_terminate(self, task: ProcessKillerTask) -> None:
+        proc = task.proc
+        root_leads_its_group = task.own_group
+        if root_leads_its_group:
+            signal_own_group(proc.pid, signal.SIGTERM)
+        # The group first, and only then the walk. A candidate started with
+        # start_new_session leads a group of its own, and everything it spawned
+        # -- however deep, and however fast it is still spawning -- is in that
+        # group and stays in it when its parent dies. The walk below cannot say
+        # the same: it takes a snapshot of the descendants and then kills the
+        # parent, at which point every survivor is reparented to PID 1 and is
+        # no longer a descendant of anything we are looking at.
         try:
             children = proc.children(recursive=True) + [proc]
         except psutil.NoSuchProcess:
@@ -194,11 +231,20 @@ class ProcessKiller:
         when = time.monotonic() + self.TERM_TIMEOUT
         with self._condition:
             for child in alive_children:
-                task = ProcessKillerTask(hard_kill=True, when=when, proc=child)
+                task = ProcessKillerTask(
+                    hard_kill=True,
+                    when=when,
+                    proc=child,
+                    own_group=root_leads_its_group and child.pid == proc.pid,
+                )
                 heapq.heappush(self._task_queue, task)
             self._condition.notify()
 
-    def _do_hard_kill(self, proc: psutil.Process) -> None:
+    def _do_hard_kill(self, task: ProcessKillerTask) -> None:
+        proc = task.proc
+        if task.own_group:
+            signal_own_group(proc.pid, signal.SIGKILL)
+
         try:
             children = proc.children(recursive=True) + [proc]
         except psutil.NoSuchProcess:
@@ -291,6 +337,24 @@ class ProcessEventNotifier:
             stderr=stderr,
             shell=shell,
             env=env,
+            # A session of its own, so the whole candidate can be killed at
+            # once. Without it the killer walks the process tree, and a tree can
+            # be walked out from under it: killing the parent reparents every
+            # survivor to PID 1, which puts them outside the descendants of the
+            # pid we started from, and they are never found again.
+            #
+            # MEASURED, and it ended a reduction after eleven hours. One
+            # candidate's test binary re-executed itself, appending another
+            # --gtest_list_tests to its own argv each time. The candidate was
+            # killed; 43 332 of its children were adopted by PID 1 -- which in
+            # the container is C-Vise itself, and C-Vise does not kill what it
+            # did not start -- and sat there holding 134 GiB of anonymous
+            # memory. The run kept going for an hour, then could not run the
+            # test at all and stopped itself on its undecided-verdict budget.
+            #
+            # A process group id does not change when a parent dies, so killing
+            # the group is not something reparenting can escape.
+            start_new_session=True,
             **kwargs,
         )
         self._notify_start(proc)
