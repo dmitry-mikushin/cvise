@@ -1,0 +1,12 @@
+[package]
+name = "cvise-mon"
+version = "0.1.0"
+edition = "2021"
+description = "What the running reduction has actually removed, on one screen"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 2
