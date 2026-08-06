@@ -24,6 +24,50 @@ pub fn output(program: &str, args: &[&str]) -> String {
     }
 }
 
+/// Days since 1970-01-01 for a civil date, by Howard Hinnant's algorithm.
+///
+/// Written out rather than pulled in with a date crate: this is the only date
+/// arithmetic in the program, and a dependency that formats timestamps would be
+/// larger than the thing it is for.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// How long the container has been up, to the second.
+///
+/// Taken from the start time rather than from `docker ps`, which says "Up 5
+/// hours" for anything between five and six of them -- a rounded figure that
+/// cannot be differenced with the previous one to see how long a batch took.
+pub fn uptime(id: &str) -> Option<std::time::Duration> {
+    let started = output("docker", &["inspect", id, "--format", "{{.State.StartedAt}}"]);
+    let text = started.trim();
+    let (date, rest) = text.split_once('T')?;
+    let time: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ':')
+        .collect();
+    let date: Vec<i64> = date.split('-').filter_map(|n| n.parse().ok()).collect();
+    let clock: Vec<i64> = time.split(':').filter_map(|n| n.parse().ok()).collect();
+    if date.len() != 3 || clock.len() != 3 {
+        return None;
+    }
+    let epoch = days_from_civil(date[0], date[1], date[2]) * 86_400
+        + clock[0] * 3_600
+        + clock[1] * 60
+        + clock[2];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    // Docker reports UTC, and so does the epoch, so no zone enters into it.
+    u64::try_from(now - epoch).ok().map(std::time::Duration::from_secs)
+}
+
 #[derive(Clone, Debug)]
 pub struct Reduction {
     pub id: String,
@@ -71,7 +115,19 @@ pub fn reduction() -> Option<Reduction> {
             .unwrap_or_else(|| state.join("ns-projection"));
         return Some(Reduction {
             id: parts[0].to_string(),
-            status: parts[3].to_string(),
+            status: match uptime(parts[0]) {
+                Some(up) => {
+                    let seconds = up.as_secs();
+                    format!(
+                        "up {:02}:{:02}:{:02}:{:02}",
+                        seconds / 86_400,
+                        (seconds % 86_400) / 3_600,
+                        (seconds % 3_600) / 60,
+                        seconds % 60
+                    )
+                }
+                None => parts[3].to_string(),
+            },
             state: state.clone(),
             worktree,
         });
@@ -195,5 +251,24 @@ impl Journal {
             .iter()
             .rposition(|l| l.contains("Traceback (most recent call last)"))?;
         Some(self.lines[at..].join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::days_from_civil;
+
+    #[test]
+    fn the_civil_calendar_is_counted_correctly() {
+        // Hand-rolled date arithmetic fails in ways that look plausible -- a
+        // leap year off by one shifts an uptime by a day and nothing complains.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        // 2000 is a leap year, 1900 is not: the rule most implementations miss.
+        assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2);
+        assert_eq!(days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28), 1);
+        // Known epoch seconds: 2026-08-06T00:00:00Z is 1785974400.
+        assert_eq!(days_from_civil(2026, 8, 6) * 86_400, 1_785_974_400);
     }
 }
