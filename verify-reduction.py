@@ -64,9 +64,15 @@ def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
         print(f'no published tree at {tree}', file=sys.stderr)
         return 2
 
+    # Every file in the checkout, which is NOT the number the reduction prints.
+    # C-Vise counts only the files it is reducing; this counts fixtures, data
+    # and .git as well, and the two differ by an order of magnitude -- 6534023
+    # against 86773054 on the same tree. Printed as what it is, because it was
+    # once printed beside a percentage and read as the reduction's own progress.
     size = sum(f.stat().st_size for f in tree.rglob('*') if f.is_file())
     print(f'published tree: {tree}')
-    print(f'                {size} bytes')
+    print(f'                {size} bytes in the whole checkout '
+          '(not the reduction\'s figure, which counts only what it reduces)')
 
     reduction = container_of(state)
     work = state / 'verify'
