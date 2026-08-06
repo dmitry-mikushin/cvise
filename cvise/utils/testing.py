@@ -289,7 +289,7 @@ class TestEnvironment:
 
     def dump(self, dst):
         for f in self.all_test_cases:
-            shutil.copy(self.folder / f, dst)
+            fileutil.copy_test_case(f, dst, source_parent=self.folder)
 
         shutil.copy(self.test_script, dst)
 

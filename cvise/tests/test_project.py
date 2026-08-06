@@ -920,3 +920,63 @@ class TestTheCheckBuildsTheSameThingTheBaselineDid:
         text = check_script(project, 'runs', tmp_path / 'check.sh').read_text()
         assert '--target' not in text
         assert f'--build {project.build_dir}' in text
+
+
+class TestACrashReportSurvivesADirectoryTestCase:
+    """Reporting a survivable problem must not itself end the run.
+
+    MEASURED, and it cost nine hours. A pass declared a bug it had itself
+    classified as non-fatal; C-Vise went to write the crash report; the report
+    copied the test cases with shutil.copy, which in project mode is handed a
+    directory:
+
+        testing.py:292  dump -> shutil.copy(self.folder / f, dst)
+        IsADirectoryError: [Errno 21] Is a directory: '.../job41040/src'
+
+    The reduction died at 56 % with the exception escaping through
+    report_pass_bug. The published tree survived only because publication had
+    happened a minute earlier.
+    """
+
+    def environment(self, folder: Path, test_case: Path, script: Path):
+        from cvise.utils.testing import TestEnvironment
+
+        return TestEnvironment(
+            state=None,
+            order=1,
+            test_script=script,
+            folder=folder,
+            test_case=test_case,
+            all_test_cases={test_case},
+            should_copy_current_test_case=True,
+            transform=None,
+        )
+
+    def test_the_report_reproduces_the_tree(self, tmp_path):
+        job = tmp_path / 'job'
+        (job / 'src' / 'deep').mkdir(parents=True)
+        (job / 'src' / 'a.cpp').write_text('int a;\n')
+        (job / 'src' / 'deep' / 'b.hpp').write_text('int b;\n')
+        script = tmp_path / 'check.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        crash_dir = tmp_path / 'crash'
+        crash_dir.mkdir()
+
+        self.environment(job, Path('src'), script).dump(crash_dir)
+
+        assert (crash_dir / 'src' / 'a.cpp').read_text() == 'int a;\n'
+        assert (crash_dir / 'src' / 'deep' / 'b.hpp').read_text() == 'int b;\n'
+        assert (crash_dir / 'check.sh').exists()
+
+    def test_a_file_test_case_still_lands_under_its_own_name(self, tmp_path):
+        job = tmp_path / 'job'
+        (job / 'src').mkdir(parents=True)
+        (job / 'src' / 'a.cpp').write_text('int a;\n')
+        script = tmp_path / 'check.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        crash_dir = tmp_path / 'crash'
+        crash_dir.mkdir()
+
+        self.environment(job, Path('src/a.cpp'), script).dump(crash_dir)
+
+        assert (crash_dir / 'src' / 'a.cpp').read_text() == 'int a;\n'

@@ -193,8 +193,8 @@ def get_dir_count(test_case: Path) -> int:
     return 1 + sum(1 for p in test_case.rglob('*') if p.is_dir())
 
 
-def copy_test_case(source: Path, destination_parent: Path) -> None:
-    """Place one file of the test case into a job's scratch directory.
+def copy_test_case(source: Path, destination_parent: Path, source_parent: Path = Path()) -> None:
+    """Place one test case into a directory, whether it is a file or a tree.
 
     The path is kept as it is, directories and all, because that is how the
     project refers to it and how the interestingness test will find it. That
@@ -202,6 +202,17 @@ def copy_test_case(source: Path, destination_parent: Path) -> None:
     src/ -- which is to say nearly every project -- otherwise fails on the very
     first candidate with FileNotFoundError, because copy2 will not create the
     parent it is copying into.
+
+    `source_parent` says where to read the test case from when that is not the
+    working directory. The name stays relative either way, so the copy
+    reproduces the layout instead of flattening it.
+
+    Every copy of a test case goes through here. The one that did not was the
+    crash dump: it called shutil.copy directly and so had no idea a test case
+    could be a directory. After nine hours of reduction a pass reported a
+    problem it had itself declared non-fatal, the dump raised IsADirectoryError
+    while writing the report, and reporting a survivable problem became the
+    thing that ended the run.
     """
     if source.is_absolute():
         # Not an assert: assertions vanish under -O, and this one is load-bearing.
@@ -210,12 +221,13 @@ def copy_test_case(source: Path, destination_parent: Path) -> None:
         # would share one tree, and the guard that compares a candidate against
         # its original would compare a file with itself and always agree.
         raise ValueError(f'a test case is named relative to the working directory, not {source}')
+    origin = source_parent / source
     destination = destination_parent / source
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_dir():
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+    if origin.is_dir():
+        shutil.copytree(origin, destination, dirs_exist_ok=True)
     else:
-        shutil.copy2(source, destination)
+        shutil.copy2(origin, destination)
 
 
 def replace_test_case_atomically(source: Path, destination: Path, move: bool = True) -> None:
