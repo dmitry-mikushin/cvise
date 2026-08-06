@@ -86,6 +86,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -271,6 +272,54 @@ def remove_state(root: Path) -> None:
                     IMAGE, 'rm', '-rf', f'/state/{root.name}'], check=True)
 
 
+def sweep_ccache_temp(ccache: Path, older_than_minutes: int = 60) -> None:
+    """Remove the temporary files ccache leaks and never collects.
+
+    MEASURED on a seven-hour run: the cache itself held 9.8 GB against its 20 GB
+    ceiling, and `ccache/tmp` held 41 GB in 14 175 files -- two thirds of the
+    tmpfs the reduction lives in, and enough to fill it in another two hours.
+
+    The mechanism is a closed loop. ccache writes an object to a temporary file
+    and renames it into the cache; a process killed between the two leaves the
+    temporary behind, and this reduction kills candidates routinely, by cgroup
+    ceiling and by time budget. Those leftovers are swept only during a cleanup,
+    and a cleanup runs only when the cache exceeds its maximum size -- which a
+    9.8 GB cache under a 20 GB cap never does. So nothing ever collects them.
+
+    An hour is far beyond any live compile, so a temporary older than that
+    belongs to a process that is gone. The age is the whole of the safety
+    argument: without it this would race a running compiler.
+
+    Through a container because the files were written by one, as root, and a
+    host-side unlink gets EPERM on every one of them -- silently, if the error
+    is discarded.
+    """
+    if not ccache.is_dir():
+        return
+    subprocess.run(
+        ['docker', 'run', '--rm', '-v', f'{ccache}:{ccache}', IMAGE,
+         'find', f'{ccache}/tmp', '-type', 'f', '-mmin', f'+{older_than_minutes}', '-delete'],
+        capture_output=True,
+    )
+
+
+def keep_sweeping(ccache: Path, every_seconds: int = 1800) -> threading.Thread:
+    """Sweep for as long as the run lasts, in the background.
+
+    Once at startup is not enough: the leak is produced continuously, at roughly
+    a gigabyte every two minutes under this load, so a run long enough to matter
+    is a run long enough to fill the tmpfs after the sweep.
+    """
+    def loop() -> None:
+        while True:
+            sweep_ccache_temp(ccache)
+            time.sleep(every_seconds)
+
+    thread = threading.Thread(target=loop, daemon=True, name='ccache-temp-sweeper')
+    thread.start()
+    return thread
+
+
 def main() -> int:
     # Interleaved with the container's output rather than flushed after it.
     # Left buffered, this program's own lines are written when it exits, so a
@@ -397,7 +446,8 @@ def main() -> int:
     print(f'    the reduced tree IS {worktree} -- C-Vise rewrites it in place as')
     print('    soon as a smaller interesting variant is found, so an interrupted run')
     print('    loses nothing and --resume continues from there.')
-    print(f'    watch it with: cvise-mon   (this machine is locked to one reduction)')
+    print('    watch it with: cvise-mon   (this machine is locked to one reduction)')
+    keep_sweeping(ccache)
     try:
         return subprocess.run(command).returncode
     finally:
