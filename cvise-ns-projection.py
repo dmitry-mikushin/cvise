@@ -258,6 +258,17 @@ def main() -> int:
     # being diagnosed leaves the container's exit status behind as well.
     command += [] if args.keep else ['--rm']
     command += [
+        # An init at PID 1, because C-Vise is not one. A worker that spawns
+        # clang_delta and exits before it leaves an orphan, the orphan is
+        # reparented to PID 1, and PID 1 here is `python3 /usr/local/bin/cvise`
+        # -- which never calls wait() on a child it did not create, so the entry
+        # stays in the process table for the life of the run. MEASURED: after
+        # one hour, 44 of 48 clang_delta processes were zombies, every one of
+        # them with ppid 1, and the count read as a phase ramping up rather
+        # than as a leak. Making C-Vise reap would be a fix at the wrong level;
+        # it is not an init and the next tool the reduction spawns would leak
+        # the same way. --init puts a real reaper there and closes the class.
+        '--init',
         # The reduction's own cgroup ceiling cannot engage in here -- inside the
         # container it is already at the root of its hierarchy and has nothing
         # to bound itself under -- so the bound is put on the container.
