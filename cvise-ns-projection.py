@@ -80,11 +80,13 @@ WHAT MAKES A CANDIDATE INTERESTING
 """
 
 import argparse
+import fcntl
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # The image is the project's build image plus C-Vise. Not configurable: a build
@@ -111,10 +113,82 @@ TEST = 'IngestTest.ParsesRepresentativeRequestJson'
 # nothing.
 JOB_BUDGET_MB = 2048
 
+# One reduction at a time, and the lock says so on the machine rather than in
+# this process. In /dev/shm deliberately: a lock should be exactly as durable as
+# the processes it protects, and a lock file that survives a reboot is a lock
+# nobody holds and everybody obeys.
+LOCK = Path('/dev/shm/cvise.lock')
+
 
 def die(message: str) -> None:
     print(f'cvise-ns-projection: {message}', file=sys.stderr)
     raise SystemExit(1)
+
+
+def reduction_containers() -> list[tuple[str, str]]:
+    """Containers that are running a reduction right now, as (id, status).
+
+    Matched on the image AND on the command, because the same image is used by
+    verify-reduction.py and by every one-off probe, and refusing to start
+    because somebody ran `docker run ns-rtc-cvise ls` would be a lock that
+    teaches people to work around it.
+    """
+    listing = subprocess.run(
+        ['docker', 'ps', '--format', '{{.ID}}\t{{.Image}}\t{{.Command}}\t{{.Status}}'],
+        capture_output=True, text=True).stdout
+    found = []
+    for row in listing.splitlines():
+        parts = row.split('\t')
+        if len(parts) == 4 and parts[1] == IMAGE and parts[2].strip('"').startswith('cvise'):
+            found.append((parts[0], parts[3]))
+    return found
+
+
+def take_the_machine(name: str) -> int:
+    """Refuse to start beside another reduction, live or abandoned.
+
+    Two things have to be true, and only the first is what a lock usually
+    means:
+
+    A live one. Another runner holding the lock is caught by flock, which the
+    kernel releases when that process dies -- exactly right, since a runner
+    that is gone is no longer using the machine.
+
+    An abandoned one. A runner can die while its container keeps running: the
+    reduction then owns 88 cores and 150 GiB and nothing holds a lock for it,
+    because the lock died with the process that took it. This is the case the
+    lock is actually being asked for, and flock alone does not cover it. So
+    once the lock is ours -- which proves no live runner owns anything -- any
+    reduction container still running is an orphan, and it is named rather than
+    killed. Killing it here would destroy hours of somebody's work on the
+    strength of an inference made in a startup path.
+
+    The handle is returned and must be kept: the lock lasts exactly as long as
+    the file stays open, which is the lifetime of this process, which is the
+    lifetime of the run.
+    """
+    handle = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held = os.read(handle, 4096).decode(errors='replace').strip()
+        die('another reduction holds this machine:\n'
+            f'    {held or "(the holder wrote nothing)"}\n'
+            'wait for it, or stop it -- this machine runs one reduction at a time')
+
+    orphans = reduction_containers()
+    if orphans:
+        lines = '\n'.join(f'    {cid}  {status}' for cid, status in orphans)
+        die('no runner holds the lock, yet a reduction is still running:\n'
+            f'{lines}\n'
+            'so nothing on this machine is looking after it. It is not stopped '
+            'from here, because it may be hours of work:\n'
+            f"    docker stop {' '.join(cid for cid, _ in orphans)}")
+
+    os.ftruncate(handle, 0)
+    os.write(handle, f'pid {os.getpid()}  run {name}  started '
+                     f'{time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
+    return handle
 
 
 def available_mb() -> int:
@@ -228,6 +302,10 @@ def main() -> int:
             'and underscore')
 
     check_image()
+    # Held for the whole run. Not taken for --dry-run, which starts nothing and
+    # would otherwise refuse to show a command while a reduction is running --
+    # the one moment somebody is most likely to ask what the command was.
+    machine = None if args.dry_run else take_the_machine(args.name)
     repo, submodule = find_repo()
 
     root = Path(f'/dev/shm/cvise-{args.name}')
@@ -319,7 +397,14 @@ def main() -> int:
     print(f'    the reduced tree IS {worktree} -- C-Vise rewrites it in place as')
     print('    soon as a smaller interesting variant is found, so an interrupted run')
     print('    loses nothing and --resume continues from there.')
-    return subprocess.run(command).returncode
+    print(f'    watch it with: cvise-mon   (this machine is locked to one reduction)')
+    try:
+        return subprocess.run(command).returncode
+    finally:
+        # Named rather than left to interpreter shutdown, so it is visible that
+        # the lock lasts exactly as long as the container does.
+        if machine is not None:
+            os.close(machine)
 
 
 if __name__ == '__main__':
