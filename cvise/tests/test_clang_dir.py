@@ -68,7 +68,14 @@ def a_project(tmp_path: Path):
 
 def a_pass(database: Path) -> ClangPass:
     programs = find_external_programs()
-    if not programs.get('clang_delta') or not Path(programs['clang_delta']).exists():
+    # Asked as "is this a program I can run", not "does this path exist". The
+    # name resolves to the bare string 'clang_delta' when the build is not
+    # installed, and the repo root -- which is where pytest runs -- contains a
+    # DIRECTORY of that name. `.exists()` therefore said yes, the skip did not
+    # happen, and seven tests failed with "0 > 0" about a binary that was never
+    # on PATH. shutil.which answers the question that was meant, and declines
+    # directories.
+    if not shutil.which(programs.get('clang_delta') or ''):
         pytest.skip('clang_delta is not built')
     return ClangPass(
         'remove-unused-function', external_programs=programs, compilation_database=str(database)

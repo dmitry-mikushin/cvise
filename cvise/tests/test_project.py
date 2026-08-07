@@ -107,6 +107,14 @@ class TestWhichTestDecides:
 
 
 class TestTheCheckScript:
+    """Run where a job runs: in a directory of its own.
+
+    The script writes `.cvise-keep` into its working directory when it refuses a
+    candidate, which is how a job asks for its scratch to be preserved. Started
+    from wherever pytest happens to be, that marker landed in the checkout --
+    which is both litter and a lie, since no job has ever run there.
+    """
+
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
     def test_it_builds_before_it_tests(self, tmp_path):
         """ctest does not build, so without this a candidate is judged by the
@@ -115,7 +123,7 @@ class TestTheCheckScript:
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         script = check_script(project, 'says_v', tmp_path / 'check.sh')
-        assert subprocess.run([str(script)], capture_output=True).returncode == 0
+        assert subprocess.run([str(script)], capture_output=True, cwd=tmp_path).returncode == 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
     def test_a_test_that_is_not_there_is_a_failure(self, tmp_path):
@@ -125,7 +133,7 @@ class TestTheCheckScript:
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
-        assert subprocess.run([str(script)], capture_output=True).returncode != 0
+        assert subprocess.run([str(script)], capture_output=True, cwd=tmp_path).returncode != 0
 
     @pytest.mark.skipif(not shutil.which('gcc'), reason='requires a C compiler')
     def test_the_output_is_kept(self, tmp_path):
@@ -133,7 +141,7 @@ class TestTheCheckScript:
         cmakelists = write_project(tmp_path / 'project', extra_targets=TESTED_PROJECT)
         project = configure(cmakelists, tmp_path / 'build')
         script = check_script(project, 'gone_missing', tmp_path / 'check.sh')
-        proc = subprocess.run([str(script)], capture_output=True, text=True)
+        proc = subprocess.run([str(script)], capture_output=True, text=True, cwd=tmp_path)
         assert proc.stdout.strip(), 'the check script said nothing about why it failed'
 
 
