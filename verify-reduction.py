@@ -33,6 +33,18 @@ IMAGE = 'ns-rtc-cvise'
 SRC = '/src'
 SUBMODULE = 'third_party/ns-projection'
 
+# Where a verified result is put so that it survives the machine. The state
+# directory is tmpfs and the reduction that made it can die at any moment; twice
+# during one reduction the result was saved only because a copy had already
+# landed here.
+RESULTS = Path.home() / 'cvise-results'
+
+# The commits are made by a program, so they say so rather than borrowing
+# whoever happened to be logged in.
+AUTHOR = ('-c', 'user.name=C-Vise', '-c', 'user.email=cvise@localhost')
+
+SOURCE_SUFFIXES = ('.cpp', '.cc', '.cxx', '.c', '.hpp', '.hh', '.hxx', '.h', '.inc')
+
 
 def container_of(state: Path) -> str | None:
     """The reduction working on this state directory, by what it has mounted.
@@ -56,6 +68,114 @@ def container_of(state: Path) -> str | None:
 
 def run(command, **kwargs):
     return subprocess.run(command, capture_output=True, text=True, **kwargs)
+
+
+def git(tree: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, text=True)
+
+
+def how_much_code(tree: Path) -> str:
+    """What is left, in the terms a person judges a reduction by.
+
+    Not bytes. They move the same for a stripped space and for a deleted
+    translation unit, so a message carrying them says nothing about how far the
+    reduction has come.
+    """
+    files = lines = 0
+    for path in tree.rglob('*'):
+        if not path.is_file() or path.suffix not in SOURCE_SUFFIXES or '.git' in path.parts:
+            continue
+        try:
+            counted = sum(1 for line in path.read_text(errors='replace').splitlines() if line.strip())
+        except OSError:
+            continue
+        if counted:
+            files += 1
+            lines += counted
+    return f'{lines} lines of code in {files} files'
+
+
+def on_the_branch(tree: Path, branch: str) -> bool:
+    """Put the verified history on a branch of its own, creating it once.
+
+    The worktree is checked out detached at the pin, so the first commit has
+    nowhere to go. Creating the branch at HEAD moves no file, which is why this
+    is safe to do while the reduction is running -- and it was, seven times.
+    """
+    if git(tree, 'rev-parse', '--verify', branch).returncode == 0:
+        return git(tree, 'checkout', branch).returncode == 0
+    return git(tree, 'checkout', '-b', branch).returncode == 0
+
+
+def preserve(tree: Path, state: Path, test: str) -> None:
+    """Commit the verified tree and bundle it out of the tmpfs it lives in.
+
+    VERIFIED is the moment the result is known to be good, and it is also the
+    only moment at which that is cheap to record. MEASURED twice in one
+    reduction: a run died at 56% with an exception while writing a crash
+    report, and another was stopped by hand after converging -- in both cases
+    the result survived because a copy had already been committed and bundled.
+    Nothing else about the run survived: the state directory is tmpfs.
+
+    A bundle rather than an archive, because it carries the history: the result
+    is then a diff against the project's real HEAD rather than an opaque tree,
+    and it is small -- 19 MB against a 91 MB checkout.
+
+    `git add` and `git commit` change no file in the working tree, so this does
+    not disturb a reduction that is running in it. That is the whole safety
+    argument and it is worth stating, because the operation looks invasive and
+    is not.
+    """
+    if git(tree, 'rev-parse', '--git-dir').returncode != 0:
+        print(f'note: {tree} is not a git checkout, so the result was not preserved',
+              file=sys.stderr)
+        return
+
+    branch = f'{state.name}-verified'
+    if not on_the_branch(tree, branch):
+        print(f'note: could not put the result on branch {branch}', file=sys.stderr)
+        return
+
+    git(tree, 'add', '-A')
+    if not git(tree, 'diff', '--cached', '--quiet').returncode:
+        # Nothing has changed since the last verified point. An empty commit
+        # would say a reduction happened when none did.
+        print(f'already preserved: {branch} is the tree that was just verified')
+        return
+
+    message = f'reduced by C-Vise: {how_much_code(tree)}, VERIFIED to build and pass {test}'
+    committed = git(tree, *AUTHOR, 'commit', '-m', message)
+    if committed.returncode != 0:
+        print(f'note: the verified tree could not be committed: {committed.stderr.strip()[:200]}',
+              file=sys.stderr)
+        return
+
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    bundle = RESULTS / f'{tree.name}-{state.name}-verified.bundle'
+    # HEAD as well as the branch, and it is not redundant. A bundle holding only
+    # a branch has no HEAD to check out, so `git clone` of it produces a
+    # repository with an empty working tree and the warning "remote HEAD refers
+    # to nonexistent ref, unable to checkout". MEASURED: the content is all
+    # there, but getting at it takes a second, non-obvious step, and the clone
+    # looks broken to whoever is handed it. With HEAD recorded, one clone gives
+    # the tree, on the branch, with the files in it.
+    made = subprocess.run(['git', '-C', str(tree), 'bundle', 'create', str(bundle), 'HEAD', branch],
+                          capture_output=True, text=True)
+    if made.returncode != 0:
+        print(f'note: the bundle could not be written: {made.stderr.strip()[:200]}', file=sys.stderr)
+        return
+    # Verified rather than assumed: a bundle that cannot be read back is a
+    # backup that only looks like one, and the day it is needed is the wrong
+    # day to find out.
+    checked = subprocess.run(['git', 'bundle', 'verify', str(bundle)], capture_output=True, text=True)
+    if checked.returncode != 0:
+        print(f'note: {bundle} does not verify: {checked.stderr.strip()[:200]}', file=sys.stderr)
+        return
+
+    revision = git(tree, 'rev-parse', '--short', 'HEAD').stdout.strip()
+    size = bundle.stat().st_size / 1024 ** 2
+    print(f'preserved: {revision} on {branch}, {message.split(", VERIFIED")[0]}')
+    print(f'           {bundle} ({size:.1f} MB, history complete)')
 
 
 def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
@@ -123,6 +243,10 @@ def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
 
     if proc.returncode == 0:
         print(f'VERIFIED: the published tree builds from nothing and {test} passes')
+        # Immediately, rather than left to whoever is watching. The result is
+        # known to be good exactly now, it lives in tmpfs, and the run that made
+        # it may not survive the hour.
+        preserve(tree, state, test)
         if not keep:
             # Through a container again: the build wrote as root, and a failure
             # to clean up must be visible rather than left for the next run to
