@@ -577,13 +577,7 @@ def do_reduce(args):
             not a small thing.
             """
             written = project_utils.publish(project, staged)
-            logging.info('%d files written back; rebuilding what the jobs read', len(written))
-            if written.describes_a_different_project:
-                # A removed source is the one change the build directory cannot
-                # work out for itself: it keeps a rule to compile the file and
-                # an archive that lists its object, and the glob that watches
-                # for such things sees an unchanged directory.
-                project_utils.reconfigure(project)
+            logging.info('%d files written back; rebuilding what the jobs read', written)
             project_utils.baseline_build(project, build_target)
 
         # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
