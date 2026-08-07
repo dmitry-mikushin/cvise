@@ -12,6 +12,7 @@ showing it holding its nerve.
 
 import logging
 import time
+from pathlib import Path
 
 import pytest
 
@@ -175,16 +176,34 @@ class TestTheSeries:
         path = tmp_path / 'progress.tsv'
         s = Series(path)
         s.add(1000, 100, 10, 'LinesPass::0')
-        when, byts, lines, files, via = path.read_text().splitlines()[1].split('\t')
+        point = next(line for line in path.read_text().splitlines()
+                     if not line.startswith('#'))
+        when, byts, lines, files, via = point.split('\t')
         assert int(when) > 1_700_000_000, 'not a wall-clock time'
         assert (byts, lines, files, via) == ('1000', '100', '10', 'LinesPass::0')
+
+    def test_each_run_says_where_it_begins(self, tmp_path):
+        """So a reader never has to guess where one run ends and the next starts.
+
+        Guessing would mean guessing by the size of the interval, and the
+        longest gap ever observed WITHIN a run is 66 min -- not comfortably
+        below how quickly a run can be restarted.
+        """
+        path = tmp_path / 'progress.tsv'
+        Series(path).add(1000, 100, 10, 'a')
+        Series(path).add(900, 90, 9, 'b')
+        marks = [line for line in path.read_text().splitlines()
+                 if line.startswith('#run')]
+        assert len(marks) == 2
+        assert int(marks[0].split('\t')[1]) > 1_700_000_000
 
     def test_a_second_run_appends_rather_than_starting_again(self, tmp_path):
         path = tmp_path / 'progress.tsv'
         Series(path).add(1000, 100, 10, 'a')
         Series(path).add(900, 90, 9, 'b')
         body = path.read_text().splitlines()
-        assert len(body) == 3 and body[0].startswith('#when')
+        assert body[0].startswith('#when')
+        assert len([line for line in body if not line.startswith('#')]) == 2
 
     def test_an_unwritable_place_costs_a_warning_and_not_the_run(self, tmp_path, caplog):
         """A record of the run is not a dependency of it."""
@@ -280,3 +299,46 @@ class TestTheWiring:
         self.replay_into(m, DEAD)
 
         assert not m.call_it_finished_if_it_is()
+
+
+class TestBothImplementationsAgree:
+    """One fixture, two readers, in two languages.
+
+    The decision to stop is C-Vise's and cvise-mon only displays -- but it
+    displays the same quantities computed a second time in Rust, and two copies
+    of a rule drift. The expectations were computed from this module and are
+    checked from the Rust side too, so a change on either side fails a test.
+    """
+
+    DATA = Path(__file__).parent / 'data'
+
+    def read(self, path):
+        p = Pace(started=0.0)
+        for line in path.read_text().splitlines():
+            if line.startswith('#run'):
+                p = Pace(started=0.0)
+                continue
+            if line.startswith('#'):
+                continue
+            when, _bytes, lines, *_rest = line.split('\t')
+            p.record(int(lines), now=float(when))
+        return p
+
+    def test_the_expectations_still_describe_this_code(self):
+        p = self.read(self.DATA / 'run16-progress.tsv')
+        rows = [line.split('\t') for line in
+                (self.DATA / 'run16-expected.tsv').read_text().splitlines()
+                if not line.startswith('#')]
+        assert len(rows) >= 8, 'the fixture stopped covering both sides of the deadline'
+        for now, usual, deadline, spent, line in rows:
+            assert abs(p.usual - float(usual)) < 0.001
+            assert abs(p.deadline() - float(deadline)) < 1.0
+            assert p.spent(now=float(now)) is (spent == 'true'), now
+            assert report(p, now=float(now)) == line, now
+
+    def test_the_fixture_straddles_the_moment_it_is_about(self):
+        """An expectation file that is all one answer proves nothing."""
+        verdicts = {line.split('\t')[3] for line in
+                    (self.DATA / 'run16-expected.tsv').read_text().splitlines()
+                    if not line.startswith('#')}
+        assert verdicts == {'true', 'false'}

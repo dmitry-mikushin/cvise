@@ -5,6 +5,7 @@
 //! terminal, which is what a script or a log wants.
 
 mod docker;
+mod pace;
 mod tree;
 mod ui;
 mod verdicts;
@@ -25,6 +26,10 @@ pub struct Snapshot {
     pub before: tree::Shape,
     pub now: tree::Shape,
     pub via: Option<String>,
+    /// The rhythm of the live run, read from the series C-Vise writes. This is
+    /// what turns an open-ended wait into a deadline.
+    pub pace: pace::Pace,
+    pub now_epoch: f64,
     pub verdicts: verdicts::Verdicts,
     pub rate: Option<f64>,
     pub published: usize,
@@ -75,6 +80,11 @@ fn gather(previous: Option<&Snapshot>, elapsed: Option<f64>) -> Option<Snapshot>
     let journal = docker::Journal::of(&run.id);
     let tool = tree::treesitter_delta(&repo_root());
     let verdicts = verdicts::read(&run.state);
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let pace = pace::read(&run.state, now_epoch);
 
     let (original, before) = match tree::baseline(&run.state, &run.worktree, tool.as_deref()) {
         Some(pair) => pair,
@@ -113,10 +123,14 @@ fn gather(previous: Option<&Snapshot>, elapsed: Option<f64>) -> Option<Snapshot>
         original,
         before,
         now,
-        via: journal.via(),
+        // From the series rather than from `docker logs`: same fact, read from
+        // a file with a wall clock on it instead of scraped out of a stream.
+        via: pace.via().or_else(|| journal.via()),
+        published: pace.points.len().saturating_sub(1),
+        pace,
+        now_epoch,
         verdicts,
         rate,
-        published: journal.count("files written back"),
         baseline_failed: journal.count("does not build as it stands"),
         load: docker::load(&run.id),
         cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
@@ -163,6 +177,10 @@ fn plain(snap: &Snapshot) -> String {
         ui::thousands(snap.before.functions),
         ui::thousands(functions),
         percent(functions, snap.before.functions),
+    ));
+    out.push_str(&format!(
+        "            {}\n",
+        pace::report(&snap.pace, snap.now_epoch)
     ));
     if let Some(via) = &snap.via {
         out.push_str(&format!("            via {via}\n"));
@@ -335,6 +353,8 @@ impl Snapshot {
             before: tree::Shape::default(),
             now: tree::Shape::default(),
             via: None,
+            pace: pace::Pace::default(),
+            now_epoch: 0.0,
             verdicts: verdicts::Verdicts::default(),
             rate: None,
             published: 0,

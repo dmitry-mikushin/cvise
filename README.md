@@ -109,7 +109,51 @@ step what the line-by-line passes had been finding one at a time.
 Keep the tree, restart the schedule. A checkpoint that restored the position in
 the schedule would optimise away the part that was doing the work.
 
-### What a candidate costs
+### When it will be done, and when to stop waiting
+
+A reduction has no natural end. It converges, and from the outside converging
+and having converged look identical: the machine is busy either way, the log
+keeps moving, and the only thing that changes is that nothing gets smaller.
+
+C-Vise therefore times itself and says so, about every five minutes:
+
+```
+a reduction every 10m47s; 3497 lines/h; next one due within 32m22s; giving up in 1h26m
+```
+
+The last figure is the one that makes a reduction usable as a step in a plan.
+It is not a guess at when the run will finish -- it is when the run will be
+STOPPED unless something smaller turns up first, and it moves forward every
+time something does. An open-ended wait becomes a deadline.
+
+When that deadline passes, the run ends and says why. Nothing is lost by it
+being wrong: the reduced tree IS the result, it is on disk continuously, and
+starting again on it continues from there.
+
+MEASURED on ns-projection, over the 25.3 h its logs record: one run of 10.96 h
+spent 6.00 h -- 54.8% of itself -- after its last accepted reduction, ending
+only once five separate passes had each burned 50 000 jobs. Two other runs of
+the same length spent 0.6% and 2.5% that way. The waste is not gradual, it is
+a cliff, and nothing was watching for it.
+
+The size of the tree cannot see that cliff. Fitted to one run's 152 accepted
+reductions and graded by predicting what came after, an exponential and a power
+law both miss by a median of 72%; extrapolating the recent slope -- what a
+progress bar would do -- is no better and is biased, over-promising in nine
+cases out of nine.
+
+The intervals between accepted reductions can. They are observed rather than
+fitted, and a run still working and a run that is over are nowhere near each
+other on that scale: the final silence of the two healthy runs was 0.2 and 0.6
+times their usual interval, and of the run that was over, 35.7 times it.
+
+`--patience` is how many times the usual interval the silence must exceed;
+8 by default, and 0 to wait for ever as C-Vise used to.
+
+Every accepted reduction is also appended to `cvise-progress.tsv`, beside the
+verdict journal, with a wall-clock timestamp. `cvise-mon` reads it -- that is
+where the same line on its screen comes from.
+
 
 A reduction asks one question millions of times, so what the question costs is
 what the reduction costs. It is asked in two stages:

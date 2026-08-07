@@ -30,6 +30,7 @@ apart, and no fit is needed to tell them apart.
 from __future__ import annotations
 
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -78,12 +79,16 @@ class Pace:
     patience: int = PATIENCE
     started: float = field(default_factory=time.monotonic)
     gaps: list[float] = field(default_factory=list)
+    #: When the first point was recorded, on whatever clock recorded it.
+    first: float | None = None
     last: float | None = None
     lines: int | None = None
     removed: int = 0
 
     def record(self, lines: int, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
+        if self.first is None:
+            self.first = now
         if self.last is not None:
             self.gaps.append(now - self.last)
         if self.lines is not None:
@@ -120,15 +125,23 @@ class Pace:
         return deadline is not None and (time.monotonic() if now is None else now) > deadline
 
     def per_hour(self, now: float | None = None) -> float | None:
-        """Lines removed per hour over the whole run so far.
+        """Lines removed per hour, measured from the first recorded point.
 
         Over the whole run and not a recent window on purpose: a window short
         enough to be current is shorter than the gap between successes for most
         of a reduction, so it reads zero at every instant that is not a success
         and a spike at every instant that is.
+
+        From the first POINT and not from construction, and that is not a
+        detail: `started` is a monotonic reading while `now` may be anything a
+        caller passes, and mixing the two produced "0 lines/h" on a run that had
+        removed 150 000 of them. Both ends of this subtraction now come from the
+        same clock by construction.
         """
         now = time.monotonic() if now is None else now
-        elapsed = now - self.started
+        if self.first is None:
+            return None
+        elapsed = now - self.first
         if elapsed < 60 or not self.removed:
             return None
         return self.removed / (elapsed / 3600)
@@ -152,10 +165,16 @@ def report(pace: Pace, now: float | None = None) -> str:
     rate = pace.per_hour(now)
     if rate is not None:
         parts.append(f'{rate:.0f} lines/h')
-    parts.append(f'next one within {clock(BAND * usual)} unless this is the end')
     left = pace.deadline() - now
-    parts.append(f'giving up in {clock(left)}' if left > 0
-                 else f'silent for {clock(pace.silence(now))}')
+    if left > 0:
+        # Only while there is still a run to forecast for. Saying "next one
+        # within 32m" beside "silent for 3h00m" is two statements that cannot
+        # both be true, and the reader believes the reassuring one.
+        parts.append(f'next one due within {clock(BAND * usual)}')
+        parts.append(f'giving up in {clock(left)}')
+    else:
+        parts.append(f'silent for {clock(pace.silence(now))}')
+        parts.append('giving up now')
     return '; '.join(parts)
 
 
@@ -168,6 +187,12 @@ class Series:
     from one, because each starts its clock at zero: reconstructing the series
     for the measurements above meant ordering the segments by file count and
     hoping. An absolute timestamp is the fix and it costs one field.
+
+    The file outlives the run that wrote it, and several runs share a state
+    directory, so each says where it begins. A reader that had to guess would
+    guess by the size of the interval -- and the longest gap ever observed
+    WITHIN a run is 66 min, which is not comfortably below how quickly a run can
+    be restarted. Saying it is one line and removes the question.
     """
 
     HEADER = '#when\tbytes\tlines\tfiles\tvia\n'
@@ -179,6 +204,8 @@ class Series:
         try:
             if not path.exists():
                 path.write_text(self.HEADER)
+            with path.open('a') as f:
+                f.write(f'#run\t{time.time():.0f}\t{os.getpid()}\n')
         except OSError as e:
             logging.warning('progress will not be recorded to %s: %s', path, e)
             self.path = None

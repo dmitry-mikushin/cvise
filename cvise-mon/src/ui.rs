@@ -18,6 +18,9 @@ use crate::Snapshot;
 const GONE: Color = Color::Green;
 const LEFT: Color = Color::DarkGray;
 const DIM: Color = Color::Gray;
+// The pace line, in the two states it has: still finding things, or out of time.
+const GOOD: Color = Color::Green;
+const WARN: Color = Color::Yellow;
 const BAR: usize = 28;
 
 pub fn thousands(value: usize) -> String {
@@ -128,6 +131,18 @@ fn reduced(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         removed_row("functions", snap.now.functions, snap.before.functions),
         Line::from(""),
     ];
+    // The line a person is actually waiting for. Above the provenance, because
+    // "how much longer" is the question and "which pass" is the footnote.
+    let silent = snap
+        .pace
+        .deadline()
+        .map(|d| d <= snap.now_epoch)
+        .unwrap_or(false);
+    text.push(Line::from(Span::styled(
+        format!(" {}", crate::pace::report(&snap.pace, snap.now_epoch)),
+        Style::default().fg(if silent { WARN } else { GOOD }),
+    )));
+
     let mut note = format!(" original {}", &snap.original[..12.min(snap.original.len())]);
     if let Some(via) = &snap.via {
         note.push_str(&format!("   via {via}"));
