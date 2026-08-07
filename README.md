@@ -83,6 +83,32 @@ compilation database used to be separate ways in, and they are gone: a tool with
 five entrances has five sets of assumptions to keep straight, and the one that
 matters here is the one the build system can state for itself.
 
+### An interrupted reduction is not a lost one
+
+The reduced tree IS the input. C-Vise rewrites it in place as soon as a smaller
+interesting variant is found, so what is on disk at any moment is the best
+result so far, and a run that is killed -- by a reboot, by the OOM killer, by
+somebody's Ctrl-C -- loses only the candidates that were in flight. Start it
+again on the same tree and it goes on from there.
+
+There is no state file to keep and nothing to configure: the property follows
+from where the result is kept. What a driver has to do is refrain from resetting
+the tree first. `cvise-ns-projection.py` takes `--resume` for exactly that --
+without it the worktree is put back to its pin before starting, which is what a
+fresh reduction wants and never what a crashed one does.
+
+The pass schedule is NOT carried over, and on a project that is the better half
+of the bargain rather than a shortcoming. MEASURED on ns-projection: a run that
+had been going for 10 h 55 min had removed 49.1% of the lines and was finding a
+few hundred more per hour. Restarted on the tree it had itself produced, it
+reached 54.6% within the first hour and 60.5% within three. Beginning the
+schedule again lets the passes that work in bulk -- reachability above all --
+look afresh at a tree that has changed shape underneath them, and propose in one
+step what the line-by-line passes had been finding one at a time.
+
+Keep the tree, restart the schedule. A checkpoint that restored the position in
+the schedule would optimise away the part that was doing the work.
+
 ### What a candidate costs
 
 A reduction asks one question millions of times, so what the question costs is
