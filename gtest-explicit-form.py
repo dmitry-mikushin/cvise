@@ -109,47 +109,126 @@ CVISE_NOREDUCE
 void {cls}::TestBody() {body}"""
 
 
+MARKER = 'CVISE_NOREDUCE'
+MARKER_HEADER = 'noreduce.h'
+
+
+def tests_in(text: str) -> list[tuple[int, int, str, str]]:
+    """Every TEST(suite, name) in the file, as (start, end, suite, name).
+
+    `end` is past the closing brace of the body, so a caller can replace the
+    whole macro with what it expands to.
+    """
+    found = []
+    for match in re.finditer(r'^TEST\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*', text, re.M):
+        opening = text.index('{', match.end() - 1)
+        found.append((match.start(), body_extent(text, opening), match.group(1), match.group(2)))
+    return found
+
+
+def with_marker_header(text: str) -> str:
+    """Make CVISE_NOREDUCE mean something in this file.
+
+    Without the include the marker is an undeclared identifier and the file
+    stops compiling -- MEASURED across this corpus: one file of 227 had the
+    include, so a bulk rewrite that forgot it would break 226.
+
+    Placed after the last include that comes BEFORE the first use of the
+    marker, which is not the same as the last include in the file. MEASURED:
+    cpython_set_order_test.cpp includes a fixture at line 923, below its tests,
+    so "after the last include" put the header 743 lines after the first
+    CVISE_NOREDUCE that needed it, and 227 files compiled into
+    `unknown type name 'CVISE_NOREDUCE'`. The build found that; reading the
+    diff did not.
+    """
+    if re.search(rf'#\s*include\s*[<"].*{re.escape(MARKER_HEADER)}', text):
+        return text
+    line = f'#include "{MARKER_HEADER}"'
+    first_use = text.find(MARKER)
+    if first_use < 0:
+        return text
+    before = [m for m in re.finditer(r'^#\s*include\s+[<"][^>"]+[>"].*$', text, re.M)
+              if m.end() < first_use]
+    if not before:
+        return line + '\n\n' + text
+    at = before[-1].end()
+    return text[:at] + '\n' + line + text[at:]
+
+
+def rewrite(text: str, wanted: set[str] | None) -> tuple[str, list[str]]:
+    """Rewrite the selected tests, returning the new text and what was done.
+
+    Backwards through the file, because each replacement changes the offsets of
+    everything after it and nothing before it.
+    """
+    done = []
+    for start, end, suite, name in reversed(tests_in(text)):
+        if wanted is not None and f'{suite}.{name}' not in wanted:
+            continue
+        body = text[text.index('{', start):end]
+        replacement = explicit_form(suite, name, body)
+        # The one thing worth checking twice: the bytes copied are the bytes
+        # found. A test rewritten by hand is a test that may quietly assert
+        # something slightly different.
+        if body not in replacement:
+            raise SystemExit(f'refusing: the body of {suite}.{name} was altered in the process')
+        if not body.startswith('{') or not body.endswith('}'):
+            raise SystemExit(f'refusing: {suite}.{name} does not look like a body')
+        text = text[:start] + replacement + text[end:]
+        done.append(f'{suite}.{name}')
+    if done:
+        text = with_marker_header(text)
+    return text, list(reversed(done))
+
+
+def sources(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return sorted(p for p in path.rglob('*.cpp') if p.is_file())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('file')
-    parser.add_argument('test', help='Suite.Name')
+    parser.add_argument('path', help='a test file, or a directory of them')
+    parser.add_argument('--test', action='append', metavar='Suite.Name',
+                        help='only this test; repeatable. Without it, every TEST() found')
     parser.add_argument('--write', action='store_true', help='apply it; otherwise only show it')
     args = parser.parse_args()
 
-    path = Path(args.file)
-    text = path.read_text()
-    suite, name = args.test.split('.', 1)
+    wanted = set(args.test) if args.test else None
+    files = sources(Path(args.path))
+    if not files:
+        raise SystemExit(f'no .cpp under {args.path}')
 
-    match = re.search(rf'^TEST\(\s*{re.escape(suite)}\s*,\s*{re.escape(name)}\s*\)\s*', text, re.M)
-    if match is None:
-        raise SystemExit(f'TEST({suite}, {name}) not found in {path}')
-    opening = text.index('{', match.end() - 1)
-    end = body_extent(text, opening)
-    body = text[opening:end]
+    total = 0
+    touched = 0
+    single = None
+    for path in files:
+        text = path.read_text()
+        produced, done = rewrite(text, wanted)
+        if not done:
+            continue
+        total += len(done)
+        touched += 1
+        single = (path, text, produced) if len(files) == 1 and len(done) == 1 else single
+        if args.write:
+            path.write_text(produced)
+        elif len(files) > 1 or len(done) > 1:
+            print(f'{path}: {len(done)} test(s) -- {", ".join(done)}')
 
-    # The one thing worth checking twice: the bytes copied are the bytes found.
-    replacement = explicit_form(suite, name, body)
-    if body not in replacement:
-        raise SystemExit('refusing: the body was altered in the process')
-    if not body.startswith('{') or not body.endswith('}'):
-        raise SystemExit('refusing: that does not look like a body')
+    if single is not None:
+        path, before, after = single
+        sys.stdout.writelines(difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile=str(path), tofile=str(path) + ' (rewritten)', n=2,
+        ))
 
-    produced = text[: match.start()] + replacement + text[end:]
+    if wanted and total == 0:
+        raise SystemExit(f'none of {sorted(wanted)} found under {args.path}')
 
-    diff = difflib.unified_diff(
-        text.splitlines(keepends=True),
-        produced.splitlines(keepends=True),
-        fromfile=str(path), tofile=str(path) + ' (rewritten)', n=2,
-    )
-    sys.stdout.writelines(diff)
-
-    kept = len(body.splitlines())
-    print(f'\n{kept} lines of body copied unchanged; {len(body)} bytes')
+    print(f'\n{total} test(s) rewritten in {touched} file(s)')
     if not args.write:
         print('nothing written. Re-run with --write to apply.')
-        return 0
-    path.write_text(produced)
-    print(f'written to {path}')
     return 0
 
 
