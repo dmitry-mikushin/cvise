@@ -577,7 +577,13 @@ def do_reduce(args):
             not a small thing.
             """
             written = project_utils.publish(project, staged)
-            logging.info('%d files written back; rebuilding what the jobs read', written)
+            logging.info('%d files written back; rebuilding what the jobs read', len(written))
+            if written.describes_a_different_project:
+                # A removed source is the one change the build directory cannot
+                # work out for itself: it keeps a rule to compile the file and
+                # an archive that lists its object, and the glob that watches
+                # for such things sees an unchanged directory.
+                project_utils.reconfigure(project)
             project_utils.baseline_build(project, build_target)
 
         # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
@@ -608,6 +614,10 @@ def do_reduce(args):
             # build: the flags come from the project's own database.
             check_command={str(k): v for k, v in project.check_command.items()},
             precheck_timeout=args.timeout,
+            # The ctest name this run is graded by. A CVISE_NOREDUCE_TEST
+            # marker naming another test is inert, so every test in the project
+            # can carry one and exactly the one being graded by is enforced.
+            criterion=args.test,
             overlay_root=project.root,
             # The build tree is isolated per job as well. It is where the
             # verdict about a candidate is computed, and sharing it means a job
@@ -692,7 +702,7 @@ def do_reduce(args):
         # directories still have to go.
         if project is not None and staged is not None:
             published = project_utils.publish(project, staged)
-            logging.info('%d reduced files written back to %s', published, project.root)
+            logging.info('%d reduced files written back to %s', len(published), project.root)
         if script:
             os.unlink(script.name)
         shutil.rmtree(cmake_dir, ignore_errors=True)

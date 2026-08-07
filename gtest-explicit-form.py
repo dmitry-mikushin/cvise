@@ -105,12 +105,27 @@ const ::testing::TestInfo* const k{cls}Registered =
 
 }} // namespace
 
-CVISE_NOREDUCE
+CVISE_NOREDUCE_TEST({suite}, {name})
 void {cls}::TestBody() {body}"""
 
 
-MARKER = 'CVISE_NOREDUCE'
+MARKER = 'CVISE_NOREDUCE_TEST'
 MARKER_HEADER = 'noreduce.h'
+
+# What the header must say for the named marker to compile. Written here rather
+# than left to whoever runs this, because a rewrite that needs a hand edit
+# somewhere else to compile is a trap, and this one would spring it 227 times.
+MARKER_DEFINITION = '''
+// Guards the test it names, and only when a reduction is being graded by that
+// test. Every test can carry one; the reducer reads the source and enforces
+// the one whose name it was given, so which test is protected follows from
+// which test is being graded by.
+#if defined(__clang__)
+#define CVISE_NOREDUCE_TEST(suite, name) [[clang::annotate("cvise::noreduce")]]
+#else
+#define CVISE_NOREDUCE_TEST(suite, name)
+#endif
+'''
 
 
 def tests_in(text: str) -> list[tuple[int, int, str, str]]:
@@ -181,6 +196,23 @@ def rewrite(text: str, wanted: set[str] | None) -> tuple[str, list[str]]:
     return text, list(reversed(done))
 
 
+def ensure_marker_defined(header: Path) -> bool:
+    """Make CVISE_NOREDUCE_TEST exist, next to the CVISE_NOREDUCE it joins.
+
+    Returns whether the header had to be changed. The alternative -- emitting
+    uses of a macro nobody defined -- is the failure this script has already
+    made once: 227 files compiling into `unknown type name`, found by the build
+    and not by the diff.
+    """
+    if not header.is_file():
+        return False
+    text = header.read_text()
+    if f'#define {MARKER}' in text:
+        return False
+    header.write_text(text.rstrip('\n') + '\n' + MARKER_DEFINITION)
+    return True
+
+
 def sources(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
@@ -196,9 +228,11 @@ def main() -> int:
     args = parser.parse_args()
 
     wanted = set(args.test) if args.test else None
-    files = sources(Path(args.path))
+    root = Path(args.path)
+    files = sources(root)
     if not files:
         raise SystemExit(f'no .cpp under {args.path}')
+    header = (root if root.is_dir() else root.parent) / MARKER_HEADER
 
     total = 0
     touched = 0
@@ -225,6 +259,9 @@ def main() -> int:
 
     if wanted and total == 0:
         raise SystemExit(f'none of {sorted(wanted)} found under {args.path}')
+
+    if args.write and total and ensure_marker_defined(header):
+        print(f'{header}: CVISE_NOREDUCE_TEST defined')
 
     print(f'\n{total} test(s) rewritten in {touched} file(s)')
     if not args.write:

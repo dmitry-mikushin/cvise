@@ -71,6 +71,17 @@ from cvise.utils.externalprograms import find_external_programs
 
 MARKER = 'CVISE_NOREDUCE'
 
+# The same guard, naming the test it belongs to. Every test in a suite can carry
+# one, and only the one whose name is the criterion this run was given does
+# anything -- so which test is protected follows from which test is being graded
+# by, rather than from editing a thousand files whenever that changes.
+#
+# It has to be visible in the SOURCE, which is why this is a second spelling
+# rather than a preprocessor condition: what is read here is the text on disk,
+# never the preprocessed translation unit, so an #if would leave every marker
+# looking equally active.
+MARKER_TEST = MARKER + '_TEST'
+
 
 @functools.cache
 def _lister() -> str | None:
@@ -103,28 +114,41 @@ def _defines_marker(text: str) -> bool:
     A warning nobody can act on trains its reader to ignore the channel it
     arrives on, which costs more than it ever saves.
     """
-    return re.search(rf'^\s*#\s*(?:define|undef|ifdef|ifndef)\s+{re.escape(MARKER)}\b',
+    return re.search(rf'^\s*#\s*(?:define|undef|ifdef|ifndef)\s+{re.escape(MARKER)}',
                      text, re.M) is not None
 
 
-def _marks(line: str) -> bool:
-    """Is this line the marker, rather than prose or a definition of it?
+def _marks(line: str, criterion: str | None = None) -> bool:
+    """Is this line an ACTIVE marker, rather than prose or a definition of one?
 
     A use starts the line. Prose that merely names the marker -- a comment
     explaining why it is there, this docstring, the header that defines it --
     does not, and must not count: a mention inside a definition would otherwise
     protect something nobody meant to protect, and a mention in the defining
     header would refuse every candidate touching it forever.
+
+    The named form is active only for the test this run is graded by. Without a
+    criterion every marker is active, which is the safe direction: a guard that
+    goes quiet when it does not know what it is guarding is worse than one that
+    refuses too much.
     """
-    return line.lstrip().startswith(MARKER)
+    line = line.lstrip()
+    if line.startswith(MARKER_TEST):
+        named = re.match(rf'{re.escape(MARKER_TEST)}\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', line)
+        if named is None:
+            # Written like the named form and not parseable as it. Refusing to
+            # guess which test it meant, and refusing to let it protect nothing.
+            return True
+        return criterion is None or f'{named.group(1)}.{named.group(2)}' == criterion
+    return line.startswith(MARKER)
 
 
-def has_protection(text: str) -> bool:
-    """Is the marker used here, as opposed to mentioned or defined here?"""
-    return any(_marks(line) for line in text.splitlines())
+def has_protection(text: str, criterion: str | None = None) -> bool:
+    """Is an active marker used here, as opposed to mentioned or defined here?"""
+    return any(_marks(line, criterion) for line in text.splitlines())
 
 
-def protected_regions(path: Path) -> list[str] | None:
+def protected_regions(path: Path, criterion: str | None = None) -> list[str] | None:
     """The text of each marked definition, or None if that cannot be determined.
 
     None is not "nothing is protected". It is "this file says something is
@@ -146,7 +170,7 @@ def protected_regions(path: Path) -> list[str] | None:
         # permission this module exists to withhold.
         logging.warning('cannot read %s to find out what it protects', path)
         return None
-    if not has_protection(text):
+    if not has_protection(text, criterion):
         return []
 
     lister = _lister()
@@ -177,7 +201,7 @@ def protected_regions(path: Path) -> list[str] | None:
         except ValueError:
             return None
         chunk = text[span['l'] : span['r']]
-        if has_protection(chunk):
+        if has_protection(chunk, criterion):
             regions.append(chunk)
     if not regions:
         # Marked, but the marker is not inside any definition: either it was put
@@ -187,17 +211,17 @@ def protected_regions(path: Path) -> list[str] | None:
     return regions
 
 
-def disturbed(before: Path, after: Path) -> bool:
+def disturbed(before: Path, after: Path, criterion: str | None = None) -> bool:
     """Did the candidate change something it was not allowed to change?"""
-    original = protected_regions(before)
+    original = protected_regions(before, criterion)
     if original is None:
         return True
     if not original:
         return False
-    return protected_regions(after) != original
+    return protected_regions(after, criterion) != original
 
 
-def _uses_marker(path: Path) -> bool:
+def _uses_marker(path: Path, criterion: str | None = None) -> bool:
     try:
         text = path.read_text()
     except UnicodeDecodeError:
@@ -211,9 +235,15 @@ def _uses_marker(path: Path) -> bool:
         logging.warning('cannot read %s; treating it as protected because it '
                         'cannot be shown otherwise: %s', path, e)
         return True
-    if has_protection(text):
+    if has_protection(text, criterion):
         return True
-    if MARKER in text and not _defines_marker(text):
+    # `criterion=None` deliberately: the question here is whether any line
+    # starts with a marker at all, not whether one applies to this run. A file
+    # full of guards naming other tests is not a file where somebody wrote the
+    # marker and got nothing -- MEASURED, the criterion-aware test warned about
+    # 226 of 227 files at once, which is the log-drowning this warning was
+    # narrowed to avoid.
+    if MARKER in text and not _defines_marker(text) and not has_protection(text, None):
         # The word is there but no line begins with it, so nothing is protected
         # and the file looks exactly like one that never asked to be. Somebody
         # wrote the marker and got no guard, which is the failure this whole
@@ -228,7 +258,7 @@ def _uses_marker(path: Path) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def marked_files(root: str) -> tuple[str, ...]:
+def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
     """Which files under a test case carry a marker, found once and remembered.
 
     Remembering is sound even though the tree shrinks underneath: a file cannot
@@ -242,7 +272,7 @@ def marked_files(root: str) -> tuple[str, ...]:
     """
     path = Path(root)
     if path.is_file():
-        return (root,) if _uses_marker(path) else ()
+        return (root,) if _uses_marker(path, criterion) else ()
     if not path.is_dir():
         return ()
     # os.walk with followlinks, not rglob: rglob does not descend into
@@ -263,12 +293,12 @@ def marked_files(root: str) -> tuple[str, ...]:
         seen.add((stat.st_dev, stat.st_ino))
         for name in names:
             candidate = Path(directory) / name
-            if candidate.is_file() and _uses_marker(candidate):
+            if candidate.is_file() and _uses_marker(candidate, criterion):
                 found.append(str(candidate))
     return tuple(sorted(found))
 
 
-def violation(original_root: Path, candidate_root: Path) -> Path | None:
+def violation(original_root: Path, candidate_root: Path, criterion: str | None = None) -> Path | None:
     """The first marked file this candidate disturbed, or None if it left them alone.
 
     Takes roots rather than a list of changed files, so that it holds for a
@@ -284,13 +314,13 @@ def violation(original_root: Path, candidate_root: Path) -> Path | None:
             f'a candidate cannot be compared against itself: {original_root} is {candidate_root}'
         )
     directory = original_root.is_dir()
-    for marked in marked_files(str(original_root)):
+    for marked in marked_files(str(original_root), criterion):
         marked = Path(marked)
         candidate = (
             Path(candidate_root) / marked.relative_to(original_root)
             if directory
             else Path(candidate_root)
         )
-        if disturbed(marked, candidate):
+        if disturbed(marked, candidate, criterion):
             return marked
     return None

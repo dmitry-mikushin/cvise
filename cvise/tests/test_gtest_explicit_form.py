@@ -112,3 +112,40 @@ def test_a_test_whose_body_holds_a_raw_string_survives(rewriter):
     assert done == ['S.R']
     assert 'R"json({"a": 1})json"' in produced
     assert produced.rstrip().endswith('}')
+
+
+def test_the_marker_names_the_test_it_guards(rewriter):
+    """All the guards, one of them active.
+
+    Every test can carry a marker; which one is enforced follows from the test
+    the reduction is graded by, not from editing a thousand files when that
+    changes.
+    """
+    produced, _ = rewriter.rewrite(TWO_TESTS, None)
+    assert 'CVISE_NOREDUCE_TEST(Suite, First)' in produced
+    assert 'CVISE_NOREDUCE_TEST(Suite, Second)' in produced
+
+
+def test_only_the_criterion_is_enforced(rewriter, tmp_path):
+    """The point of the whole thing, asked of the guard rather than of the text."""
+    from cvise.utils import noreduce
+
+    produced, _ = rewriter.rewrite(TWO_TESTS, None)
+    first, second = 'Suite.First', 'Suite.Second'
+
+    assert noreduce.has_protection(produced, first)
+    assert noreduce.has_protection(produced, second)
+    assert not noreduce.has_protection(produced, 'Other.Test')
+    # Not knowing which test is being graded by protects everything, which is
+    # the safe direction to be wrong in.
+    assert noreduce.has_protection(produced, None)
+
+
+def test_the_header_gains_the_definition(rewriter, tmp_path):
+    """Emitting uses of a macro nobody defined is the trap this already sprang."""
+    header = tmp_path / 'noreduce.h'
+    header.write_text('#pragma once\n#define CVISE_NOREDUCE\n')
+    assert rewriter.ensure_marker_defined(header) is True
+    assert '#define CVISE_NOREDUCE_TEST(suite, name)' in header.read_text()
+    # Idempotent: a second run must not append it again.
+    assert rewriter.ensure_marker_defined(header) is False

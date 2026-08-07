@@ -132,7 +132,7 @@ def is_undecided(exitcode: int) -> bool:
     return exitcode == UNDECIDED_EXIT_CODE or exitcode < 0
 
 
-def protected_rejection(pairs):
+def protected_rejection(pairs, criterion=None):
     """Refuse a candidate that edited what it was told not to.
 
     Returns what run_test should return, or None to go on.
@@ -156,7 +156,7 @@ def protected_rejection(pairs):
     refuses the direct edit, not every route to the same end.
     """
     for original, candidate in pairs:
-        offender = noreduce.violation(original, candidate)
+        offender = noreduce.violation(original, candidate, criterion)
         if offender is not None:
             return (
                 1,
@@ -248,6 +248,7 @@ class TestEnvironment:
         pid_queue: queue.Queue | None = None,
         check_command: dict | None = None,
         precheck_timeout: float | None = None,
+        criterion: str | None = None,
         overlay_root: Path | None = None,
         overlay_build_dir: Path | None = None,
         overlay_files=None,
@@ -268,6 +269,10 @@ class TestEnvironment:
         self.new_size: int | None = None
         self.check_command = check_command
         self.precheck_timeout = precheck_timeout
+        # The ctest name this run is graded by, so a marker naming another test
+        # stays inert. None means every marker is active, which is the safe way
+        # to not know.
+        self.criterion = criterion
         self.overlay_root = overlay_root
         self.overlay_build_dir = overlay_build_dir
         self.overlay_files = overlay_files
@@ -354,7 +359,7 @@ class TestEnvironment:
                 pairs = [(Path(self.overlay_root), self.folder / tc) for tc in self.all_test_cases]
             else:
                 pairs = [(tc, self.folder / tc) for tc in self.all_test_cases]
-            verdict = protected_rejection(pairs)
+            verdict = protected_rejection(pairs, self.criterion)
             if verdict is not None:
                 return verdict
 
@@ -617,6 +622,7 @@ class TestManager:
         stopping_threshold,
         check_command=None,
         precheck_timeout=None,
+        criterion=None,
         overlay_root=None,
         overlay_build_dir=None,
         overlay_files=None,
@@ -639,6 +645,9 @@ class TestManager:
         self.also_interesting = also_interesting
         self.check_command = check_command or {}
         self.precheck_timeout = precheck_timeout
+        # The ctest name this run is graded by, handed to every candidate so a
+        # marker naming another test stays inert.
+        self.criterion = criterion
         self.overlay_root = overlay_root
         self.overlay_build_dir = overlay_build_dir
         self.overlay_files = overlay_files
@@ -884,6 +893,7 @@ class TestManager:
             transform=None,
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
+            criterion=self.criterion,
             overlay_root=self.overlay_root,
             overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
@@ -1596,6 +1606,7 @@ class TestManager:
             self.process_monitor.pid_queue,
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
+            criterion=self.criterion,
             overlay_root=self.overlay_root,
             overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
@@ -1641,6 +1652,7 @@ class TestManager:
             self.process_monitor.pid_queue,
             check_command=self.check_command,
             precheck_timeout=self.precheck_timeout,
+            criterion=self.criterion,
             overlay_root=self.overlay_root,
             overlay_build_dir=self.overlay_build_dir,
             overlay_files=self.overlay_files,
