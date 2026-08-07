@@ -11,7 +11,7 @@ original sources every time, finds every candidate interesting, and reports a
 triumphant reduction of nothing. So the test script records the checksum of what
 it compiled, and the test fails unless the builds really saw the variants.
 
-Skipped unless CVISE_CLI points at a built cvise-cli.py and FAKECHROOT_LIB at
+Skipped unless CVISE_CLI points at a built cvise-cli.py and CVISE_OVERLAY_LIB at
 the overlay library, because it needs both halves actually built.
 """
 
@@ -32,16 +32,58 @@ if not LIB:
     from cvise.utils import overlay as _overlay
     LIB = _overlay.library_path()
 MARKER = 'KEEP-THIS-STRING-42'
+TEST_NAME = 'says_the_marker'
 # Whichever C++ compiler this environment actually has: the reduction image
 # carries clang, a desktop usually has g++, and hardcoding either makes the
 # test report a broken overlay when the only thing missing is a compiler.
 CXX = os.environ.get('CXX') or shutil.which('g++') or shutil.which('clang++-19') or shutil.which('clang++')
 
-CMAKELISTS = (
-    'cmake_minimum_required(VERSION 3.20)\n'
-    'project(demo CXX)\n'
-    'add_executable(prog main.cpp core.cpp extra.cpp)\n'
-)
+def cmakelists(recorder: Path) -> str:
+    """The whole criterion, written where the reduction cannot reach it.
+
+    The property is asserted on the program's OUTPUT rather than its exit
+    status, because `prog` exits 0 whatever it prints -- and a criterion an
+    empty program satisfies is one the reduction will satisfy by emptying the
+    program.
+
+    The recorder is a BUILD step, not part of the test, and that is the point of
+    the whole file: it notes the checksum of the source the compiler is about to
+    be given. Taken from the test run it would say only what the binary did, and
+    an inert overlay produces a perfectly good binary -- of the pristine sources.
+    """
+    return (
+        'cmake_minimum_required(VERSION 3.20)\n'
+        'project(demo CXX)\n'
+        'add_executable(prog main.cpp core.cpp extra.cpp)\n'
+        'add_custom_target(witness\n'
+        f'    COMMAND {recorder}\n'
+        '    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})\n'
+        'add_dependencies(prog witness)\n'
+        'enable_testing()\n'
+        f'add_test(NAME {TEST_NAME} COMMAND prog)\n'
+        f'set_tests_properties({TEST_NAME} PROPERTIES\n'
+        f'                     PASS_REGULAR_EXPRESSION "{MARKER}")\n'
+    )
+
+
+def write_recorder(path: Path, witness: Path):
+    """A script rather than a shell one-liner in COMMAND.
+
+    MEASURED: `COMMAND sh -c "md5sum core.cpp >> witness"` reaches sh with the
+    redirection mangled -- ninja escapes the argument, sh tries to EXECUTE the
+    witness path, and the target fails with "No such file or directory" about a
+    file it was supposed to create. A script takes its arguments from a file
+    nobody re-quotes.
+    """
+    path.write_text(
+        '#!/bin/sh\n'
+        f'md5sum core.cpp >> {witness} 2>/dev/null\n'
+        '# Never the reason a build fails: whether a candidate that deleted this\n'
+        '# file is interesting is for the compiler and the test to say.\n'
+        'exit 0\n'
+    )
+    path.chmod(0o755)
+
 
 PROJECT = {
     'core.hpp': '#pragma once\nconst char* core_message();\nint core_padding();\n',
@@ -67,37 +109,23 @@ PROJECT = {
 }
 
 
-def write_project(root: Path):
+def write_project(root: Path, recorder: Path):
     root.mkdir(parents=True)
-    (root / 'CMakeLists.txt').write_text(CMAKELISTS)
+    (root / 'CMakeLists.txt').write_text(cmakelists(recorder))
     for name, text in PROJECT.items():
         (root / name).write_text(text)
 
 
-def write_test_script(path: Path, project: Path, witness: Path):
-    path.write_text(
-        '#!/bin/sh\n'
-        '# Build the project AT ITS REAL PATH. Nothing here knows about deltas:\n'
-        '# if the overlay is doing its job, these are the candidate sources.\n'
-        f'cd {project} || exit 125\n'
-        f'md5sum *.cpp *.hpp >> {witness} 2>/dev/null\n'
-        f'{CXX} -O0 -o prog main.cpp core.cpp extra.cpp 2>/dev/null || exit 1\n'
-        f'./prog 2>/dev/null | grep -q {MARKER}\n'
-    )
-    path.chmod(0o755)
-
-
 @pytest.mark.skipif(not CVISE or not Path(LIB).exists() or not CXX,
-                    reason='needs CVISE_CLI, FAKECHROOT_LIB and a C++ compiler')
+                    reason='needs CVISE_CLI, CVISE_OVERLAY_LIB and a C++ compiler')
 def test_reduction_through_the_overlay(tmp_path):
     work = tmp_path
     if True:
-        project = work / 'project'
-        write_project(project)
-        pristine = {name: (project / name).read_text() for name in PROJECT}
         witness = work / 'compiled.txt'
-        script = work / 'interesting.sh'
-        write_test_script(script, project, witness)
+        project = work / 'project'
+        write_recorder(work / 'record.sh', witness)
+        write_project(project, work / 'record.sh')
+        pristine = {name: (project / name).read_text() for name in PROJECT}
 
         env = {
             **os.environ,
@@ -107,10 +135,11 @@ def test_reduction_through_the_overlay(tmp_path):
         (work / 'tmp').mkdir()
 
         # The whole interface: the CMakeLists.txt that drives the build, and
-        # the question to ask about each variant. Everything else -- which files
-        # exist, what flags they need -- comes from the database CMake writes.
+        # the name of the ctest test that says whether a variant is still
+        # interesting. Everything else -- which files exist, what flags they
+        # need -- comes from the database CMake writes.
         cmd = [sys.executable, CVISE, '--n', '4', '--timeout', '60',
-               str(project / 'CMakeLists.txt'), str(script)]
+               str(project / 'CMakeLists.txt'), TEST_NAME]
         proc = subprocess.run(cmd, cwd=project, env=env, capture_output=True,
                               text=True, timeout=900)
         print(f'cvise exit {proc.returncode}')
@@ -118,7 +147,12 @@ def test_reduction_through_the_overlay(tmp_path):
         for line in tail:
             print(f'  {line}')
 
-        reduced = {name: (project / name).read_text() for name in PROJECT}
+        # A file the reduction removed reads as empty rather than raising: a
+        # header nothing needs any more is a result, not a broken run. MEASURED:
+        # extra.hpp goes entirely, and the test used to die of FileNotFoundError
+        # about the best thing that had happened.
+        reduced = {name: (project / name).read_text() if (project / name).is_file() else ''
+                   for name in PROJECT}
         shrank = sum(len(pristine[n]) for n in PROJECT) > sum(len(reduced[n]) for n in PROJECT)
         kept = MARKER in reduced['core.cpp']
 
