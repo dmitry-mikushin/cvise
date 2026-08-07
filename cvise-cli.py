@@ -31,6 +31,7 @@ from cvise.passes.abstract import AbstractPass  # noqa: E402
 from cvise.utils import memory  # noqa: E402
 from cvise.utils import project as project_utils  # noqa: E402
 from cvise.utils import statistics, testing  # noqa: E402
+from cvise.utils import pace  # noqa: E402
 from cvise.utils.error import CViseError, MissingPassGroupsError  # noqa: E402
 from cvise.utils.externalprograms import find_external_programs  # noqa: E402
 
@@ -328,6 +329,15 @@ def main():
         'to satisfy such a criterion is to delete the test',
     )
     parser.add_argument(
+        '--patience',
+        default=pace.PATIENCE,
+        type=int,
+        help='stop when nothing smaller has been found for this many times the interval '
+        'this run has been averaging between reductions. A reduction has no natural end, '
+        'and MEASURED on a real project one run spent 6.0 h of its 10.96 h after its last '
+        'accepted reduction. 0 waits for ever, which is what it used to do',
+    )
+    parser.add_argument(
         '--stopping-threshold',
         default=1.0,
         type=float,
@@ -604,6 +614,13 @@ def do_reduce(args):
             args.start_with_pass,
             args.skip_after_n_transforms,
             args.stopping_threshold,
+            # 0 means the old behaviour: wait for ever, and let the run end when
+            # every pass has separately burned 50 000 jobs.
+            patience=args.patience or 10 ** 9,
+            # Beside the verdict journal, because the two answer the same
+            # question at different resolutions and whatever reads one wants the
+            # other.
+            progress_path=project.build_dir.parent / 'cvise-progress.tsv',
             # Reject what the compiler alone can reject, before paying for a
             # build: the flags come from the project's own database.
             check_command={str(k): v for k, v in project.check_command.items()},
@@ -696,7 +713,7 @@ def do_reduce(args):
         # directories still have to go.
         if project is not None and staged is not None:
             published = project_utils.publish(project, staged)
-            logging.info('%d reduced files written back to %s', len(published), project.root)
+            logging.info('%d reduced files written back to %s', published, project.root)
         if script:
             os.unlink(script.name)
         shutil.rmtree(cmake_dir, ignore_errors=True)

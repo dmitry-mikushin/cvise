@@ -147,6 +147,13 @@ def test_reduction_through_the_overlay(tmp_path):
         for line in tail:
             print(f'  {line}')
 
+        # The exit code, which this used to ignore. A reduction that produced a
+        # good tree and then died writing the last log line looks like a
+        # success in every other assertion here, and did: `len()` of an int
+        # crashed the final write-back of EVERY project reduction, and the tree
+        # was already correct so nothing else noticed.
+        assert proc.returncode == 0, 'cvise did not exit cleanly'
+
         # A file the reduction removed reads as empty rather than raising: a
         # header nothing needs any more is a result, not a broken run. MEASURED:
         # extra.hpp goes entirely, and the test used to die of FileNotFoundError

@@ -26,7 +26,7 @@ import pebble
 from cvise.cvise import CVise
 from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
-from cvise.utils import cache, fileutil, mplogging, noreduce, overlay, precheck, sigmonitor
+from cvise.utils import cache, fileutil, mplogging, noreduce, overlay, pace, precheck, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
     InsaneTestCaseError,
@@ -623,6 +623,8 @@ class TestManager:
         check_command=None,
         precheck_timeout=None,
         criterion=None,
+        patience=pace.PATIENCE,
+        progress_path=None,
         overlay_root=None,
         overlay_build_dir=None,
         overlay_files=None,
@@ -660,6 +662,10 @@ class TestManager:
         self.start_with_pass = start_with_pass
         self.skip_after_n_transforms = skip_after_n_transforms
         self.stopping_threshold = stopping_threshold
+        # How long a run may go on finding nothing before it is called finished,
+        # and where the record of what it did find is written.
+        self.pace = pace.Pace(patience=patience)
+        self.series = pace.Series(Path(progress_path) if progress_path else None)
         self.exit_stack = contextlib.ExitStack()
 
         for test_case in test_cases:
@@ -1198,6 +1204,11 @@ class TestManager:
         ready_hint_types = self.get_fully_initialized_hint_types()
         while self.jobs or any(c.can_start_job_now(ready_hint_types) for c in self.pass_contexts):
             sigmonitor.maybe_raise_exc()
+            # Asked here rather than between passes, because an interleaved
+            # sweep does not come back between passes: the 6 h this exists to
+            # recover were spent inside one call to this function.
+            self.call_it_finished_if_it_is()
+            self.say_how_it_is_going()
 
             # schedule new jobs, as long as there are free workers
             while len(self.jobs) < self.parallel_tests and self.maybe_schedule_job():
@@ -1460,6 +1471,61 @@ class TestManager:
             notes.append(extra_note)
 
         logging.info('(' + ', '.join(notes) + ')')
+
+        # The same event, written where another program can read it and where
+        # this one can time it. The log line carries a relative clock and no
+        # machine-readable form, so nothing -- not even C-Vise itself -- could
+        # tell a run that was still working from one that had been silent for
+        # six hours.
+        self.series.add(total_bytes, lines, self.total_file_count,
+                        (extra_note or '').removeprefix('via '))
+        self.pace.record(lines)
+
+    #: How often the pace line is printed. Long, because it says nothing new in
+    #: between: the quantities in it change when a candidate succeeds, and those
+    #: are minutes apart.
+    PACE_INTERVAL = 300
+
+    def say_how_it_is_going(self) -> None:
+        """The ETA, on a clock rather than on a reduction.
+
+        Printed on its own schedule and not beside each accepted reduction,
+        because the number a person waits for is "how much longer" and the
+        moments they ask are not the moments something happens.
+        """
+        now = time.monotonic()
+        if now - getattr(self, '_said_at', 0.0) < self.PACE_INTERVAL:
+            return
+        self._said_at = now
+        if self.pace.usual is not None:
+            logging.info('%s', pace.report(self.pace, now))
+
+    def call_it_finished_if_it_is(self) -> bool:
+        """Has this run gone quiet for long enough to be over?
+
+        Ends it by marking every pass defunct rather than by raising, because
+        that is how a sweep already ends and a second exit path would be a
+        second set of edge cases to get wrong.
+
+        On by default, where a target size is not, and the difference is what it
+        costs to be wrong. Stopping early loses only the candidates in flight:
+        the reduced tree IS the result, it is on disk continuously, and starting
+        again on it goes on from there.
+        """
+        if not self.pass_contexts or not self.pace.spent():
+            return False
+        if all(ctx.defunct for ctx in self.pass_contexts):
+            return False
+        logging.info(
+            'nothing smaller found for %s, against one reduction every %s for this run. '
+            'Stopping: the tree on disk is the result, and starting again on it '
+            'continues from here',
+            pace.clock(self.pace.silence()),
+            pace.clock(self.pace.usual),
+        )
+        for ctx in self.pass_contexts:
+            ctx.defunct = True
+        return True
 
     def should_proceed_with_success_candidate(self):
         assert self.success_candidate
