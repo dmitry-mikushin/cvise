@@ -149,3 +149,58 @@ def test_the_header_gains_the_definition(rewriter, tmp_path):
     assert '#define CVISE_NOREDUCE_TEST(suite, name)' in header.read_text()
     # Idempotent: a second run must not append it again.
     assert rewriter.ensure_marker_defined(header) is False
+
+
+ALREADY_EXPLICIT = '''\
+#include <gtest/gtest.h>
+#include "noreduce.h"
+
+namespace {
+class Ingest_Test_Parses_Test : public ::testing::Test {
+public:
+    void TestBody() override;
+};
+
+const ::testing::TestInfo* const kIngest_Test_Parses_TestRegistered =
+    ::testing::RegisterTest("Ingest_Test", "Parses",
+                            nullptr, nullptr, __FILE__, __LINE__,
+                            []() -> ::testing::Test* {
+                                return new Ingest_Test_Parses_Test;
+                            });
+} // namespace
+
+CVISE_NOREDUCE
+void Ingest_Test_Parses_Test::TestBody() {
+    EXPECT_EQ(1, 1);
+}
+'''
+
+
+def test_a_bare_marker_is_given_the_name_of_its_test(rewriter):
+    """The hand-written guard is unconditional, so it survives a change of
+    criterion that should have made it inert."""
+    produced, done = rewriter.rewrite(ALREADY_EXPLICIT, None)
+    assert done == ['Ingest_Test.Parses']
+    assert 'CVISE_NOREDUCE_TEST(Ingest_Test, Parses)' in produced
+    assert '\nCVISE_NOREDUCE\n' not in produced
+
+
+def test_the_name_comes_from_the_registration_not_the_class(rewriter):
+    """Ingest_Test_Parses_Test splits two ways and only one is right.
+
+    By class name it reads as suite Ingest, test Test_Parses; the registration
+    says suite Ingest_Test, test Parses, and the registration is what gtest
+    itself goes by.
+    """
+    produced, _ = rewriter.rewrite(ALREADY_EXPLICIT, None)
+    assert 'CVISE_NOREDUCE_TEST(Ingest_Test, Parses)' in produced
+    assert 'CVISE_NOREDUCE_TEST(Ingest, Test_Parses)' not in produced
+
+
+def test_a_bare_marker_on_something_else_is_left_alone(rewriter):
+    """The unconditional spelling is a legitimate tool; only TestBody guards
+    with a registration to name them are converted."""
+    text = '#include "noreduce.h"\n\nCVISE_NOREDUCE\nvoid some_helper() {\n    return;\n}\n'
+    produced, done = rewriter.rewrite(text, None)
+    assert done == []
+    assert produced == text

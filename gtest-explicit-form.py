@@ -170,13 +170,53 @@ def with_marker_header(text: str) -> str:
     return text[:at] + '\n' + line + text[at:]
 
 
+def name_the_bare_markers(text: str, wanted: set[str] | None) -> tuple[str, list[str]]:
+    """Give a bare CVISE_NOREDUCE guarding a TestBody the name of its test.
+
+    A test already written out by hand carries the unconditional spelling, which
+    stays active whichever test the reduction is graded by -- so a corpus that is
+    otherwise uniform has one guard that is not. The name is taken from the
+    registration rather than from the class:
+
+        const ... kIngestTest_ParsesRepresentativeRequestJson_TestRegistered =
+            ::testing::RegisterTest("IngestTest", "ParsesRepresentativeRequestJson", ...
+
+    Splitting the class on underscores cannot tell IngestTest_Parses from
+    Ingest_TestParses, and the registration says which it is.
+    """
+    registered = {
+        m.group(1): (m.group(2), m.group(3))
+        for m in re.finditer(
+            r'k(\w+)Registered\s*=\s*::testing::RegisterTest\(\s*"(\w+)"\s*,\s*"(\w+)"', text
+        )
+    }
+    named = []
+
+    def rename(match: re.Match) -> str:
+        cls = match.group('cls')
+        pair = registered.get(cls)
+        if pair is None:
+            return match.group(0)
+        suite, name = pair
+        if wanted is not None and f'{suite}.{name}' not in wanted:
+            return match.group(0)
+        named.append(f'{suite}.{name}')
+        return f'{MARKER}({suite}, {name})' + match.group('rest')
+
+    text = re.sub(
+        rf'^CVISE_NOREDUCE[ \t]*$(?P<rest>\s*void\s+(?P<cls>\w+)::TestBody\s*\()',
+        rename, text, flags=re.M,
+    )
+    return text, named
+
+
 def rewrite(text: str, wanted: set[str] | None) -> tuple[str, list[str]]:
     """Rewrite the selected tests, returning the new text and what was done.
 
     Backwards through the file, because each replacement changes the offsets of
     everything after it and nothing before it.
     """
-    done = []
+    text, done = name_the_bare_markers(text, wanted)
     for start, end, suite, name in reversed(tests_in(text)):
         if wanted is not None and f'{suite}.{name}' not in wanted:
             continue
@@ -193,7 +233,7 @@ def rewrite(text: str, wanted: set[str] | None) -> tuple[str, list[str]]:
         done.append(f'{suite}.{name}')
     if done:
         text = with_marker_header(text)
-    return text, list(reversed(done))
+    return text, sorted(set(done))
 
 
 def ensure_marker_defined(header: Path) -> bool:
