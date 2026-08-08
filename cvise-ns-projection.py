@@ -187,8 +187,14 @@ def take_the_machine(name: str) -> int:
             f"    docker stop {' '.join(cid for cid, _ in orphans)}")
 
     os.ftruncate(handle, 0)
+    # Says what it is worth. This line is only ever READ when flock has already
+    # refused, so in use it is current by construction -- but it outlives the
+    # run that wrote it, and somebody who cats the file between runs sees a
+    # confident sentence about a process that died yesterday.
     os.write(handle, f'pid {os.getpid()}  run {name}  started '
-                     f'{time.strftime("%Y-%m-%d %H:%M:%S")}\n'.encode())
+                     f'{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                     'this line is stale unless flock is held; the lock is the '
+                     'fact, this is only a note from whoever took it\n'.encode())
     return handle
 
 
@@ -342,7 +348,17 @@ def main() -> int:
     )
     parser.add_argument('--dry-run', action='store_true',
                         help='print the command that would run, and stop')
-    args = parser.parse_args()
+    parser.epilog = ('Anything after a bare -- is handed to cvise unchanged, '
+                     'e.g. `cvise-ns-projection.py run17 -- --patience 0`.')
+    # Split before argparse sees it rather than with argparse.REMAINDER, which
+    # takes everything from the first token after the positional -- so
+    # `run17 --dry-run -- --patience 0` handed `--dry-run` to cvise, which
+    # rightly refused it.
+    mine, passthrough = sys.argv[1:], []
+    if '--' in mine:
+        at = mine.index('--')
+        mine, passthrough = mine[:at], mine[at + 1:]
+    args = parser.parse_args(mine)
 
     if not re.fullmatch(r'[A-Za-z0-9._-]+', args.name):
         # It becomes a directory that a root container later removes. Anything
@@ -435,6 +451,9 @@ def main() -> int:
     ]
     if args.keep:
         command.append('--save-temps')
+    # Before the positionals, and last among the options, so that what was asked
+    # for on the command line wins over what this script chose.
+    command += passthrough
     command += [f'{SRC}/CMakeLists.txt', TEST]
 
     if args.dry_run:

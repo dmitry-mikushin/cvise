@@ -238,7 +238,12 @@ fn nothing_to_watch() -> i32 {
 }
 
 fn main() -> io::Result<()> {
-    let once = std::env::args().any(|a| a == "--once");
+    // Plain output when there is no terminal to take over, and not only when
+    // asked. A TUI needs a tty to initialise and dies without one -- as
+    // `failed to initialize terminal: Os { code: 6 }` -- which is what an agent,
+    // a pipe and a log file all get. The right answer to "no terminal" is the
+    // text screen, not a panic.
+    let once = std::env::args().any(|a| a == "--once") || !io::IsTerminal::is_terminal(&io::stdout());
     let interval = Duration::from_secs(
         std::env::args()
             .skip_while(|a| a != "--interval")

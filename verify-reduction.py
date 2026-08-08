@@ -46,6 +46,27 @@ AUTHOR = ('-c', 'user.name=C-Vise', '-c', 'user.email=cvise@localhost')
 SOURCE_SUFFIXES = ('.cpp', '.cc', '.cxx', '.c', '.hpp', '.hh', '.hxx', '.h', '.inc')
 
 
+def ceiling_mb() -> int:
+    """A bound for the verification build, which is a full build of the project.
+
+    This ran unbounded until 2026-08-07, which made it the one thing on this
+    machine that could take it down while every rule said otherwise. The
+    reduction is paused for the duration, so its own cgroup is holding nothing
+    and all of the machine is nominally free -- and there is no swap and no
+    oomd here, so an overshoot is not a slow machine, it is a dead one.
+
+    Three quarters of what is available, matching the reduction's own ceiling,
+    with --memory-swap set equal so the ceiling is a ceiling: left larger,
+    docker permits that much swap on top, and MEASURED once at --memory 179G
+    --memory-swap 358G it exhausted 28.6 GB of swap and put 3539 tasks in
+    uninterruptible sleep.
+    """
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemAvailable:'):
+            return max(4096, int(line.split()[1]) // 1024 * 3 // 4)
+    return 4096
+
+
 def container_of(state: Path) -> str | None:
     """The reduction working on this state directory, by what it has mounted.
 
@@ -222,6 +243,9 @@ def verify(state: Path, test: str, repo: Path, keep: bool) -> int:
         # before the deletions being checked.
         proc = run([
             'docker', 'run', '--rm',
+            # Bounded like every other build on this machine. See ceiling_mb().
+            '--memory', f'{ceiling_mb()}m',
+            '--memory-swap', f'{ceiling_mb()}m',
             '-v', f'{repo}:{SRC}',
             '-v', f'{tree}:{SRC}/{SUBMODULE}',
             '-v', f'{work}:{work}',
