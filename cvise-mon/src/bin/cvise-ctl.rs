@@ -119,10 +119,13 @@ fn stop(verify: bool) -> i32 {
                   write-back and statistics were lost");
     }
 
-    // The lock is held by the driver process on the host, not by the container,
-    // and the driver is waiting on exactly this container. It exits when the
-    // container does, and the lock goes with it.
-    println!("the machine is free again");
+    match wait_for_the_machine() {
+        true => println!("the machine is free again"),
+        false => println!(
+            "the container is stopped, but the machine is not free yet: something \
+             still holds {LOCK}. Nothing else will start until it lets go"
+        ),
+    }
 
     if !verify {
         println!(
@@ -157,6 +160,40 @@ fn stop(verify: bool) -> i32 {
             eprintln!("the run is stopped, but the verifier would not run: {e}");
             1
         }
+    }
+}
+
+/// Where the one-reduction-at-a-time lock lives. cvise-ns-projection.py.
+const LOCK: &str = "/dev/shm/cvise.lock";
+
+/// Wait until the next run could actually start, and say whether it can.
+///
+/// Not the same question as "did the container stop", which is what this used
+/// to answer. MEASURED after a stop: `docker stop` returned in 17 s, and the
+/// `docker run --rm` client the driver is waiting on lived for minutes after
+/// that, cleaning up. The driver holds the lock until that client exits, so
+/// "the machine is free again" was printed while the next run would still have
+/// been refused.
+///
+/// Asked of the lock itself rather than of the process list, because the lock
+/// is what the next run will actually contend for. flock(1) takes it and drops
+/// it in the same breath; taking it here would be a race against a run that is
+/// entitled to start the moment we let go.
+fn wait_for_the_machine() -> bool {
+    let deadline = Instant::now() + Duration::from_secs(GRACE);
+    loop {
+        let free = Command::new("flock")
+            .args(["-n", LOCK, "true"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true);
+        if free {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
