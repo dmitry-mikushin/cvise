@@ -466,9 +466,27 @@ def do_reduce(args):
         # several files at once, which is the only way the changes that matter in
         # C++ -- a declaration and its uses -- can ever be accepted, since neither
         # half of such a change compiles on its own.
-        # Where the user was standing. Anything saved for them goes here, not into
-        # the staged copy C-Vise is about to work in and then delete.
-        launch_dir = Path.cwd()
+        # Where anything saved for the user goes: crash dumps and the copies
+        # kept by --also-interesting.
+        #
+        # Beside the run's other records rather than in the directory the user
+        # was standing in, because in project mode that directory IS the tree
+        # being reduced, and C-Vise must not write its diagnostics into the
+        # thing it is measuring. MEASURED, what that costs: nine `cvise_bug_N`
+        # directories from earlier runs sat in the project root, each holding a
+        # copy of the test file, and the guard that protects marked definitions
+        # walked into one of them and refused to start the run --
+        #
+        #   rejected: /src/cvise_bug_1/.../ingest_test.cpp has a definition
+        #             marked not to be reduced
+        #
+        # -- which is C-Vise being stopped by its own crash dump. They also
+        # outlive the run, owned by root, in a tree under version control.
+        #
+        # The state directory is where cvise-verdicts.log and
+        # cvise-progress.tsv already are, so it is where somebody looking for
+        # what a run left behind is already looking.
+        launch_dir = project.build_dir.parent
         staged = project_utils.stage(project, staging_dir / project.root.name)
 
         # Built once, here, from the sources as they are. Every job then gets
