@@ -12,6 +12,7 @@ from cvise.passes.abstract import BinaryState, SubsegmentState
 from cvise.passes.clang import SOURCE_SUFFIXES
 from cvise.passes.hint_based import HintBasedPass, HintState
 from cvise.utils.hint import Hint, HintBundle
+from cvise.utils.hintcache import HintCache, fingerprint, key_for
 from cvise.utils.process import ProcessEventNotifier
 
 CLANG_STD_CHOICES = ('c++98', 'c++11', 'c++14', 'c++17', 'c++20', 'c++2b')
@@ -66,6 +67,10 @@ class ClangHintsPass(HintBasedPass):
         self._user_clang_delta_std = user_clang_delta_std
         self._strategy = strategy
         self._iterate_stds = False if iterate_stds is None else iterate_stds
+        # What clang_delta already answered, so that an initialisation cut
+        # short does not have to start from the first file again.
+        self._cache = HintCache()
+        self._identity: bytes | None = None
 
     def check_prerequisites(self):
         return self.check_external_program('clang_delta')
@@ -208,6 +213,25 @@ class ClangHintsPass(HintBasedPass):
             logging.debug('clang_delta skipped a file: %s', f)
         return HintBundle(vocabulary=vocabulary, hints=hints)
 
+    def _tool_identity(self) -> bytes:
+        """What, besides the file, decides clang_delta's answer.
+
+        The tool itself and the compilation database, both by size and mtime
+        rather than by content: the database is megabytes and is read on every
+        file, and clang_delta is a 32 MB binary. Computed once per pass.
+
+        The database is taken whole rather than per-file. A finer key would
+        have to parse it for every file, which is the cost this is avoiding;
+        and it changes only when the project is reconfigured, so the coarse
+        key throws the cache away exactly when it deserves to be thrown away.
+        """
+        if self._identity is None:
+            parts = [fingerprint(Path(self.external_programs['clang_delta'] or ''))]
+            if self._compilation_database:
+                parts.append(fingerprint(Path(self._compilation_database)))
+            self._identity = b'|'.join(parts)
+        return self._identity
+
     def _generate_hints_for_file(
         self, test_case: Path, std: str | None, timeout: int, process_event_notifier: ProcessEventNotifier
     ) -> HintBundle:
@@ -226,6 +250,18 @@ class ClangHintsPass(HintBasedPass):
         cmd = [prog] + options + [str(test_case)]
         logging.debug(shlex.join(str(s) for s in cmd))
 
+        # Everything that decides the answer, and nothing that does not. The
+        # file's CONTENT and not its path: a reduction produces identical files
+        # under different names constantly, and they have identical hints.
+        try:
+            content = test_case.read_bytes()
+        except OSError as e:
+            raise ClangDeltaError(f'cannot read {test_case}: {e}') from e
+        key = key_for(content, self.arg.encode(), (std or '').encode(), self._tool_identity())
+        cached = self._cache.get(key)
+        if cached is not None:
+            return parse_clang_delta_hints(cached)
+
         try:
             stdout, stderr, returncode = process_event_notifier.run_process(cmd, timeout=timeout)
         except subprocess.TimeoutExpired as e:
@@ -239,6 +275,11 @@ class ClangHintsPass(HintBasedPass):
             raise ClangDeltaError(
                 f'clang_delta ({" ".join(options)}) failed with exit code {returncode}{delim}{stderr}'
             )
+        # Only a success is remembered. A failure may be the file's fault and
+        # may be the tool's -- MEASURED, callexpr-to-value segfaults on 6 of 24
+        # translation units of this project -- and caching a crash would make a
+        # bug that is being fixed look permanent.
+        self._cache.put(key, stdout)
         return parse_clang_delta_hints(stdout)
 
 
