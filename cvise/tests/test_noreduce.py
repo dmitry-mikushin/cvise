@@ -373,3 +373,79 @@ class TestWhatCanCarryAMarker:
         path = tmp_path / 'case'
         path.write_text(GUARDED)
         assert noreduce.marked_files(str(path)) == (str(path),)
+
+
+NAMED = """\
+#include <gtest/gtest.h>
+#include "noreduce.h"
+
+namespace {
+class IngestTest_Parses_Test : public ::testing::Test {
+public:
+    void TestBody() override;
+};
+class IngestTest_Other_Test : public ::testing::Test {
+public:
+    void TestBody() override;
+};
+}
+
+CVISE_NOREDUCE_TEST(IngestTest, Parses)
+void IngestTest_Parses_Test::TestBody() {
+    EXPECT_EQ(1 + 1, 2);
+}
+
+CVISE_NOREDUCE_TEST(IngestTest, Other)
+void IngestTest_Other_Test::TestBody() {
+    EXPECT_EQ(2 + 2, 4);
+}
+"""
+
+
+class TestTheMarkerInFrontOfTheDefinition:
+    """The shape every test in the corpus actually has.
+
+    CVISE_NOREDUCE_TEST expands to [[clang::annotate(...)]], which is an
+    ATTRIBUTE and therefore sits in front of what it applies to. The definition
+    treesitter_delta reports does not include what precedes it.
+
+    MEASURED on the real ingest_test.cpp: all 13 spans began at or after `void`
+    and not one contained the marker, so no region was found,
+    protected_regions returned None -- "something is protected and I cannot
+    work out what" -- and every candidate was refused. The reduction rejected
+    its own unmodified tree and would not start.
+
+    The tests above did not catch it because they use the BARE CVISE_NOREDUCE,
+    which is a lone identifier and gets absorbed into the definition node; the
+    named form has parentheses and does not.
+    """
+
+    def test_an_untouched_copy_is_not_a_violation(self, tmp_path):
+        a = write(tmp_path, 'a/t.cpp', NAMED)
+        b = write(tmp_path, 'b/t.cpp', NAMED)
+        assert noreduce.protected_regions(a, 'IngestTest.Parses') is not None
+        assert not noreduce.disturbed(a, b, 'IngestTest.Parses')
+
+    def test_the_region_found_contains_the_marker(self, tmp_path):
+        a = write(tmp_path, 'a/t.cpp', NAMED)
+        regions = noreduce.protected_regions(a, 'IngestTest.Parses')
+        assert len(regions) == 1, 'the criterion should select exactly its own test'
+        assert regions[0].startswith('CVISE_NOREDUCE_TEST(IngestTest, Parses)')
+
+    def test_gutting_the_guarded_body_is_still_caught(self, tmp_path):
+        a = write(tmp_path, 'a/t.cpp', NAMED)
+        b = write(tmp_path, 'b/t.cpp', NAMED.replace('EXPECT_EQ(1 + 1, 2);', ''))
+        assert noreduce.disturbed(a, b, 'IngestTest.Parses')
+
+    def test_deleting_the_marker_is_caught_too(self, tmp_path):
+        """Which is why the marker line belongs IN the region, not just near it."""
+        a = write(tmp_path, 'a/t.cpp', NAMED)
+        b = write(tmp_path, 'b/t.cpp',
+                  NAMED.replace('CVISE_NOREDUCE_TEST(IngestTest, Parses)\n', ''))
+        assert noreduce.disturbed(a, b, 'IngestTest.Parses')
+
+    def test_another_guarded_test_may_still_be_reduced(self, tmp_path):
+        """Only the test being graded by is enforced; the rest stay reducible."""
+        a = write(tmp_path, 'a/t.cpp', NAMED)
+        b = write(tmp_path, 'b/t.cpp', NAMED.replace('EXPECT_EQ(2 + 2, 4);', ''))
+        assert not noreduce.disturbed(a, b, 'IngestTest.Parses')

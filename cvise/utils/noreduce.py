@@ -151,6 +151,37 @@ def has_protection(text: str, criterion: str | None = None) -> bool:
     return any(_marks(line, criterion) for line in text.splitlines())
 
 
+def _back_over_the_marker(text: str, start: int) -> int:
+    """Extend a definition's span backwards over the marker that introduces it.
+
+    The marker is a C++ ATTRIBUTE and it sits in front of the thing it applies
+    to:
+
+        CVISE_NOREDUCE_TEST(IngestTest, ParsesRepresentativeRequestJson)
+        void IngestTest_ParsesRepresentativeRequestJson_Test::TestBody() {
+
+    treesitter_delta reports the definition, and the definition does not
+    include what precedes it -- MEASURED on that file, all 13 spans began at or
+    after `void` and not one of them contained the marker. So every span failed
+    the has_protection test, no region was found, and protected_regions
+    returned None: "this file says something is protected and I cannot work out
+    what". That is refused, correctly and unhelpfully, for EVERY candidate --
+    which is how a reduction came to reject its own unmodified tree.
+
+    Including the marker line in the region is also the right comparison and
+    not merely a way to find it: a candidate that deletes the marker but leaves
+    the body alone has changed the region, and that is exactly the edit this
+    module exists to catch.
+    """
+    line_start = text.rfind('\n', 0, start) + 1
+    while line_start > 0:
+        previous_start = text.rfind('\n', 0, line_start - 1) + 1
+        if not _marks(text[previous_start:line_start], None):
+            break
+        line_start = previous_start
+    return line_start
+
+
 def protected_regions(path: Path, criterion: str | None = None) -> list[str] | None:
     """The text of each marked definition, or None if that cannot be determined.
 
@@ -203,7 +234,7 @@ def protected_regions(path: Path, criterion: str | None = None) -> list[str] | N
             span = json.loads(line)
         except ValueError:
             return None
-        chunk = text[span['l'] : span['r']]
+        chunk = text[_back_over_the_marker(text, span['l']) : span['r']]
         if has_protection(chunk, criterion):
             regions.append(chunk)
     if not regions:
