@@ -67,6 +67,9 @@ import subprocess
 from pathlib import Path
 
 from cvise.utils.externalprograms import find_external_programs
+# What the marker can attach to: the same set the semantic passes work on,
+# from a module light enough to import once per candidate.
+from cvise.utils.sources import SOURCE_SUFFIXES
 
 
 MARKER = 'CVISE_NOREDUCE'
@@ -259,7 +262,22 @@ def _uses_marker(path: Path, criterion: str | None = None) -> bool:
 
 @functools.lru_cache(maxsize=None)
 def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
-    """Which files under a test case carry a marker, found once and remembered.
+    """Which SOURCE files under a test case carry a marker, found once and remembered.
+
+    Source files and nothing else. The marker is a C++ construct that attaches
+    to a definition, so a file that cannot hold a definition cannot hold a
+    marker -- it can only hold the eight characters. MEASURED: a run refused to
+    start because
+
+        rejected: /src/.git/modules/third_party/ns-projection/COMMIT_EDITMSG
+                  has a definition marked not to be reduced
+
+    and it was right about the text: that file is the commit message of the
+    change that INTRODUCED the guard, and it says CVISE_NOREDUCE twice.
+    Skipping `.git` would have fixed that one file; a README, a design note or
+    this docstring would have stopped the next run the same way. Asking what
+    the marker can attach to closes the class, and it also stops this walk
+    reading every object in a git directory once per run.
 
     Remembering is sound even though the tree shrinks underneath: a file cannot
     become marked, and one that stops being marked has had its marker removed,
@@ -272,6 +290,8 @@ def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
     """
     path = Path(root)
     if path.is_file():
+        # Named explicitly by the caller, so its suffix is not this function's
+        # business: a single-file test case is whatever the user handed over.
         return (root,) if _uses_marker(path, criterion) else ()
     if not path.is_dir():
         return ()
@@ -293,6 +313,8 @@ def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
         seen.add((stat.st_dev, stat.st_ino))
         for name in names:
             candidate = Path(directory) / name
+            if candidate.suffix not in SOURCE_SUFFIXES:
+                continue
             if candidate.is_file() and _uses_marker(candidate, criterion):
                 found.append(str(candidate))
     return tuple(sorted(found))

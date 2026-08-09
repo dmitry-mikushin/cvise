@@ -155,6 +155,7 @@ set(SOURCE_FILES
   "utils/overlay_contract.py"
   "utils/pace.py"
   "utils/precheck.py"
+  "utils/sources.py"
   "utils/project.py"
   "utils/projectcheck.py"
   "utils/process.py"

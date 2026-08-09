@@ -18,10 +18,9 @@ from cvise.passes.abstract import AbstractPass, PassResult
 # semantic pass. What a header does need is the flags of a unit that includes
 # it, and the database C-Vise writes records exactly that -- on the same example
 # clang_delta finds two removable functions in the header and none in the source.
-SOURCE_SUFFIXES = (
-    '.c', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.C', '.m', '.mm', '.cl', '.cu', '.hip',
-    '.h', '.hh', '.hp', '.hpp', '.hxx', '.h++', '.H', '.inc', '.ipp', '.tcc', '.tpp',
-)
+# Defined in cvise/utils/sources.py so that this pass and the reduction guard
+# cannot disagree about which files they are talking about.
+from cvise.utils.sources import SOURCE_SUFFIXES  # noqa: F401
 
 
 @dataclass(frozen=True)

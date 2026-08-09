@@ -322,3 +322,54 @@ class TestTheGuardCannotBeSwitchedOffQuietly:
             assert noreduce.protected_regions(original) is None
         finally:
             os.chmod(original, 0o644)
+
+
+class TestWhatCanCarryAMarker:
+    """Only a file that can hold a definition, which is what the marker attaches to.
+
+    MEASURED: a run refused to start with
+
+        rejected: /src/.git/modules/third_party/ns-projection/COMMIT_EDITMSG
+                  has a definition marked not to be reduced
+
+    and it was right about the text. That file is the commit message of the
+    change that introduced the guard, and it says CVISE_NOREDUCE twice.
+    """
+
+    def a_tree(self, tmp_path, name, body):
+        root = tmp_path / 'tree'
+        (root / Path(name).parent).mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+        return root
+
+    def test_a_commit_message_about_the_guard_is_not_a_guard(self, tmp_path):
+        root = self.a_tree(
+            tmp_path, '.git/COMMIT_EDITMSG',
+            'test: every test can carry a reduction guard, one is enforced\n\n'
+            'CVISE_NOREDUCE says so, and it needs a definition written out to\n'
+            'attach to. CVISE_NOREDUCE_TEST(IngestTest, Parses) is the named form.\n')
+        assert noreduce.marked_files(str(root)) == ()
+
+    @pytest.mark.parametrize('name', [
+        'README.md', 'notes.txt', 'design.rst', '.git/COMMIT_EDITMSG', 'CMakeLists.txt',
+    ])
+    def test_prose_that_mentions_the_marker_is_only_prose(self, tmp_path, name):
+        """Skipping .git alone would have fixed one file and left the class."""
+        root = self.a_tree(tmp_path, name, 'CVISE_NOREDUCE_TEST(Suite, Name)\n')
+        assert noreduce.marked_files(str(root)) == ()
+
+    @pytest.mark.parametrize('suffix', ['.cpp', '.cc', '.h', '.hpp', '.inc', '.cu'])
+    def test_every_source_suffix_is_still_looked_at(self, tmp_path, suffix):
+        """The other direction, which is the one that would be silent.
+
+        A guard that stops looking at a file protects nothing there, and says
+        so nowhere.
+        """
+        root = self.a_tree(tmp_path, f'guarded{suffix}', GUARDED)
+        assert [Path(p).name for p in noreduce.marked_files(str(root))] == [f'guarded{suffix}']
+
+    def test_a_file_named_outright_is_read_whatever_it_is_called(self, tmp_path):
+        """A single-file test case is whatever the user handed over."""
+        path = tmp_path / 'case'
+        path.write_text(GUARDED)
+        assert noreduce.marked_files(str(path)) == (str(path),)
