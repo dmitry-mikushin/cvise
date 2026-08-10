@@ -158,6 +158,20 @@ class TestClangDelta(unittest.TestCase):
             end_index=1,
         )
 
+    def test_callexpr_to_value_nested1(self):
+        # Nested calls that share a beginning: generating hints for all of them
+        # used to apply overlapping rewrites and crash with SIGSEGV.
+        self.check_clang_delta(
+            'callexpr-to-value/nested1.cc',
+            '--transformation=callexpr-to-value --counter=1',
+        )
+        self.check_clang_delta_hints(
+            'callexpr-to-value/nested1.cc',
+            '--transformation=callexpr-to-value',
+            begin_index=0,
+            end_index=1,
+        )
+
     def test_callexpr_to_value_test1(self):
         self.check_clang_delta(
             'callexpr-to-value/test1.c',

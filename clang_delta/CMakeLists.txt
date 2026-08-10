@@ -48,6 +48,8 @@ set(SOURCE_FILES
   "/tests/callexpr-to-value/macro1.output"
   "/tests/callexpr-to-value/macro2.c"
   "/tests/callexpr-to-value/macro2.output"
+  "/tests/callexpr-to-value/nested1.cc"
+  "/tests/callexpr-to-value/nested1.output"
   "/tests/callexpr-to-value/test1.c"
   "/tests/callexpr-to-value/test1.output"
   "/tests/callexpr-to-value/test2.c"

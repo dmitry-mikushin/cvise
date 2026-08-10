@@ -1,0 +1,14 @@
+struct S { int g(); };
+S f(int);
+int a();
+void h() { 0; }
+
+// Regression test: the two calls in `f(...).g()` begin at the same offset, so
+// rewriting the outer one invalidates the source range of the inner one.
+// Rewriter::getRangeSize() then maps the inner range's end below its own
+// beginning and returns a negative size, which used to be passed to
+// Rewriter::ReplaceText() as an `unsigned` length. The argument list is long
+// enough that the resulting offsets fall outside the buffer, so RewriteBuffer
+// walked off its rope and clang_delta died with SIGSEGV. The comment is kept
+// below the code on purpose: text in front of `f` would push its offset up and
+// stop the range from underflowing.

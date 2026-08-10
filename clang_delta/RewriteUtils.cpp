@@ -24,6 +24,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Casting.h"
@@ -44,6 +45,8 @@ RewriteUtils *RewriteUtils::GetInstance(Rewriter *RW, HintsBuilder *H)
     RewriteUtils::Instance->TheRewriter = RW;
     RewriteUtils::Instance->Hints = H;
     RewriteUtils::Instance->SrcManager = &(RW->getSourceMgr());
+    // The claimed ranges belong to the buffers of the previous Rewriter.
+    RewriteUtils::Instance->RewrittenRanges.clear();
     return RewriteUtils::Instance;
   }
 
@@ -718,13 +721,41 @@ SourceLocation RewriteUtils::getExpansionEndLoc(SourceLocation EndLoc)
     return Entry->getExpansion().getExpansionLocEnd();
 }
 
+bool RewriteUtils::claimRangeForRewrite(SourceRange Range)
+{
+  std::pair<FileID, unsigned> Begin =
+    SrcManager->getDecomposedLoc(Range.getBegin());
+  std::pair<FileID, unsigned> End =
+    SrcManager->getDecomposedLoc(Range.getEnd());
+  if (Begin.first != End.first)
+    return false;
+
+  // getSourceRange() ends at the beginning of the last token, and these are
+  // original offsets, so they stay meaningful no matter what was rewritten.
+  unsigned Lo = Begin.second;
+  unsigned Hi = End.second + Lexer::MeasureTokenLength(Range.getEnd(),
+                                                       *SrcManager,
+                                                       TheRewriter->getLangOpts());
+  if (Hi < Lo)
+    return false;
+
+  std::vector<std::pair<unsigned, unsigned>> &Claimed =
+    RewrittenRanges[Begin.first];
+  for (const std::pair<unsigned, unsigned> &R : Claimed) {
+    if (Lo < R.second && R.first < Hi)
+      return false;
+  }
+  Claimed.push_back(std::make_pair(Lo, Hi));
+  return true;
+}
+
 bool RewriteUtils::replaceExpr(const Expr *E,
                                const std::string &ES)
 {
   SourceRange ExprRange = E->getSourceRange();
 
   int RangeSize = TheRewriter->getRangeSize(ExprRange);
-  if (RangeSize == -1) {
+  if (RangeSize < 0) {
     SourceLocation StartLoc = ExprRange.getBegin();
     if (StartLoc.isMacroID()) {
       StartLoc = SrcManager->getExpansionLoc(StartLoc);
@@ -738,12 +769,26 @@ bool RewriteUtils::replaceExpr(const Expr *E,
       // void foo(void) { int x = macro }
       EndLoc = getExpansionEndLoc(EndLoc);
     }
-    Hints->AddPatch(SourceRange(StartLoc, EndLoc), ES);
-    return !(TheRewriter->ReplaceText(SourceRange(StartLoc, EndLoc), ES));
+    ExprRange = SourceRange(StartLoc, EndLoc);
+    RangeSize = TheRewriter->getRangeSize(ExprRange);
   }
 
+  // The hint is measured against a pristine copy of the buffer, so it stays
+  // correct even for the expressions that are refused below.
   Hints->AddPatch(ExprRange, ES);
-  return !(TheRewriter->ReplaceText(ExprRange, ES));
+
+  // A transformation may visit nested expressions, e.g. both calls in
+  // `f(a()).g()`. Those are independent reduction candidates and each deserves
+  // its own hint, but they cannot all be applied to one Rewriter: rewriting the
+  // outer expression deletes the text of the inner ones, and rewriting an inner
+  // one afterwards makes RewriteBuffer address memory outside its buffer and
+  // crash. Note that this cannot be caught by checking the size Rewriter
+  // reports for the stale range: it derives that size from two offsets that
+  // both underflow, so their difference still looks plausible.
+  if (RangeSize < 0 || !claimRangeForRewrite(ExprRange))
+    return false;
+
+  return !(TheRewriter->ReplaceText(ExprRange.getBegin(), RangeSize, ES));
 }
 
 bool RewriteUtils::replaceExprNotInclude(const Expr *E,

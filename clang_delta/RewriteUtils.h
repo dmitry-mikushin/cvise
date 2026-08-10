@@ -11,7 +11,10 @@
 #ifndef REWRITE_UTILS_H
 #define REWRITE_UTILS_H
 
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 #include "clang/Basic/SourceLocation.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/DeclTemplate.h"
@@ -297,6 +300,20 @@ private:
   HintsBuilder *Hints;
 
   clang::SourceManager *SrcManager;
+
+  // Half-open intervals, in original file offsets, that have already been
+  // replaced in TheRewriter. Rewriter does not support overlapping rewrites:
+  // once a range has been replaced its characters are gone from the buffer,
+  // and rewriting a range inside it makes RewriteBuffer map offsets outside
+  // the buffer it owns. That is only caught by an assert() inside LLVM, which
+  // is compiled out in release builds, so the caller has to keep the rewrites
+  // disjoint itself.
+  std::map<clang::FileID, std::vector<std::pair<unsigned, unsigned>>>
+      RewrittenRanges;
+
+  // Records [Begin, End) as rewritten and returns whether it was still free.
+  // A range that overlaps an earlier one is rejected and not recorded.
+  bool claimRangeForRewrite(clang::SourceRange Range);
 
   RewriteUtils(void)
   : TheRewriter(NULL),
