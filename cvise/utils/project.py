@@ -554,6 +554,35 @@ def _test_command_from_generated(build_dir: Path, test: str) -> Path | None:
     return None
 
 
+def build_for_tests(project: 'Project', tests) -> tuple[float, str | None]:
+    """The target every named test needs, if there is one.
+
+    With several tests the honest answer is often "no single target", and then
+    the default is built -- everything the project builds, which may be far
+    more than the criterion needs, but which is certainly enough. Guessing one
+    of the targets instead would leave the others unbuilt, and a test whose
+    binary was never built does not fail: it does not exist, and the criterion
+    would then be satisfied by the tests that happen to share the built one.
+    """
+    if isinstance(tests, str):
+        tests = [tests]
+    seconds = 0.0
+    targets = set()
+    for test in tests:
+        took, target = build_for_test(project, test)
+        seconds += took
+        targets.add(target)
+    if len(targets) == 1:
+        return seconds, targets.pop()
+    logging.info(
+        'the %d tests come from %d different targets, so the default target is built: '
+        'building one of them would leave the others without a binary, and a test with no '
+        'binary does not fail, it vanishes',
+        len(tests), len(targets),
+    )
+    return baseline_build(project), None
+
+
 def build_for_test(project: 'Project', test: str) -> tuple[float, str | None]:
     """Build what the named test needs, and nothing else.
 
@@ -708,8 +737,8 @@ def open_jobserver(path: Path, tokens: int) -> int:
     return fd
 
 
-def check_script(project: 'Project', name: str, path: Path, target: str | None = None) -> Path:
-    """Build the project, then run the one test -- and insist that it ran.
+def check_script(project: 'Project', names, path: Path, target: str | None = None) -> Path:
+    """Build the project, then run the named tests -- and insist that they ran.
 
     A ctest test, not a build target. A target only says the code still
     compiles and links, and a target that runs something says only that the
@@ -770,17 +799,19 @@ def check_script(project: 'Project', name: str, path: Path, target: str | None =
     # the rest of C-Vise: the installed layout puts the package under a prefix
     # that is not on the default path.
     root = Path(__file__).resolve().parents[2]
+    if isinstance(names, str):
+        names = [names]
     command = [
         sys.executable,
         '-m',
         'cvise.utils.projectcheck',
         '--build',
         str(project.build_dir),
-        '--test',
-        name,
         '--witness',
         str(project.build_dir.parent / 'cvise-verdicts.log'),
     ]
+    for name in names:
+        command += ['--test', name]
     if target:
         command += ['--target', target]
     path.write_text(

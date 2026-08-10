@@ -136,6 +136,7 @@ set(SOURCE_FILES
   "tests/test_peep.py"
   "tests/test_process.py"
   "tests/test_rmunusedfiles.py"
+  "tests/test_several_tests.py"
   "tests/test_sigmonitor.py"
   "tests/test_special.py"
   "tests/test_ternary.py"

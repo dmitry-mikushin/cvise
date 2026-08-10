@@ -130,10 +130,11 @@ def _marks(line: str, criterion: str | None = None) -> bool:
     protect something nobody meant to protect, and a mention in the defining
     header would refuse every candidate touching it forever.
 
-    The named form is active only for the test this run is graded by. Without a
-    criterion every marker is active, which is the safe direction: a guard that
-    goes quiet when it does not know what it is guarding is worse than one that
-    refuses too much.
+    The named form is active for the tests this run is graded by -- ALL of
+    them, since a run may be graded by several and each of them has to survive.
+    Without a criterion every marker is active, which is the safe direction: a
+    guard that goes quiet when it does not know what it is guarding is worse
+    than one that refuses too much.
     """
     line = line.lstrip()
     if line.startswith(MARKER_TEST):
@@ -142,8 +143,24 @@ def _marks(line: str, criterion: str | None = None) -> bool:
             # Written like the named form and not parseable as it. Refusing to
             # guess which test it meant, and refusing to let it protect nothing.
             return True
-        return criterion is None or f'{named.group(1)}.{named.group(2)}' == criterion
+        return criterion is None or f'{named.group(1)}.{named.group(2)}' in _named(criterion)
     return line.startswith(MARKER)
+
+
+def _named(criterion) -> frozenset:
+    """The test names this run is graded by, however the caller spelled them.
+
+    One name or many: a single string is one name and not a sequence of
+    characters, which is the mistake this exists to make impossible. Written
+    once because every function in this module takes the same argument, and a
+    guard that silently matched nothing would protect nothing and say so
+    nowhere.
+    """
+    if criterion is None:
+        return frozenset()
+    if isinstance(criterion, str):
+        return frozenset({criterion})
+    return frozenset(criterion)
 
 
 def has_protection(text: str, criterion: str | None = None) -> bool:
@@ -291,8 +308,24 @@ def _uses_marker(path: Path, criterion: str | None = None) -> bool:
     return False
 
 
+def marked_files(root: str, criterion=None) -> tuple[str, ...]:
+    """Normalise the criterion, then ask the cache.
+
+    The cache is keyed on the arguments, so the criterion has to be hashable --
+    and since a run may now be graded by several tests, callers pass a list.
+    MEASURED: they did, and it cost the end-to-end run
+
+        TypeError: unhashable type: 'list'
+
+    which the unit tests missed because they call _marks directly and never go
+    through the cache. Normalising here rather than at every call site makes
+    the mistake impossible instead of merely fixed.
+    """
+    return _marked_files(root, _named(criterion) or None)
+
+
 @functools.lru_cache(maxsize=None)
-def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
+def _marked_files(root: str, criterion: frozenset | None = None) -> tuple[str, ...]:
     """Which SOURCE files under a test case carry a marker, found once and remembered.
 
     Source files and nothing else. The marker is a C++ construct that attaches
@@ -349,6 +382,13 @@ def marked_files(root: str, criterion: str | None = None) -> tuple[str, ...]:
             if candidate.is_file() and _uses_marker(candidate, criterion):
                 found.append(str(candidate))
     return tuple(sorted(found))
+
+
+# The cache lives on the private function now, but clearing it is part of this
+# module's surface -- tests and a long run both need it. Forwarding rather than
+# renaming, so that "clear the cache" keeps meaning the same thing to callers.
+marked_files.cache_clear = _marked_files.cache_clear
+marked_files.cache_info = _marked_files.cache_info
 
 
 def violation(original_root: Path, candidate_root: Path, criterion: str | None = None) -> Path | None:

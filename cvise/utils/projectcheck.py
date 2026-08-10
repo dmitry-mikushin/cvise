@@ -221,11 +221,52 @@ def watch_for_a_swarm(ceiling: int, done: threading.Event) -> list[int]:
     return seen
 
 
+# "100% tests passed, 0 tests failed out of 3" -- the last number is how many
+# tests ctest actually found, and it is the only thing that distinguishes a
+# criterion that held from one that was deleted out from under it.
+RAN = re.compile(r'\bout of (\d+)\b')
+
+
+def they_did_not_all_run(output: str, wanted: int) -> str:
+    """Why this candidate must be refused even though ctest exited zero.
+
+    Returns the reason, or '' when all the named tests ran.
+
+    --no-tests=error is not enough once there is more than one name. MEASURED,
+    two tests asked for and one of them deleted:
+
+        ctest -R '^(alpha|deleted)$' --no-tests=error
+        100% tests passed, 0 tests failed out of 1        rc=0
+
+    ctest ran what it found, all of it passed, and it said so with a zero exit.
+    The flag only fires when NOTHING matched. So the surviving test would have
+    spoken for the deleted one for the rest of the run, and the cheapest way to
+    satisfy a two-test criterion would be to delete one of the tests.
+
+    The count in ctest's own summary is what closes it, and nothing else in the
+    output does.
+    """
+    if wanted <= 1:
+        # One name is already covered by --no-tests=error, which turns "not
+        # found" into exit 8. Nothing to add, and a summary line that ctest
+        # someday words differently must not start failing single-test runs.
+        return ''
+    found = RAN.search(output)
+    if not found:
+        return f'ctest did not say how many of the {wanted} tests it ran'
+    ran = int(found.group(1))
+    if ran < wanted:
+        return f'only {ran} of the {wanted} tests the criterion names still exist'
+    return ''
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--build', required=True, type=Path)
     parser.add_argument('--target')
-    parser.add_argument('--test', required=True, help='exact ctest name')
+    parser.add_argument('--test', required=True, action='append', dest='tests',
+                        help='exact ctest name; repeat to require several, all of '
+                             'which must pass')
     parser.add_argument('--witness', type=Path)
     args = parser.parse_args(argv)
 
@@ -299,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 '--test-dir',
                 str(args.build),
                 '-R',
-                '^' + re.escape(args.test) + '$',
+                '^(' + '|'.join(re.escape(name) for name in args.tests) + ')$',
                 '--no-tests=error',
                 '--output-on-failure',
             ],
@@ -333,13 +374,21 @@ def main(argv: list[str] | None = None) -> int:
     # working -- two faults repaired in opposite directions. Reported as
     # "36 accepts" until the published tree was looked at, which is a guess
     # dressed as a measurement.
+    missing = they_did_not_all_run(proc.stdout, len(args.tests))
     record(
         args.witness,
         **facts,
-        test='pass' if proc.returncode == 0 else 'fail',
+        test='pass' if proc.returncode == 0 and not missing else 'fail',
         rc=proc.returncode,
         dir=Path.cwd(),
     )
+    if missing:
+        keep_this_job(missing)
+        print(proc.stdout, end='')
+        print(f'cvise: {missing}')
+        # Not the test's verdict but the criterion's: fewer tests exist than
+        # were asked for, so what did run cannot speak for what did not.
+        return 1
     if proc.returncode != 0:
         # A test that ran and failed is the interesting rejection: the candidate
         # compiled, so the code is well-formed, and it changed behaviour. That is

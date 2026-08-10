@@ -319,14 +319,16 @@ def main():
         'what flags each one is compiled with',
     )
     parser.add_argument(
-        'test',
+        'tests',
         metavar='TEST',
-        nargs='?',
-        help='name of the ctest test that decides whether a variant of the project is still '
-        'interesting: it is interesting if the project builds and that one test passes. A test, '
-        'not a build target, because a target says only that something exited zero -- and a test '
-        'runner exits zero when the case it was asked for no longer exists, so the cheapest way '
-        'to satisfy such a criterion is to delete the test',
+        nargs='*',
+        help='names of the ctest tests that decide whether a variant of the project is still '
+        'interesting: it is interesting if the project builds and ALL of them pass. Name as many '
+        'as the result has to keep working -- everything no test holds will be deleted, and a '
+        'code path no criterion exercises is the first thing to go. A test, not a build target, '
+        'because a target says only that something exited zero -- and a test runner exits zero '
+        'when the case it was asked for no longer exists, so the cheapest way to satisfy such a '
+        'criterion is to delete the test',
     )
     parser.add_argument(
         '--patience',
@@ -347,7 +349,7 @@ def main():
     args = parser.parse_args()
 
 
-    if not args.list_passes and (not args.project or not args.test):
+    if not args.list_passes and (not args.project or not args.tests):
         parser.error('the following arguments are required: CMAKELISTS, TEST')
 
     log_config = {}
@@ -500,7 +502,7 @@ def do_reduce(args):
         # target is the whole tree, and a component the criterion never touches
         # failing to compile would stop a reduction that has nothing to do with
         # it.
-        baseline_seconds, build_target = project_utils.build_for_test(project, args.test)
+        baseline_seconds, build_target = project_utils.build_for_tests(project, args.tests)
 
         # One pool of build tokens shared by every candidate from here on. ninja
         # is a client of it and is never given a -j, so a build that can only
@@ -530,10 +532,12 @@ def do_reduce(args):
                 'machine to itself, and up to %d candidates share it',
                 args.timeout, baseline_seconds, args.n,
             )
-        if not project_utils.has_test(project, args.test):
+        missing = [name for name in args.tests if not project_utils.has_test(project, name)]
+        if missing:
             known = project_utils.tests_of(project)
             sys.exit(
-                f"the project registers no ctest test called '{args.test}'"
+                'the project registers no ctest test called '
+                + ', '.join(repr(name) for name in missing)
                 + (f'; it registers: {", ".join(known)}' if known else
                    '; it registers none at all, so add enable_testing() and add_test() -- or '
                    'gtest_discover_tests() -- to the project')
@@ -548,7 +552,7 @@ def do_reduce(args):
         # it is built and how it is checked, and asking for both again in shell is
         # asking for two descriptions that will disagree.
         args.interestingness_test = str(
-            project_utils.check_script(project, args.test, staging_dir / 'check.sh', build_target)
+            project_utils.check_script(project, args.tests, staging_dir / 'check.sh', build_target)
         )
         os.chdir(staged.parent)
         test_cases = [Path(staged.name)]
@@ -646,7 +650,7 @@ def do_reduce(args):
             # The ctest name this run is graded by. A CVISE_NOREDUCE_TEST
             # marker naming another test is inert, so every test in the project
             # can carry one and exactly the one being graded by is enforced.
-            criterion=args.test,
+            criterion=args.tests,
             overlay_root=project.root,
             # The build tree is isolated per job as well. It is where the
             # verdict about a candidate is computed, and sharing it means a job
