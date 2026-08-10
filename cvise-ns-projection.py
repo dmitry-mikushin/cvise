@@ -206,17 +206,31 @@ def available_mb() -> int:
 
 
 def derive_jobs() -> int:
-    # One core short of the machine, deliberately. C-Vise sizes the shared
-    # build pool as cores minus jobs, because each build already holds one
-    # implicit token; asking for every core leaves the pool empty and every
-    # candidate then compiles one file at a time.
+    """The CEILING on concurrent jobs, which is a property of the machine.
+
+    One core short of it, deliberately. C-Vise sizes the shared build pool as
+    cores minus jobs, because each build already holds one implicit token;
+    asking for every core leaves the pool empty and every candidate then
+    compiles one file at a time.
+
+    Memory is deliberately NOT part of this any more. It used to be -- the
+    count was min(cores, free memory / 2 GB) taken at the instant the run
+    started and then held for its whole life. MEASURED, the same project on the
+    same machine within one day: 74 jobs starting on an idle machine, 66 with
+    something else holding 20 GB, and 16 when it started seconds after a docker
+    build had filled the page cache. That last run was four times slower than
+    it needed to be for hours, because of one moment that had passed by the
+    time the first candidate was built.
+
+    C-Vise now decides that itself, every few seconds, from the cgroup ceiling
+    it actually runs under -- which is the only correct place to ask, since
+    /proc/meminfo inside the container reports the host. This number is the
+    upper bound it may grow back to.
+    """
     cpu = max(1, (os.cpu_count() or 1) - 1)
-    memory = available_mb() * 3 // 4 // JOB_BUDGET_MB
-    jobs = min(cpu, memory)
-    if jobs < 1:
-        die(f'less than {JOB_BUDGET_MB} MB available -- cannot run even one job')
-    print(f'    jobs     : {jobs}  (cpu {cpu}, memory allows {memory} at {JOB_BUDGET_MB} MB/job)')
-    return jobs
+    print(f'    jobs     : up to {cpu} (one per core, less one); how many of them run '
+          f'at once is decided by C-Vise from the memory ceiling, and moves')
+    return cpu
 
 
 def find_repo() -> tuple[Path, Path]:

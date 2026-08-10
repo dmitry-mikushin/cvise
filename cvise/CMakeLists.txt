@@ -107,6 +107,7 @@ set(SOURCE_FILES
   "tests/test_overlay_integration.py"
   "tests/test_project.py"
   "tests/test_reachability.py"
+  "tests/test_allowance.py"
   "tests/test_balanced.py"
   "tests/test_blank.py"
   "tests/test_cache.py"

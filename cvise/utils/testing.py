@@ -26,7 +26,7 @@ import pebble
 from cvise.cvise import CVise
 from cvise.passes.abstract import AbstractPass, PassResult
 from cvise.passes.hint_based import HintBasedPass, HintState
-from cvise.utils import cache, fileutil, mplogging, noreduce, overlay, pace, precheck, sigmonitor
+from cvise.utils import cache, fileutil, memory, mplogging, noreduce, overlay, pace, precheck, sigmonitor
 from cvise.utils.error import (
     UndecidedTestError,
     InsaneTestCaseError,
@@ -662,6 +662,11 @@ class TestManager:
         self.start_with_pass = start_with_pass
         self.skip_after_n_transforms = skip_after_n_transforms
         self.stopping_threshold = stopping_threshold
+        # How many jobs may run right now. The worker pool is built for
+        # parallel_tests and that is the ceiling; this is how many of its slots
+        # memory currently permits, and it moves.
+        self.allowed_jobs = parallel_tests
+        self._temperature_taken = 0.0
         # How long a run may go on finding nothing before it is called finished,
         # and where the record of what it did find is written.
         self.pace = pace.Pace(patience=patience)
@@ -1209,9 +1214,11 @@ class TestManager:
             # recover were spent inside one call to this function.
             self.call_it_finished_if_it_is()
             self.say_how_it_is_going()
+            self.take_the_memory_temperature()
 
-            # schedule new jobs, as long as there are free workers
-            while len(self.jobs) < self.parallel_tests and self.maybe_schedule_job():
+            # schedule new jobs, as long as there are free workers AND the
+            # memory ceiling has room for them
+            while len(self.jobs) < self.allowed_jobs and self.maybe_schedule_job():
                 pass
 
             if not self.jobs:
@@ -1499,6 +1506,39 @@ class TestManager:
         self._said_at = now
         if self.pace.usual is not None:
             logging.info('%s', pace.report(self.pace, now))
+
+    #: How often the cgroup is read. Reading it is two file reads and could be
+    #: done every iteration, but the controller must step at a known rate or
+    #: its "one more job per step" means nothing.
+    TEMPERATURE_INTERVAL = 5
+
+    def take_the_memory_temperature(self) -> None:
+        """Let memory decide how many of the pool's slots to use.
+
+        The count used to be fixed for the life of a run, derived from free
+        memory at the instant it started. MEASURED, the same project on the
+        same machine: 74 jobs starting on an idle machine, 66 with something
+        else holding 20 GB, and 16 when it started seconds after a docker build
+        had filled the page cache -- that run was four times slower than it
+        needed to be, for hours, because of one moment.
+
+        Read from the CGROUP and not from /proc/meminfo, which inside a
+        container reports the host: MEASURED on a live run, /proc/meminfo said
+        157 GB available while this cgroup's ceiling was 132.8 GiB and 41.7 of
+        it were in use.
+        """
+        now = time.monotonic()
+        if now - self._temperature_taken < self.TEMPERATURE_INTERVAL:
+            return
+        self._temperature_taken = now
+        before = self.allowed_jobs
+        self.allowed_jobs = memory.next_allowance(
+            self.allowed_jobs, self.parallel_tests,
+            memory.memory_ceiling(), memory.memory_in_use(),
+        )
+        if self.allowed_jobs != before:
+            logging.debug('jobs allowed by memory: %d -> %d of %d',
+                          before, self.allowed_jobs, self.parallel_tests)
 
     def call_it_finished_if_it_is(self) -> bool:
         """Has this run gone quiet for long enough to be over?

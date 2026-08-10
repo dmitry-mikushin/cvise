@@ -288,6 +288,73 @@ def memory_ceiling() -> int | None:
         node = node.parent
 
 
+# How full the ceiling may get before the number of concurrent jobs is cut,
+# and how empty before it is allowed to grow again. The gap between them is
+# what stops the count oscillating: a single threshold would raise and lower on
+# alternate readings for the whole run.
+CROWDED = 0.85
+ROOMY = 0.60
+
+#: Never go below this, whatever memory says. One job at a time is slow; zero
+#: is a hang, and a reduction that cannot schedule anything never finds out
+#: that its estimate was wrong.
+MIN_JOBS = 1
+
+
+def next_allowance(allowance: int, cap: int, ceiling: int | None, used: int | None) -> int:
+    """How many jobs to permit now: up by one, or down by a quarter.
+
+    Additive increase, multiplicative decrease -- the arrangement TCP uses for
+    the same problem, and for the same reason. Growth has to be slow because
+    the cost of a new job is not known until it has run for a while, and a
+    reduction's memory use lags its job count by tens of seconds; retreat has
+    to be fast because the penalty for being wrong is the cgroup killing the
+    whole run.
+
+    Returns `cap` unchanged when there is no signal. Not zero, not one: "I
+    cannot read the cgroup" is not "there is no memory", and a reduction that
+    throttled itself to nothing on a machine it could not measure would be
+    worse than one that did not try.
+
+    Why this is decided every round rather than once at startup: the count used
+    to be derived from free memory at the moment the run began and then held
+    for hours. MEASURED, the same project on the same machine: 74 jobs when it
+    started on an idle machine, 66 when something else held 20 GB, and 16 when
+    it started seconds after a docker build had filled the page cache. That last
+    run was four times slower than it needed to be for its whole life, because
+    of one instant.
+    """
+    if not ceiling or ceiling <= 0 or used is None:
+        return cap
+    fraction = used / ceiling
+    if fraction >= CROWDED:
+        allowance = allowance * 3 // 4
+    elif fraction <= ROOMY:
+        allowance += 1
+    return max(MIN_JOBS, min(cap, allowance))
+
+
+def memory_in_use() -> int | None:
+    """What this cgroup is charged with right now, in bytes, or None.
+
+    The companion to memory_ceiling(), and the only honest way to ask "how
+    close are we" from inside a container. /proc/meminfo there reports the
+    HOST -- MEASURED on a live run: it said 263 GB total and 157 GB available
+    while this cgroup's ceiling was 132.8 GiB and its usage 41.7. A reduction
+    that sized itself from /proc/meminfo would be reading a number that has no
+    relation to the limit it will be killed at.
+
+    Charged, not resident: the tmpfs scratch counts here too, which is the
+    point -- one figure bounds the compilers and the scratch together.
+    """
+    for name in ('memory.current', 'memory.usage_in_bytes'):
+        try:
+            return int((CGROUP_ROOT / name).read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def available_ram() -> int:
     """What the machine can actually spare right now, not what it has in total."""
     try:
