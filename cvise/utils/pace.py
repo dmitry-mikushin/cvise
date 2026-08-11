@@ -98,10 +98,34 @@ class Pace:
 
     @property
     def usual(self) -> float | None:
-        """The gap to expect, or None while there is not enough to say."""
-        if len(self.gaps) < WARMUP:
+        """The gap to expect, or None before there is a single one to go on."""
+        if not self.gaps:
             return None
         return statistics.median(self.gaps)
+
+    @property
+    def patience_now(self) -> float:
+        """How many usual gaps of silence to allow, given how little is known.
+
+        WARMUP intervals or more: the configured patience, which was measured.
+        Fewer: proportionally more, because a median of one sample is one
+        sample. One gap buys WARMUP times the patience, two buys half of that,
+        and at WARMUP it is the ordinary figure.
+
+        This exists because refusing to answer at all was worse. It used to
+        return None below WARMUP, and a run that finds almost nothing from the
+        start never accumulates the intervals -- so exactly the run that most
+        needs stopping was the one that could not be stopped. MEASURED on a
+        real run of llama.cpp: one accepted reduction in the first 281 s and
+        then ELEVEN HOURS of nothing, ending in a crash rather than a decision.
+        With this, it would have given up after about three hours; with the
+        ordinary patience on one sample it would have been forty minutes, which
+        is too eager to bet a run on.
+        """
+        n = len(self.gaps)
+        if n >= WARMUP:
+            return float(self.patience)
+        return self.patience * WARMUP / max(n, 1)
 
     def silence(self, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
@@ -118,7 +142,7 @@ class Pace:
         usual = self.usual
         if usual is None or self.last is None:
             return None
-        return self.last + self.patience * usual
+        return self.last + self.patience_now * usual
 
     def spent(self, now: float | None = None) -> bool:
         deadline = self.deadline()

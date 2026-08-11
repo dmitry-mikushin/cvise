@@ -126,14 +126,51 @@ class TestWhatItRefusesToSay:
                           'by anything')
         assert pace_module.PATIENCE >= 4, 'PATIENCE is at or below the measured cliff'
 
-    def test_a_run_too_young_to_have_a_rhythm_says_so(self):
+    def test_a_run_that_has_found_nothing_at_all_still_refuses(self):
+        """Zero intervals is zero information, and there is nothing to scale."""
+        p = Pace(started=0.0)
+        p.record(1000, now=0)
+        assert p.usual is None
+        assert p.deadline() is None
+        assert not p.spent(now=100000)
+        assert 'intervals needed' in report(p, now=120)
+
+    def test_one_interval_is_thin_evidence_and_buys_much_more_patience(self):
         p = Pace(started=0.0)
         p.record(1000, now=0)
         p.record(900, now=60)
-        assert p.usual is None
-        assert p.deadline() is None
-        assert not p.spent(now=100000), 'a run with two data points was called finished'
-        assert 'intervals needed' in report(p, now=120)
+        assert p.usual == 60
+        assert p.patience_now == pace_module.PATIENCE * pace_module.WARMUP
+        assert not p.spent(now=60 + 60 * p.patience_now - 1)
+        assert p.spent(now=60 + 60 * p.patience_now + 1)
+
+    def test_patience_shrinks_to_the_measured_figure_as_evidence_arrives(self):
+        p = Pace(started=0.0)
+        p.record(1000, now=0)
+        seen = []
+        for i in range(1, pace_module.WARMUP + 3):
+            p.record(1000 - i, now=i * 60)
+            seen.append(p.patience_now)
+        assert seen == sorted(seen, reverse=True), seen
+        assert seen[-1] == pace_module.PATIENCE
+
+    def test_the_run_that_could_never_be_stopped(self):
+        """The defect this scaling exists for, on the run that suffered it.
+
+        MEASURED on a real reduction of llama.cpp: one accepted reduction after
+        281 s and then ELEVEN HOURS of nothing, ending in a crash rather than a
+        decision. One interval is fewer than WARMUP, so `usual` was None,
+        `deadline()` was None, and `spent()` stayed False for ever -- the run
+        that most needed stopping was precisely the one that could not be.
+        """
+        p = Pace(started=0.0)
+        p.record(138896, now=1786385262.0)
+        p.record(128924, now=1786385543.0)
+        deadline = p.deadline()
+        assert deadline is not None, 'still cannot be stopped'
+        waited = (deadline - 1786385543.0) / 3600
+        assert 1 < waited < 6, f'gives up after {waited:.1f} h, which is not a sane bound'
+        assert p.spent(now=1786385543.0 + 11 * 3600), 'eleven hours of silence was not enough'
 
     def test_a_run_that_has_never_succeeded_is_never_called_finished(self):
         """The first candidate can take longer than everything after it: the
