@@ -28,22 +28,15 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# One definition of how a result is put into git, shared with the reducer, which
+# now keeps every publication itself. Two copies of this would drift, and the
+# thing they would drift about is whether a result was preserved at all.
+from cvise.utils.keep import AUTHOR, RESULTS, git, how_much_code, on_the_branch  # noqa: E402
 
 IMAGE = 'ns-rtc-cvise'
 SRC = '/src'
 SUBMODULE = 'third_party/ns-projection'
-
-# Where a verified result is put so that it survives the machine. The state
-# directory is tmpfs and the reduction that made it can die at any moment; twice
-# during one reduction the result was saved only because a copy had already
-# landed here.
-RESULTS = Path.home() / 'cvise-results'
-
-# The commits are made by a program, so they say so rather than borrowing
-# whoever happened to be logged in.
-AUTHOR = ('-c', 'user.name=C-Vise', '-c', 'user.email=cvise@localhost')
-
-SOURCE_SUFFIXES = ('.cpp', '.cc', '.cxx', '.c', '.hpp', '.hh', '.hxx', '.h', '.inc')
 
 
 def ceiling_mb() -> int:
@@ -89,43 +82,6 @@ def container_of(state: Path) -> str | None:
 
 def run(command, **kwargs):
     return subprocess.run(command, capture_output=True, text=True, **kwargs)
-
-
-def git(tree: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(['git', '-C', str(tree), *args], capture_output=True, text=True)
-
-
-def how_much_code(tree: Path) -> str:
-    """What is left, in the terms a person judges a reduction by.
-
-    Not bytes. They move the same for a stripped space and for a deleted
-    translation unit, so a message carrying them says nothing about how far the
-    reduction has come.
-    """
-    files = lines = 0
-    for path in tree.rglob('*'):
-        if not path.is_file() or path.suffix not in SOURCE_SUFFIXES or '.git' in path.parts:
-            continue
-        try:
-            counted = sum(1 for line in path.read_text(errors='replace').splitlines() if line.strip())
-        except OSError:
-            continue
-        if counted:
-            files += 1
-            lines += counted
-    return f'{lines} lines of code in {files} files'
-
-
-def on_the_branch(tree: Path, branch: str) -> bool:
-    """Put the verified history on a branch of its own, creating it once.
-
-    The worktree is checked out detached at the pin, so the first commit has
-    nowhere to go. Creating the branch at HEAD moves no file, which is why this
-    is safe to do while the reduction is running -- and it was, seven times.
-    """
-    if git(tree, 'rev-parse', '--verify', branch).returncode == 0:
-        return git(tree, 'checkout', branch).returncode == 0
-    return git(tree, 'checkout', '-b', branch).returncode == 0
 
 
 def preserve(tree: Path, state: Path, test: str) -> None:

@@ -31,7 +31,7 @@ from cvise.passes.abstract import AbstractPass  # noqa: E402
 from cvise.utils import memory  # noqa: E402
 from cvise.utils import project as project_utils  # noqa: E402
 from cvise.utils import statistics, testing  # noqa: E402
-from cvise.utils import pace  # noqa: E402
+from cvise.utils import keep, pace  # noqa: E402
 from cvise.utils.error import CViseError, MissingPassGroupsError  # noqa: E402
 from cvise.utils.externalprograms import find_external_programs  # noqa: E402
 
@@ -452,6 +452,7 @@ def do_reduce(args):
     project = None
     staged = None
     script = None
+    keeper = None
     try:
         project = project_utils.configure(Path(args.project), cmake_dir, args.under)
         logging.info(
@@ -554,6 +555,12 @@ def do_reduce(args):
         args.interestingness_test = str(
             project_utils.check_script(project, args.tests, staging_dir / 'check.sh', build_target)
         )
+        # Every publication goes into git on a branch of its own, and the branch
+        # is packed out of the tmpfs on a clock. Unverified, and it says so:
+        # only verify-reduction.py builds the tree from nothing and runs the
+        # criterion, and a reducer that certified its own output would preserve
+        # its own systematic errors along with it.
+        keeper = keep.Keeper(project.root)
         os.chdir(staged.parent)
         test_cases = [Path(staged.name)]
 
@@ -610,6 +617,11 @@ def do_reduce(args):
             """
             written = project_utils.publish(project, staged)
             logging.info('%d files written back; rebuilding what the jobs read', written)
+            # Kept in git as well as on disk. Publishing overwrites in place and
+            # keeps exactly one version, in tmpfs -- MEASURED, a run that
+            # published at its fifth minute and died eleven hours later left
+            # nothing at all behind.
+            keeper.keep()
             project_utils.baseline_build(project, build_target)
 
         # Use forkserver to avoid potential problems due to multi-threading, and to reduce the memory usage in workers.
@@ -736,6 +748,12 @@ def do_reduce(args):
         if project is not None and staged is not None:
             published = project_utils.publish(project, staged)
             logging.info('%d reduced files written back to %s', published, project.root)
+            # The last word, however the run ended. A crash skips everything
+            # else; this is in the finally block for the same reason the
+            # write-back is.
+            if keeper is not None:
+                keeper.keep('final state of the run')
+                keeper.bundle()
         if script:
             os.unlink(script.name)
         shutil.rmtree(cmake_dir, ignore_errors=True)
